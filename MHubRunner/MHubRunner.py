@@ -468,6 +468,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # set udocker executable
         self.ui.pthUDockerExecutable.currentPath = udocker_executable
 
+    def _appendLogOutput(self, stdout: str | None) -> None:
+        if stdout is None:
+            return
+        # remove ANSI escapes and control chars that can break QTextCursor
+        stdout = re.sub(r'\x1b\[[0-9;]*m', '', stdout)
+        stdout = stdout.replace('\r', '\n')
+        stdout = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', stdout)
+        if stdout.strip() != "":
+            self.ui.txtLogs.appendPlainText(stdout)
+
     def _ensureLoggerConfigured(self) -> None:
         for handler in list(logger.handlers):
             if getattr(handler, "_mhubrunner_handler", False):
@@ -740,8 +750,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             logger.debug("Image %s pulled, args: %s", image_name, args)
 
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                button.text = f"Pulling ({sec}s)"
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
+
         # pull model
-        self.logic.update_image(image_name, on_stop=on_stop)
+        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def onModelLoadTest(self, model: str) -> None:
 
@@ -840,7 +859,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # get selected image
         selected = self.ui.lstBackendImages.currentItem()
-        image_name = selected.text()
+        if selected is None:
+            return
+        image_name = selected.data(qt.Qt.UserRole)
+        if not image_name:
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Update image")
+            msg.setText("Selected image is missing its stored name. Please refresh the image list.")
+            msg.exec_()
+            return
 
         logger.info("Updating image: %s", image_name)
 
@@ -863,18 +891,49 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selected.setFlags(qt.Qt.ItemIsEnabled)
 
         # on stop callback removes `updating...` from image
-        def on_stop(*args):
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
             selected.setText(image_name)
+            if returncode != 0 or timedout or killed:
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Update image failed")
+                text = f"Updating image {image_name} failed with return code {returncode}."
+                text += "\nProcess timed out." if timedout else ""
+                text += "\nProcess was killed." if killed else ""
+                msg.setText(text)
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
+                return
+            self.updateBackendImagesList()
+
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                selected.setText(f"{image_name} (updating... {sec}s)")
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
 
         # update image
-        self.logic.update_image(image_name, on_stop=on_stop)
+        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def onBackendImageRemove(self) -> None:
         assert self.logic
 
         # get selected image
         selected = self.ui.lstBackendImages.currentItem()
-        image_name = selected.text()
+        if selected is None:
+            return
+        image_name = selected.data(qt.Qt.UserRole)
+        if not image_name:
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Remove image")
+            msg.setText("Selected image is missing its stored name. Please refresh the image list.")
+            msg.exec_()
+            return
 
         logger.info("Removing image: %s", image_name)
 
@@ -897,17 +956,40 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selected.setFlags(qt.Qt.ItemIsEnabled)
 
         # on stop callback removes entry
-        def on_stop(errorcode: int, stdout: str, *args):
-
-            logger.debug("Image %s removed (errorCode: %s)", image_name, errorcode)
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
+            logger.debug("Image %s removed (returnCode: %s)", image_name, returncode)
             if stdout:
                 logger.debug("Image remove stdout: %s", stdout)
 
-            # FIXME: this is very optimistic...
+            if returncode != 0 or timedout or killed:
+                selected.setText(image_name)
+                selected.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable)
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Remove image failed")
+                text = f"Removing image {image_name} failed with return code {returncode}."
+                text += "\nProcess timed out." if timedout else ""
+                text += "\nProcess was killed." if killed else ""
+                msg.setText(text)
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
+                return
+
+            # remove from list on success
             self.ui.lstBackendImages.takeItem(self.ui.lstBackendImages.row(selected))
 
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                selected.setText(f"{image_name} (removing... {sec}s)")
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
+
         # remove image
-        self.logic.remove_image(image_name, on_stop=on_stop)
+        self.logic.remove_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def updateBackendImagesList(self) -> None:
         assert self.logic is not None
@@ -923,6 +1005,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for image in images:
             item = qt.QListWidgetItem()
             item.setText(image)
+            raw_name = image.split(" (", 1)[0] if " (" in image else image
+            item.setData(qt.Qt.UserRole, raw_name)
             self.ui.lstBackendImages.addItem(item)
 
     # def initiateHostTest(self) -> None:
@@ -1089,8 +1173,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.renderTableData(tableNode, csv_header, csv_data)
 
         elif output_file.endswith(".seg.dcm"):
-
-            self.logic.openSegmentation()
+            self.logic.importSegmentations([output_file])
 
     def onCancelButton(self) -> None:
 
@@ -1152,12 +1235,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         ###### TEST (for caching on host)
         # get InstanceUIDs (only available for nodes loaded through the dicom module)
         node = self.ui.inputSelector.currentNode()
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
 
-        # create hash from instanceUIDs
-        hash = hashlib.sha256()
-        hash.update(instanceUIDs.encode('utf-8'))
-        instance_idh = hash.hexdigest()
+        # create hash from instanceUIDs if available
+        if instanceUIDs:
+            hash = hashlib.sha256()
+            hash.update(instanceUIDs.encode('utf-8'))
+            instance_idh = hash.hexdigest()
+        else:
+            instance_idh = "non-dicom"
+            logger.debug("No DICOM instanceUIDs for node: %s", node.GetName() if node else None)
 
         # get selected model
         model = self.getModelFromTableSelection()
@@ -1194,7 +1281,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             gpus: list[int] | None = None
             if self.ui.chkGpuEnabled.checked:
                 gpus = []
-                for i in range(self.ui.lstHostGpu.count):
+                for i in range(self.ui.lstHostGpu.count()):
                     item = self.ui.lstHostGpu.item(i)
                     if item.checkState() == qt.Qt.Checked:
                         logger.debug("Selected GPU: %s", item.text())
@@ -1212,14 +1299,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # PROGRESS handler
             def onProgress(progress: float, stdout: str | None):
                 self.ui.applyButton.text = f"Running {model.label} ({progress}s)"
-
-                # remove all color formatting from stdout string
-                if stdout is not None:
-                    stdout = re.sub(r'\x1b\[[0-9;]*m', '', stdout)
-
-                # display stdout in txtLogs
-                if stdout is not None and stdout.strip() != "":
-                    self.ui.txtLogs.appendPlainText(stdout)
+                self._appendLogOutput(stdout)
 
             # TERMINATION handler
             def onStop(returncode: int, stdout: str, timedout: bool, killed: bool):
@@ -1231,7 +1311,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
                     self.logic.addFilesToDatabase(dsegfiles, operation="copy")
                     self.logic.importSegmentations(dsegfiles)
-                    self.logic.openSegmentation(dsegfiles)
 
                 if 'Prediction' in model.categories:
                     self.updateOutputRunDirectories(open_latest=True)
@@ -1512,7 +1591,7 @@ class ProgressObserver:
 
     @classmethod
     def killAll(cls):
-        for task in cls._tasks:
+        for task in list(cls._tasks):
             task.kill()
 
     @classmethod
@@ -1537,7 +1616,14 @@ class ProgressObserver:
 
         return matched_tasks
 
-    def __init__(self, cmd: list[str], frequency: float = 2, timeout: int = 0, data: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        cmd: list[str],
+        frequency: float = 2,
+        timeout: int = 0,
+        data: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+    ):
         """
         cmd:       command to execute in subprocess
         frequency: progress update frequency in Hz
@@ -1555,6 +1641,7 @@ class ProgressObserver:
         self._seconds_elapsed = 0.0
 
         self._proc = None
+        self._env = env
         self._onProgress: Callable[[float, str], None] | None = None
         self._onStop: Callable[[int, str, bool, bool], None] | None = None
 
@@ -1596,6 +1683,7 @@ class ProgressObserver:
                 cmd,
                 stdout=stdout_file,
                 stderr=subprocess.STDOUT,
+                env=self._env,
                 text=True,
                 encoding='utf-8'
             )
@@ -1701,12 +1789,13 @@ class ProcessChain:
         success: bool | None = None
         started: bool = False
 
-    def __init__(self):
+    def __init__(self, env: dict[str, str] | None = None):
         self.cmds: list['ProcessChain.CMD'] = []
         self.started = False
         self.stopped = False
         self.success = True
         self.index = -1
+        self._env = env
 
         self._seconds_elapsed = 0.0
 
@@ -1724,15 +1813,16 @@ class ProcessChain:
         self._start_next()
 
     def _start_next(self):
-        if self.index < len(self.cmds):
+        if self.index + 1 < len(self.cmds):
             self.index += 1
             self._start_process(self.cmds[self.index].cmd)
-        else:
-            self.stopped = True
+            return
 
-            # invoke callback if defined
-            if self._onStop:
-                self._onStop(True)
+        self.stopped = True
+
+        # invoke callback if defined
+        if self._onStop:
+            self._onStop(True)
 
     def _on_process_stop(self, returncode: int, stdout: str, timedout: bool, killed: bool):
         if timedout or killed or returncode != 0:
@@ -1753,7 +1843,7 @@ class ProcessChain:
             self._onProgress(self.cmds[self.index], time)
 
     def _start_process(self, cmd: list[str]):
-        p = ProgressObserver(cmd)
+        p = ProgressObserver(cmd, env=self._env)
         p.onStop(self._on_process_stop)
         p.onProgress(self._on_process_progress)
 
@@ -1808,6 +1898,18 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         except ModuleNotFoundError as e:
             #self.log('paramiko is required. Installing...')
             slicer.util.pip_install('paramiko')
+
+    def _build_subprocess_env(self, executable_path: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        if executable_path:
+            path_entries = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+            exec_dir = os.path.dirname(executable_path)
+            real_exec_dir = os.path.dirname(os.path.realpath(executable_path))
+            for path in (exec_dir, real_exec_dir):
+                if path and path not in path_entries:
+                    path_entries.insert(0, path)
+            env["PATH"] = os.pathsep.join(path_entries)
+        return env
 
     def getModel(self, model_name: str) -> Model:
 
@@ -1984,7 +2086,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 docker_exec = self.getDockerExecutable()
                 assert docker_exec is not None, "Docker executable not found"
                 logger.debug("Running %s --version", docker_exec)
-                result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True)
+                env = self._build_subprocess_env(docker_exec)
+                result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
                 bi.version = result.stdout.decode('utf-8')
                 bi.available = True
                 logger.debug("Docker available")
@@ -2007,7 +2110,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 udocker_exec = self.getUDockerExecutable()
                 assert udocker_exec is not None, "Udocker executable not found"
                 logger.debug("Running %s --version", udocker_exec)
-                result = subprocess.run([udocker_exec, "--version"], timeout=5, check=True, capture_output=True)
+                env = self._build_subprocess_env(udocker_exec)
+                result = subprocess.run([udocker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
                 logger.debug("Udocker --version output: %s", result.stdout.decode('utf-8'))
 
                 # extract "version: x.x.x" from string
@@ -2076,14 +2180,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             if backend == "docker":
                 docker_exec = self.getDockerExecutable()
                 assert docker_exec is not None, "Docker executable not found"
-                result = subprocess.run([docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"], timeout=5, check=True, capture_output=True)
+                env = self._build_subprocess_env(docker_exec)
+                result = subprocess.run([docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"], timeout=5, check=True, capture_output=True, env=env)
                 images = [i.split("|") for i in result.stdout.decode('utf-8').split("\n")]
                 images = [f"{i[0]}:latest ({i[2]})" for i in images if len(i) == 3 and i[1] == "latest"]
 
             elif backend == "udocker":
                 udocker_exec = self.getUDockerExecutable()
                 assert udocker_exec is not None, "Udocker executable not found"
-                result = subprocess.run([udocker_exec, "images"], timeout=5, check=True, capture_output=True)
+                env = self._build_subprocess_env(udocker_exec)
+                result = subprocess.run([udocker_exec, "images"], timeout=5, check=True, capture_output=True, env=env)
                 images = result.stdout.decode('utf-8').split("\n")
                 images = [image.split()[0] for image in images if image.startswith("mhubai/")]
 
@@ -2102,12 +2208,19 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         return images
 
     def get_node_paths(self, node) -> list[str]:
-        storageNode=node.GetStorageNode()
+        storageNode = node.GetStorageNode() if node else None
         if storageNode is not None:
-            return [storageNode.GetFullNameFromFileName()]
-        else:
-            instanceUIDs=node.GetAttribute('DICOM.instanceUIDs').split()
-            return [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
+            file_path = storageNode.GetFullNameFromFileName()
+            if file_path:
+                return [file_path]
+
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
+        if not instanceUIDs:
+            raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
+
+        instanceUIDs = instanceUIDs.split()
+        files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
+        return [f for f in files if f]
 
     def renderTableData(self, tableNode, header: list[str], data: list[list[str]]) -> None:
 
@@ -2232,10 +2345,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         elif len(gpus) == 0:
             mhub_run_gpus = ["--gpus", "all"]
         else:
-            mhub_run_gpus = ["--gpus", f"'\"device={','.join(str(i) for i in gpus)}\"'"]
+            mhub_run_gpus = ["--gpus", f"device={','.join(str(i) for i in gpus)}"]
 
         # get executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # run mhub
         run_cmd = [
@@ -2260,7 +2374,13 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             onStop(returncode, stdout, timedout, killed)
 
         # run async
-        po = ProgressObserver(run_cmd, frequency=2, timeout=timeout, data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"})
+        po = ProgressObserver(
+            run_cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"},
+            env=env,
+        )
         po.onStop(_on_stop)
         po.onProgress(onProgress)
 
@@ -2268,6 +2388,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # get executable
         udocker_exec = self.getUDockerExecutable()
+        env = self._build_subprocess_env(udocker_exec)
 
         # callback wrapper
         def _on_progress(cmd: ProcessChain.CMD, time: float):
@@ -2279,7 +2400,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             onStop(int(success), "", False, False)
 
         # initialize async processing chain
-        pc = ProcessChain()
+        pc = ProcessChain(env=env)
         pc.onStop(_on_stop)
         pc.onProgress(_on_progress)
 
@@ -2360,36 +2481,74 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             self._run_mhub_udocker(model, gpus is not None, input_dir, output_dir, _on_progress, _on_stop, timeout)
 
 
-    def remove_image(self, image_name, on_stop: Callable[[int, str, bool, bool], None] | None = None, timeout: int = 0):
+    def remove_image(
+        self,
+        image_name,
+        on_stop: Callable[[int, str, bool, bool], None] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        timeout: int = 0,
+    ):
 
         # get docker executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # remove image cli command
         cmd = [docker_exec, "rmi", image_name]
 
         # run command in bg
-        po = ProgressObserver(cmd, frequency=2, timeout=timeout, data={"image_name": image_name, "operation": "remove"})
+        po = ProgressObserver(
+            cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": image_name, "operation": "remove"},
+            env=env,
+        )
         if on_stop: po.onStop(on_stop)
 
-    def update_image(self, image_name, on_stop: Callable[[int, str, bool, bool], None] | None = None, timeout: int = 0):
+        def onProgress(t: float, stdout: str):
+            if on_progress:
+                on_progress(t, stdout)
+            for line in stdout.split("\n"):
+                if line:
+                    logger.info("Remove image: %s", line)
+
+        po.onProgress(onProgress)
+
+    def update_image(
+        self,
+        image_name,
+        on_stop: Callable[[int, str, bool, bool], None] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        timeout: int = 0,
+    ):
 
         # get docker executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # remove image cli command
         cmd = [docker_exec, "pull", image_name]
 
+        # log command
+        logger.debug("Pull image command: %s", " ".join(cmd))
+
         # run command in bg
-        po = ProgressObserver(cmd, frequency=2, timeout=timeout, data={"image_name": image_name, "operation": "update"})
+        po = ProgressObserver(
+            cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": image_name, "operation": "update"},
+            env=env,
+        )
         if on_stop: po.onStop(on_stop)
 
-        # log output (DEBUG ONLY)
         def onProgress(t: float, stdout: str):
-            logger.debug("Pull image progress: %s", t)
+            if on_progress:
+                on_progress(t, stdout)
             for line in stdout.split("\n"):
                 if line:
-                    logger.debug("Pull image: %s", line)
+                    logger.info("Pull image: %s", line)
 
         po.onProgress(onProgress)
 
@@ -2444,23 +2603,17 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         logger.debug("Segmentation loadables: %s", loadables)
 
         # import files
-        # for loadable in loadables:
-        #     importer.load(loadable)
+        loaded_any = False
+        for loadable in loadables:
+            if importer.load(loadable):
+                loaded_any = True
+
+        if not loaded_any:
+            logger.warning("No segmentations loaded for files: %s", files)
 
 
     def openSegmentation(self, files: list[str]):
-
-        # Load the DICOM Segmentation
-        from DICOMLib import DICOMUtils
-
-        # read dicom files
-
-        # If you know the specific Study/Series UID or other identifiers
-        # seriesInstanceUID = ["1.3.6.1.4.1.14519.5.2.1.6834.5010.254012015145965303823476992753"]  # CT
-        # seriesInstanceUID = ["1.2.276.0.7230010.3.1.3.0.137.1738238573.133411"]                   # SEG
-
-        # Load the segmentation
-        loadedNodes = DICOMUtils.loadSeriesByUID([seriesInstanceUID])
+        self.importSegmentations(files)
 
 #
 # MHubRunnerTest
