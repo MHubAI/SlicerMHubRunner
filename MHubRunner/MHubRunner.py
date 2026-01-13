@@ -252,8 +252,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.backendSelector.connect('currentIndexChanged(int)', self.onBackendSelect)
 
         # executable paths
-        self.ui.pthDockerExecutable.currentPath = self.logic.getDockerExecutable()
-        self.ui.pthUDockerExecutable.currentPath = self.logic.getUDockerExecutable()
+        settings = qt.QSettings()
+        docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
+        udocker_exec = settings.value("MHubRunner/UDockerExecutable", self.logic.getUDockerExecutable())
+        self.ui.pthDockerExecutable.currentPath = docker_exec
+        self.ui.pthUDockerExecutable.currentPath = udocker_exec
+        if docker_exec:
+            self.logic._executables["docker"] = docker_exec
+        if udocker_exec:
+            self.logic._executables["udocker"] = udocker_exec
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         self.ui.pthUDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateUDockerExecutable)
         self.ui.cmdDetectDockerExecutable.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
@@ -436,6 +443,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # set docker executable
         logger.debug("Docker executable updated: %s (from %s)", docker_executable, path)
         self.logic._executables["docker"] = docker_executable
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/DockerExecutable", docker_executable)
 
     def onAutoDetectDockerExecutable(self) -> None:
         assert self.logic is not None
@@ -446,6 +455,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # set docker executable
         self.ui.pthDockerExecutable.currentPath = docker_executable
+        if docker_executable:
+            settings = qt.QSettings()
+            settings.setValue("MHubRunner/DockerExecutable", docker_executable)
 
     def onUpdateUDockerExecutable(self, path) -> None:
         assert self.logic is not None
@@ -457,6 +469,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # set udocker executable
         logger.debug("Udocker executable updated: %s (from %s)", udocker_executable, path)
         self.logic._executables["udocker"] = udocker_executable
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
 
     def onAutoDetectUDockerExecutable(self) -> None:
         assert self.logic is not None
@@ -467,6 +481,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # set udocker executable
         self.ui.pthUDockerExecutable.currentPath = udocker_executable
+        if udocker_executable:
+            settings = qt.QSettings()
+            settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
 
     def _appendLogOutput(self, stdout: str | None) -> None:
         if stdout is None:
