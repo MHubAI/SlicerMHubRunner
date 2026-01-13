@@ -1,14 +1,2 @@
-.DS_STORE
-__pycache__
-.ipynb_checkpoints/
-.vscode/*
-
-MRunner/docker_info_example.json
-MRunner/Resources/SampleData/*
-MRunner/ymldicomseg/meta2.json
-MRunner/ymldicomseg/test.ipynb
-MRunner/ymldicomseg/ymldicomseg.py
-MRunner/Resources/meta.yml
-MRunner/ymldicomseg/meta.yml
-MRunner/ymldicomseg/README.md
-MRunner/ymldicomseg/segclass.test.py
+MHubRunner/__pycache__/MHubRunner.cpython-39.pyc
+notes.md

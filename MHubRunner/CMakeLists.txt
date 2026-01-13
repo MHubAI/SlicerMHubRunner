@@ -1,5 +1,5 @@
 #-----------------------------------------------------------------------------
-set(MODULE_NAME MRunner)
+set(MODULE_NAME MHubRunner)
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
@@ -9,9 +9,6 @@ set(MODULE_PYTHON_SCRIPTS
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/UI/${MODULE_NAME}.ui
-  Utils/__init__.py
-  Utils/Models.py
-  Resources/MHub/models.json
   )
 
 #-----------------------------------------------------------------------------
