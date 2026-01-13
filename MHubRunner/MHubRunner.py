@@ -233,7 +233,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
-        self.ui.cmbLogLevel.setCurrentText("INFO")
+        settings = qt.QSettings()
+        saved_level = settings.value("MHubRunner/LogLevel", "INFO")
+        if saved_level not in ["ERROR", "WARNING", "INFO", "DEBUG"]:
+            saved_level = "INFO"
+        self.ui.cmbLogLevel.setCurrentText(saved_level)
         self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
         self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
 
@@ -477,6 +481,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         level_name = str(level_text).upper()
         level = getattr(logging, level_name, logging.INFO)
         logger.setLevel(level)
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/LogLevel", level_name)
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
