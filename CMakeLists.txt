@@ -9,8 +9,8 @@ set(EXTENSION_CATEGORY "Examples")
 set(EXTENSION_CONTRIBUTORS "Leonard Nürnberg (AIM, Mass General Brigham)")
 set(EXTENSION_DESCRIPTION "MHub Runner is a 3D Slicer plugin that seamlessly integrates Deep Learning models from the Medical Hub repository (MHub) into 3D Slicer.")
 set(EXTENSION_ICONURL "https://mhub.ai/slicer/SlicerMHubRunner.png")
-set(EXTENSION_SCREENSHOTURLS "https://mhub.ai/slicer/image01.png https://mhub.ai/slicer/image02.png https://mhub.ai/slicer/image03.png")
-set(EXTENSION_DEPENDS "NA") # Specified as a list or "NA" if no dependencies
+set(EXTENSION_SCREENSHOTURLS "https://mhub.ai/slicer/image01.png")
+set(EXTENSION_DEPENDS "QuantitativeReporting") # list of dependencies, space separated, e.g., '"d1" "d2" ...'
 
 #-----------------------------------------------------------------------------
 # Extension dependencies
@@ -19,7 +19,7 @@ include(${Slicer_USE_FILE})
 
 #-----------------------------------------------------------------------------
 # Extension modules
-add_subdirectory(MRunner)
+add_subdirectory(MHubRunner)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------
