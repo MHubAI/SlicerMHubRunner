@@ -24,6 +24,8 @@ import DICOMSegmentationPlugin
 import hashlib
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 #
 # MHubRunner
 #
@@ -178,6 +180,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._parameterNodeGuiTag = None
+        self._logger_configured = False
 
     def setup(self) -> None:
         """
@@ -190,6 +193,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/MHubRunner.ui'))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+
+        self._ensureLoggerConfigured()
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
@@ -226,6 +231,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
+
+        # logging
+        self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
+        self.ui.cmbLogLevel.setCurrentText("INFO")
+        self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
+        self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
 
         # search box "searchModel" and model list "lstModelList"
         self.ui.searchModel.textChanged.connect(self.onSearchModel)
@@ -274,16 +285,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # print path
         import sys
-        print(sys.path)
+        logger.debug("Python sys.path: %s", sys.path)
 
         # run which python and which pip
         import subprocess
-        print(subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
-        print(subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8'))
+        logger.debug("which python3: %s", subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
+        logger.debug("which udocker: %s", subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8'))
 
         # try the same with slicer.utils.consoleProcess
         p = slicer.util.launchConsoleProcess(["which", "python3"])
-        print(p.stdout.read())
+        logger.debug("slicer console which python3: %s", p.stdout.read())
 
     def cleanup(self) -> None:
         """
@@ -363,8 +374,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get subject hierarchy node
         shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
 
-        # print debug
-        print("SubjectHierarchyTreeView currentItemChanged: ", itemId, shNode.GetItemName(itemId))
+        logger.debug(
+            "SubjectHierarchyTreeView currentItemChanged: %s %s",
+            itemId,
+            shNode.GetItemName(itemId),
+        )
 
         # get the volume node
         volumeNode = shNode.GetItemDataNode(itemId)
@@ -384,12 +398,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # print all selected items
         for i in range(items.GetNumberOfIds()):
-            print("Selected item: ", shNode.GetItemName(items.GetId(i)))
+            logger.debug("Selected item: %s", shNode.GetItemName(items.GetId(i)))
 
         # --- selection modality
 
         # check if selected item is a volume
-        print(type(volumeNode))
+        logger.debug("Selected item type: %s", type(volumeNode))
         if volumeNode and (
             volumeNode.IsA("vtkMRMLScalarVolumeNode")
          or volumeNode.IsA("vtkMRMLSegmentationNode")
@@ -404,9 +418,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 patient_name = slicer.dicomDatabase.instanceValue(instUids[0], '0010,0010')
                 modality = slicer.dicomDatabase.instanceValue(instUids[0], '0008,0060')
 
-                print("Modality: ", modality, " | Patient", patient_name)
+                logger.debug("Modality: %s | Patient %s", modality, patient_name)
             except Exception as e:
-                print("Error accessing node's dicom data: ", e)
+                logger.warning("Error accessing node's DICOM data: %s", e)
 
 
     def onUpdateDockerExecutable(self, path) -> None:
@@ -417,7 +431,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         docker_executable = self.ui.pthDockerExecutable.currentPath
 
         # set docker executable
-        print("---docker_executable-->", docker_executable, path)
+        logger.debug("Docker executable updated: %s (from %s)", docker_executable, path)
         self.logic._executables["docker"] = docker_executable
 
     def onAutoDetectDockerExecutable(self) -> None:
@@ -438,7 +452,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         udocker_executable = self.ui.pthUDockerExecutable.currentPath
 
         # set udocker executable
-        print("---udocker_executable-->", udocker_executable, path)
+        logger.debug("Udocker executable updated: %s (from %s)", udocker_executable, path)
         self.logic._executables["udocker"] = udocker_executable
 
     def onAutoDetectUDockerExecutable(self) -> None:
@@ -450,6 +464,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # set udocker executable
         self.ui.pthUDockerExecutable.currentPath = udocker_executable
+
+    def _ensureLoggerConfigured(self) -> None:
+        if self._logger_configured:
+            return
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("[MHubRunner] %(levelname)s: %(message)s"))
+            logger.addHandler(handler)
+        logger.propagate = False
+        self._logger_configured = True
+
+    def onLogLevelChanged(self, level_text) -> None:
+        self._ensureLoggerConfigured()
+        if isinstance(level_text, int):
+            level_text = self.ui.cmbLogLevel.itemText(level_text)
+        level_name = str(level_text).upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logger.setLevel(level)
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
@@ -537,7 +569,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def onSearchModel(self, text: str) -> None:
         assert self.logic is not None
-        print("Search model: ", text)
+        logger.debug("Search model: %s", text)
 
         # get models
         models = self.logic.getModels()
@@ -697,8 +729,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # construct image name
         image_name = f"mhubai/{model.name}:latest"
 
-        # debug
-        print("Pulling image: ", image_name)
+        logger.info("Pulling image: %s", image_name)
 
         # on stop handler
         def on_stop(*args):
@@ -706,8 +737,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             button.text = "Pulled" # <-- NOTE: optimistic update
             self.updateBackendImagesList()
 
-            # debug
-            print(f"Image {image_name} pulled, args: {args}")
+            logger.debug("Image %s pulled, args: %s", image_name, args)
 
         # pull model
         self.logic.update_image(image_name, on_stop=on_stop)
@@ -744,8 +774,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         model = self.getModelFromTableSelection(row)
         model_name = model.name if model else "N/A"
 
-        # debug
-        print("Model selected: ", row, col, model_name)
+        logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
         # update apply button
         self._checkCanApply()
@@ -803,8 +832,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmdImageUpdate.enabled = selected is not None and enabled
         self.ui.cmdImageRemove.enabled = selected is not None and enabled
 
-        # debug
-        print(f"Selected image: {selected.text()}, status: {enabled}")
+        logger.debug("Selected image: %s, enabled=%s", selected.text(), enabled)
 
     def onBackendImageUpdate(self) -> None:
         assert self.logic
@@ -813,8 +841,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selected = self.ui.lstBackendImages.currentItem()
         image_name = selected.text()
 
-        # debug
-        print(f"Updating image: {image_name}")
+        logger.info("Updating image: %s", image_name)
 
         # show a message box
         msg = qt.QMessageBox()
@@ -828,8 +855,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if ret != qt.QMessageBox.Ok:
             return
 
-        # debug
-        print("Updating image")
+        logger.debug("Updating image confirmed")
 
         # add `updating...` to image and disable entry
         selected.setText(f"{image_name} (updating...)")
@@ -849,8 +875,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selected = self.ui.lstBackendImages.currentItem()
         image_name = selected.text()
 
-        # debug
-        print(f"Removing image: {image_name}")
+        logger.info("Removing image: %s", image_name)
 
         # show a message box
         msg = qt.QMessageBox()
@@ -864,8 +889,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if ret != qt.QMessageBox.Ok:
             return
 
-        # debug
-        print("Removing image")
+        logger.debug("Removing image confirmed")
 
         # add `removing...` to image and disable entry
         selected.setText(f"{image_name} (removing...)")
@@ -874,10 +898,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # on stop callback removes entry
         def on_stop(errorcode: int, stdout: str, *args):
 
-            # debug
-            print(f"/ Image {image_name} removed \\")
-            print(stdout)
-            print(f"\\ Image {image_name} removed (errorCode: {errorcode}) /")
+            logger.debug("Image %s removed (errorCode: %s)", image_name, errorcode)
+            if stdout:
+                logger.debug("Image remove stdout: %s", stdout)
 
             # FIXME: this is very optimistic...
             self.ui.lstBackendImages.takeItem(self.ui.lstBackendImages.row(selected))
@@ -948,7 +971,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         run_dirs = [str(d.name) for d in run_dirs]
 
         # run_dirs = [str(d.name) for d in os.scandir(runs_dir) if d.is_dir() and not d.name.startswith(".")]
-        print("run_dirs: ", run_dirs)
+        logger.debug("run_dirs: %s", run_dirs)
 
         # clear run list
         self.ui.cmbSelectRunOutput.clear()
@@ -977,13 +1000,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         output_dir = os.path.join(runs_dir, selected_run)
 
         # get output files
-        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv"])
+        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv", ".seg.dcm"])
 
         # clear output list
         self.ui.lstOutputFiles.clear()
 
-        # debug
-        print("Output files: ", output_files)
+        logger.debug("Output files: %s", output_files)
 
         # update list
         for output_file in output_files:
@@ -1005,17 +1027,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get output file
         output_file = selected.data(qt.Qt.UserRole)
 
-        # debug
-        print("Selected output file: ", output_file)
+        logger.debug("Selected output file: %s", output_file)
 
         # create table node
-        if not self.ui.outputTableSelector.currentNode():
-            print("create table node")
-            tableNode = slicer.vtkMRMLTableNode()
-            slicer.mrmlScene.AddNode(tableNode)
-            self.ui.outputTableSelector.setCurrentNode(tableNode)
-        else:
-            tableNode = self.ui.outputTableSelector.currentNode()
+        if output_file.endswith(".json") or output_file.endswith(".csv"):
+            if not self.ui.outputTableSelector.currentNode():
+                logger.debug("Creating table node")
+                tableNode = slicer.vtkMRMLTableNode()
+                slicer.mrmlScene.AddNode(tableNode)
+                self.ui.outputTableSelector.setCurrentNode(tableNode)
+            else:
+                tableNode = self.ui.outputTableSelector.currentNode()
 
         # if file is json, open text
         if output_file.endswith(".json"):
@@ -1047,8 +1069,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # flatten json
             data = flatten_json(data)
 
-            # debug
-            print("Flattened json: ", data)
+            logger.debug("Flattened json: %s", data)
 
             # create table
             self.logic.renderTableData(tableNode, ["Key", "Value"], [[k, v] for k, v in data.items()])
@@ -1065,6 +1086,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # create table
             self.logic.renderTableData(tableNode, csv_header, csv_data)
+
+        elif output_file.endswith(".seg.dcm"):
+
+            self.logic.openSegmentation()
 
     def onCancelButton(self) -> None:
 
@@ -1137,7 +1162,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         model = self.getModelFromTableSelection()
         assert model is not None, "No model selected"
 
-        print(instance_idh)
+        logger.debug("Instance UID hash: %s", instance_idh)
 
         # runid as yy.mm.dd-hh.mm.ss-model.name
         runid = f"{datetime.now().strftime('%y.%m.%d-%H.%M.%S')}_{model.name}"
@@ -1171,7 +1196,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 for i in range(self.ui.lstHostGpu.count):
                     item = self.ui.lstHostGpu.item(i)
                     if item.checkState() == qt.Qt.Checked:
-                        print("Selected GPU: ", item.text())
+                        logger.debug("Selected GPU: %s", item.text())
                         gpus.append(i)
 
             # copy selected dicom data into input directory
@@ -1205,6 +1230,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
                     self.logic.addFilesToDatabase(dsegfiles, operation="copy")
                     self.logic.importSegmentations(dsegfiles)
+                    self.logic.openSegmentation(dsegfiles)
 
                 if 'Prediction' in model.categories:
                     self.updateOutputRunDirectories(open_latest=True)
@@ -1540,15 +1566,18 @@ class ProgressObserver:
         stdout_file = tempfile.NamedTemporaryFile(delete=False, prefix="mhub_slicer_stdout_", suffix=".txt")
         stdout_file.close()
 
-        print("Temp File Created: ", stdout_file.name)
+        logger.debug("Temp file created: %s", stdout_file.name)
         self._stdout_file_name = stdout_file.name
 
         # create empty file
         with open(stdout_file.name, 'w') as f:
             f.write("")
 
-        # print if file exists
-        print("Temp File Exists: ", self._stdout_file_name, os.path.exists(self._stdout_file_name))
+        logger.debug(
+            "Temp file exists: %s %s",
+            self._stdout_file_name,
+            os.path.exists(self._stdout_file_name),
+        )
         self._stdout_readpointer = 0
 
         # run command
@@ -1576,7 +1605,11 @@ class ProgressObserver:
     def _stop(self, returncode: int, timedout: bool, killed: bool):
 
         # cleanup (delete stdout file)
-        print("read and remove temp stdout file", self._stdout_file_name, os.path.exists(self._stdout_file_name))
+        logger.debug(
+            "Read and remove temp stdout file: %s %s",
+            self._stdout_file_name,
+            os.path.exists(self._stdout_file_name),
+        )
 
         # retrieve stdout
         with open(self._stdout_file_name, encoding='utf-8') as f:
@@ -1644,8 +1677,8 @@ class ProgressObserver:
         # try to stop
         try:
             self._stop(-1, False, True)
-        except Exception as e:
-            print("Error when killing process: stop method failed. ", self.cmd, e)
+        except Exception:
+            logger.exception("Error when killing process: stop method failed. cmd=%s", self.cmd)
 
         # then stop timer, kill process and remove from tasks
         if self._proc is not None:
@@ -1884,12 +1917,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             except Exception as e:
                 pass
 
-        # debug
-        print("Docker executable: ", docker_executable)
+        logger.debug("Docker executable: %s", docker_executable)
 
         # error
         if docker_executable is None or docker_executable == "":
-            print("WARNING: ", "Docker executable not found.")
+            logger.warning("Docker executable not found.")
 
         # cache
         if docker_executable:
@@ -1925,12 +1957,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             except Exception as e:
                 pass
 
-        # debug
-        print("U-Docker executable: ", udocker_executable)
+        logger.debug("U-Docker executable: %s", udocker_executable)
 
         # error
         if udocker_executable is None or udocker_executable == "":
-            print("WARNING: ", "U-Docker executable not found.")
+            logger.warning("U-Docker executable not found.")
 
         # cache
         if udocker_executable:
@@ -1951,11 +1982,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             try:
                 docker_exec = self.getDockerExecutable()
                 assert docker_exec is not None, "Docker executable not found"
-                print("running" , docker_exec, "--version")
+                logger.debug("Running %s --version", docker_exec)
                 result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True)
                 bi.version = result.stdout.decode('utf-8')
                 bi.available = True
-                print("Docker available")
+                logger.debug("Docker available")
             except Exception as e:
                 bi.version = "E"
                 bi.available = False
@@ -1974,16 +2005,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 # run
                 udocker_exec = self.getUDockerExecutable()
                 assert udocker_exec is not None, "Udocker executable not found"
-                print("running: ", udocker_exec, "--version")
+                logger.debug("Running %s --version", udocker_exec)
                 result = subprocess.run([udocker_exec, "--version"], timeout=5, check=True, capture_output=True)
-                print("result: ", result.stdout.decode('utf-8'))
+                logger.debug("Udocker --version output: %s", result.stdout.decode('utf-8'))
 
                 # extract "version: x.x.x" from string
                 version = re.search(r"version: ([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.decode('utf-8'))
 
                 bi.version = f"Version: {version.groups()[0]}" if version else "???"
                 bi.available = True
-                print("Udocker available")
+                logger.debug("Udocker available")
 
             except Exception as e:
                 bi.version = "E"
@@ -2115,7 +2146,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """
         Switch to a layout where tables are visible and show the selected one.
         """
-        print("Show table view")
+        logger.debug("Show table view")
         currentLayout = slicer.app.layoutManager().layout
         layoutWithTable = slicer.modules.tables.logic().GetLayoutWithTable(currentLayout)
         slicer.app.layoutManager().setLayout(layoutWithTable)
@@ -2179,7 +2210,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # print number of files
         if verbose:
-            print(f"number of files: {len(files)}")
+            logger.debug("Number of files: %s", len(files))
 
         # check if the path exists
         if not os.path.exists(copy_dir):
@@ -2219,7 +2250,12 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # callback wrapper
         def _on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
-            print(f"Command chain stopped with return code {returncode}. Timedout [{timedout}] Killed [{killed}]")
+            logger.info(
+                "Command chain stopped with return code %s. Timedout [%s] Killed [%s]",
+                returncode,
+                timedout,
+                killed,
+            )
             onStop(returncode, stdout, timedout, killed)
 
         # run async
@@ -2238,7 +2274,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             onProgress(float(time), "")
 
         def _on_stop(success: bool):
-            print(f"Command chain stopped with success: {success}")
+            logger.info("Command chain stopped with success: %s", success)
             onStop(int(success), "", False, False)
 
         # initialize async processing chain
@@ -2248,11 +2284,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # setup gpu if required
         if gpu:
-            print("udocker with gpu")
+            logger.debug("Udocker with GPU")
 
             # check if image is already available or optionally pull image
             images = self.getLocalImages("udocker", cached=True)
-            print(images)
+            logger.debug("Udocker local images: %s", images)
             if f"mhubai/{model.name}:latest" not in images:
                 pull_cmd = [udocker_exec, "pull", f"mhubai/{model.name}:latest"]
                 pc.add(pull_cmd, name="Pull image")
@@ -2276,7 +2312,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
             # print execution plan
             for cmd in pc.cmds:
-                print(cmd.name, cmd.cmd)
+                logger.debug("Udocker cmd: %s %s", cmd.name, cmd.cmd)
 
         else:
 
@@ -2349,9 +2385,10 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # log output (DEBUG ONLY)
         def onProgress(t: float, stdout: str):
-            print(f">> __pull image ({t})__")
+            logger.debug("Pull image progress: %s", t)
             for line in stdout.split("\n"):
-                print(f">> {line}")
+                if line:
+                    logger.debug("Pull image: %s", line)
 
         po.onProgress(onProgress)
 
@@ -2372,6 +2409,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # DICOM indexer uses the current DICOM database folder as the basis for relative paths,
         # therefore we must convert the folder path to absolute to ensure this code works
         # even when a relative path is used as self.extractedFilesDirectory.
+
+        # TODO: check https://github.com/ImagingDataCommons/SlicerIDCBrowser/blob/67d3ea7117749254b83d5fcdad88828096c4748f/IDCBrowser/IDCBrowser.py#L1006-L1019
 
         # get indexer
         indexer = ctk.ctkDICOMIndexer()
@@ -2401,9 +2440,26 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # examine files
         loadables = importer.examineFiles(files)
 
+        logger.debug("Segmentation loadables: %s", loadables)
+
         # import files
-        for loadable in loadables:
-            importer.load(loadable)
+        # for loadable in loadables:
+        #     importer.load(loadable)
+
+
+    def openSegmentation(self, files: list[str]):
+
+        # Load the DICOM Segmentation
+        from DICOMLib import DICOMUtils
+
+        # read dicom files
+
+        # If you know the specific Study/Series UID or other identifiers
+        # seriesInstanceUID = ["1.3.6.1.4.1.14519.5.2.1.6834.5010.254012015145965303823476992753"]  # CT
+        # seriesInstanceUID = ["1.2.276.0.7230010.3.1.3.0.137.1738238573.133411"]                   # SEG
+
+        # Load the segmentation
+        loadedNodes = DICOMUtils.loadSeriesByUID([seriesInstanceUID])
 
 #
 # MHubRunnerTest
