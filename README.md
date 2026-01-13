@@ -26,7 +26,7 @@ You will now see the graphical user interface (GUI) of the module.
 Here you see an overview of all available MHub.ai models.
 You can use the search box to find models suitable for your use case.
 
-Additional model information such as a short description of the model, the modalitier and the expected input data can be displayed using the details button.
+Additional model information such as a short description of the model, the modalities and the expected input data can be displayed using the details button.
 For more information, you can open the model card on MHub.ai using the web button which will take you directly to the model page.
 
 ## Input Image
