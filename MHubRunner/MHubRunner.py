@@ -1561,13 +1561,14 @@ class ProgressObserver:
         import subprocess
 
         # run command
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=open(self._stdout_file_name, 'w', encoding='utf-8'),
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8'
-        )
+        with open(self._stdout_file_name, 'w', encoding='utf-8') as stdout_file:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=stdout_file,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8'
+            )
 
         # start timer
         self._timer.start()
