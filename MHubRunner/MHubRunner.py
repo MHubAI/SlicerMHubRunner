@@ -180,7 +180,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._parameterNodeGuiTag = None
-        self._logger_configured = False
 
     def setup(self) -> None:
         """
@@ -466,14 +465,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.pthUDockerExecutable.currentPath = udocker_executable
 
     def _ensureLoggerConfigured(self) -> None:
-        if self._logger_configured:
-            return
-        if not logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("[MHubRunner] %(levelname)s: %(message)s"))
-            logger.addHandler(handler)
-        logger.propagate = False
-        self._logger_configured = True
+        for handler in list(logger.handlers):
+            if getattr(handler, "_mhubrunner_handler", False):
+                logger.removeHandler(handler)
+        logger.propagate = True
 
     def onLogLevelChanged(self, level_text) -> None:
         self._ensureLoggerConfigured()
