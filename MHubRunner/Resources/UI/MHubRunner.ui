@@ -90,28 +90,42 @@
            </widget>
           </item>
           <item row="1" column="1">
-           <widget class="qMRMLNodeComboBox" name="inputSelector">
-            <property name="toolTip">
-             <string>Pick the input to the algorithm.</string>
-            </property>
-            <property name="nodeTypes">
-             <stringlist notr="true">
-              <string>vtkMRMLScalarVolumeNode</string>
-             </stringlist>
-            </property>
-            <property name="showChildNodeTypes">
-             <bool>false</bool>
-            </property>
-            <property name="addEnabled">
-             <bool>false</bool>
-            </property>
-            <property name="removeEnabled">
-             <bool>false</bool>
-            </property>
-            <property name="SlicerParameterName" stdset="0">
-             <string>inputVolume</string>
-            </property>
-           </widget>
+           <layout class="QHBoxLayout" name="horizontalLayout_inputSelector">
+            <item>
+             <widget class="qMRMLNodeComboBox" name="inputSelector">
+              <property name="toolTip">
+               <string>Pick the input to the algorithm.</string>
+              </property>
+              <property name="nodeTypes">
+               <stringlist notr="true">
+                <string>vtkMRMLScalarVolumeNode</string>
+               </stringlist>
+              </property>
+              <property name="showChildNodeTypes">
+               <bool>false</bool>
+              </property>
+              <property name="addEnabled">
+               <bool>false</bool>
+              </property>
+              <property name="removeEnabled">
+               <bool>false</bool>
+              </property>
+              <property name="SlicerParameterName" stdset="0">
+               <string>inputVolume</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLabel" name="lblInputModality">
+              <property name="text">
+               <string>Modality</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QComboBox" name="cmbInputModality"/>
+            </item>
+           </layout>
           </item>
          </layout>
         </widget>

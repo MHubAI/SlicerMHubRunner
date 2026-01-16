@@ -341,6 +341,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.tblModelList.connect('cellClicked(int, int)', self.onModelSelectFromTable)
         self.onSearchModel("")
 
+        # input modality (for non-DICOM volumes)
+        if hasattr(self.ui, "cmbInputModality"):
+            self.ui.cmbInputModality.addItems(["CT", "MR", "NM", "US", "PT", "CR", "SC"])
+            self.ui.cmbInputModality.setCurrentText("CT")
+            self.ui.cmbInputModality.enabled = False
+        if hasattr(self.ui, "inputSelector"):
+            self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
+
         # executable paths
         settings = qt.QSettings()
         docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
@@ -356,6 +364,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         self.updateSettingsSummary()
         self.updateLicenseSummary()
+        self._updateInputModalityState()
 
         # setup SubjectHierarchyTreeView
         # -> https://apidocs.slicer.org/v4.8/classqMRMLSubjectHierarchyTreeView.html#a3214047490b8efd11dc9abf59c646495
@@ -487,6 +496,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update the (old) input selector based on selection
         if volumeNode:
             self.ui.inputSelector.setCurrentNode(volumeNode)
+            self._updateInputModalityState(volumeNode)
             self._checkCanApply()
 
         # --- multi selection:
@@ -905,6 +915,31 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateLicenseSummary(model)
         self._updateMainButtonIcons()
 
+    def onInputNodeChanged(self, node=None) -> None:
+        self._updateInputModalityState(node)
+
+    def _updateInputModalityState(self, node=None) -> None:
+        if not hasattr(self.ui, "cmbInputModality"):
+            return
+        if node is None:
+            node = self.ui.inputSelector.currentNode() if hasattr(self.ui, "inputSelector") else None
+        if node is None:
+            self.ui.cmbInputModality.enabled = False
+            return
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        if instanceUIDs:
+            self.ui.cmbInputModality.enabled = False
+            modality = None
+            try:
+                inst_uids = instanceUIDs.split()
+                if inst_uids:
+                    modality = slicer.dicomDatabase.instanceValue(inst_uids[0], '0008,0060')
+            except Exception:
+                modality = None
+            if modality and modality in [self.ui.cmbInputModality.itemText(i) for i in range(self.ui.cmbInputModality.count)]:
+                self.ui.cmbInputModality.setCurrentText(modality)
+            return
+        self.ui.cmbInputModality.enabled = True
 
     def onKillObservedProcessesButton(self) -> None:
         """
@@ -1738,6 +1773,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get InstanceUIDs (only available for nodes loaded through the dicom module)
         node = self.ui.inputSelector.currentNode()
         instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
+        input_is_dicom = bool(instanceUIDs)
 
         # create hash from instanceUIDs if available
         if instanceUIDs:
@@ -1790,9 +1826,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                         gpus.append(i)
 
             # copy selected dicom data into input directory
+            modality = None
+            if hasattr(self.ui, "cmbInputModality"):
+                modality = self.ui.cmbInputModality.currentText
             self.logic.copy_node(
                 self.ui.inputSelector.currentNode(),
-                input_dir
+                input_dir,
+                modality=modality
             )
 
             # clear logs
@@ -1811,7 +1851,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
                 if 'Segmentation' in model.categories:
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    self.logic.addFilesToDatabase(dsegfiles, operation="copy")
+                    if input_is_dicom:
+                        self.logic.addFilesToDatabase(dsegfiles, operation="copy")
                     self.logic.importSegmentations(dsegfiles)
 
                 if 'Prediction' in model.categories:
@@ -2573,19 +2614,80 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         return images
 
     def get_node_paths(self, node) -> list[str]:
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
+        if instanceUIDs:
+            instanceUIDs = instanceUIDs.split()
+            files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
+            return [f for f in files if f]
+
         storageNode = node.GetStorageNode() if node else None
         if storageNode is not None:
             file_path = storageNode.GetFullNameFromFileName()
             if file_path:
                 return [file_path]
 
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
-        if not instanceUIDs:
-            raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
+        raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
 
-        instanceUIDs = instanceUIDs.split()
-        files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
-        return [f for f in files if f]
+    def _normalize_modality(self, modality: str | None) -> str:
+        if not modality:
+            return "SC"
+        normalized = str(modality).strip().upper()
+        if normalized in ("CT", "MR", "NM", "US", "PT", "CR", "SC"):
+            return normalized
+        return "SC"
+
+    def _build_dicom_export_tags(self, volume_node, modality: str | None = None) -> dict[str, str]:
+        now = datetime.now()
+        date = now.strftime("%Y%m%d")
+        time_value = now.strftime("%H%M%S")
+        volume_name = volume_node.GetName() if volume_node else "SlicerVolume"
+        try:
+            import pydicom
+        except Exception as exc:
+            raise RuntimeError("pydicom is required to generate DICOM UIDs.") from exc
+        study_uid = pydicom.uid.generate_uid()
+        series_uid = pydicom.uid.generate_uid()
+        frame_uid = pydicom.uid.generate_uid()
+
+        return {
+            "Patient Name": "Slicer^User",
+            "Patient ID": "Slicer",
+            "Patient Birth Date": "",
+            "Patient Sex": "",
+            "Patient Comments": "",
+            "Study ID": f"SLICER-{date}",
+            "Study Date": date,
+            "Study Time": time_value,
+            "Study Description": "Slicer Export",
+            "Modality": self._normalize_modality(modality),
+            "Manufacturer": "3D Slicer",
+            "Model": "MHubRunner",
+            "Series Description": volume_name,
+            "Series Number": "1",
+            "Series Date": date,
+            "Series Time": time_value,
+            "Content Date": date,
+            "Content Time": time_value,
+            "Study Instance UID": study_uid,
+            "Series Instance UID": series_uid,
+            "Frame of Reference UID": frame_uid,
+        }
+
+    def export_volume_to_dicom(self, volume_node, output_dir: str, modality: str | None = None) -> list[str]:
+        if not volume_node or not volume_node.IsA("vtkMRMLScalarVolumeNode"):
+            raise ValueError("Selected input node must be a scalar volume.")
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            from DICOMLib import DICOMExportScalarVolume
+        except Exception as exc:
+            raise RuntimeError("DICOM export is unavailable in this Slicer build.") from exc
+
+        tags = self._build_dicom_export_tags(volume_node, modality=modality)
+        exporter = DICOMExportScalarVolume(tags["Study ID"], volume_node, tags, output_dir)
+        if not exporter.export():
+            raise RuntimeError("Creating DICOM files from the selected volume failed.")
+
+        return self.scanDirectoryForFilesWithExtension(output_dir, extension=[])
 
     def renderTableData(self, tableNode, header: list[str], data: list[list[str]]) -> None:
 
@@ -2678,29 +2780,32 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
     #             # let slicer breathe :D
     #             slicer.app.processEvents()
 
-    def copy_node(self, node, copy_dir: str, verbose: bool = True):
+    def copy_node(self, node, copy_dir: str, verbose: bool = True, modality: str | None = None):
         """
         Copy all dicom files from a dicom image node to the specified location.
         """
         import shutil
 
-        # get list of all dicom files
-        files = self.get_node_paths(node)
+        if node is None:
+            raise ValueError("No input node selected.")
 
-        # print number of files
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        if instanceUIDs:
+            files = self.get_node_paths(node)
+            if verbose:
+                logger.debug("Number of files: %s", len(files))
+            if not os.path.exists(copy_dir):
+                os.makedirs(copy_dir)
+            for file in files:
+                shutil.copy(file, copy_dir)
+                slicer.app.processEvents()
+            return
+
         if verbose:
-            logger.debug("Number of files: %s", len(files))
-
-        # check if the path exists
-        if not os.path.exists(copy_dir):
-            os.makedirs(copy_dir)
-
-        # copy all files to the specified location
-        for file in files:
-            shutil.copy(file, copy_dir)
-
-            # let slicer breathe :D
-            slicer.app.processEvents()
+            logger.info("Exporting non-DICOM volume to DICOM for model input.")
+        files = self.export_volume_to_dicom(node, copy_dir, modality=modality)
+        if verbose:
+            logger.debug("Exported %s DICOM files.", len(files))
 
     def _run_mhub_docker(self, model: 'Model', gpus: list[int] | None, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
 
