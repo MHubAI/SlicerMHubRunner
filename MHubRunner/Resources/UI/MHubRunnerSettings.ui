@@ -67,7 +67,7 @@
       </widget>
      </item>
      <item>
-      <spacer name="verticalSpacer_mhubCitation">
+      <spacer name="verticalSpacer_mhubContribution">
        <property name="orientation">
         <enum>Qt::Vertical</enum>
        </property>
