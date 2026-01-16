@@ -791,10 +791,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
-        for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
-            widget = getattr(self.ui, attr, None)
-            if widget is not None:
-                widget.collapsed = False
+        # for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
+        #     widget = getattr(self.ui, attr, None)
+        #     if widget is not None:
+        #         widget.collapsed = False
         if self._settingsDialog is None:
             self._closeStaleSettingsDialogs()
             dialog = qt.QDialog(slicer.util.mainWindow())
@@ -809,6 +809,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 settings_widget.show()
                 layout.addWidget(settings_widget)
             dialog.setLayout(layout)
+            dialog.setMinimumWidth(520)
             self._settingsDialog = dialog
         self._settingsDialog.show()
         self._settingsDialog.raise_()

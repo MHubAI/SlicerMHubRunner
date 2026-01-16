@@ -16,22 +16,47 @@
      </property>
      <layout class="QVBoxLayout" name="verticalLayout_mhubInfo">
       <item>
-      <widget class="QPushButton" name="cmdShowDockerSetup">
-       <property name="autoDefault">
-        <bool>false</bool>
-       </property>
-       <property name="default">
-        <bool>false</bool>
-       </property>
+      <widget class="QLabel" name="lblMHubLinks">
        <property name="text">
-        <string>Show Docker Setup Screen</string>
+        <string><![CDATA[MHub.ai is an open source platform for standardized, tested and simple to use medical imaging AI models. Learn more at <a href="https://mhub.ai">mhub.ai</a> and browse the model repository at <a href="https://mhub.ai/models">mhub.ai/models</a>.]]></string>
+       </property>
+       <property name="wordWrap">
+        <bool>true</bool>
+       </property>
+       <property name="openExternalLinks">
+        <bool>true</bool>
        </property>
       </widget>
      </item>
      <item>
-      <widget class="QLabel" name="lblMHubLinks">
+      <spacer name="verticalSpacer_mhubCitation">
+       <property name="orientation">
+        <enum>Qt::Vertical</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>20</width>
+         <height>12</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QLabel" name="lblMHubContributionTitle">
+       <property name="font">
+        <font>
+         <bold>true</bold>
+        </font>
+       </property>
        <property name="text">
-        <string><![CDATA[Learn more at <a href="https://mhub.ai">mhub.ai</a> and browse the model repository at <a href="https://mhub.ai/models">mhub.ai/models</a>.]]></string>
+        <string>Model Contribution</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="lblMHubContribution">
+       <property name="text">
+        <string><![CDATA[The MHub.ai framework wraps pre-trained AI models in a standardized DICOM-to-DICOM container. Find developer resources, tutorials, and contribution details at <a href="https://mhub.ai/contribute">mhub.ai/contribute</a>.]]></string>
        </property>
        <property name="wordWrap">
         <bool>true</bool>
@@ -229,6 +254,19 @@
           </property>
          </widget>
         </item>
+        <item>
+         <widget class="QPushButton" name="cmdShowDockerSetup">
+          <property name="autoDefault">
+           <bool>false</bool>
+          </property>
+          <property name="default">
+           <bool>false</bool>
+          </property>
+          <property name="text">
+           <string>Show Docker Setup Screen</string>
+          </property>
+         </widget>
+        </item>
        </layout>
       </item>
       <item row="3" column="0">
@@ -371,7 +409,7 @@
       <string>Advanced</string>
      </property>
      <property name="collapsed">
-      <bool>false</bool>
+      <bool>true</bool>
      </property>
      <property name="collapsedHeight">
       <number>0</number>
@@ -428,7 +466,7 @@
       <string>Log</string>
      </property>
      <property name="collapsed">
-      <bool>false</bool>
+      <bool>true</bool>
      </property>
      <property name="collapsedHeight">
       <number>0</number>
