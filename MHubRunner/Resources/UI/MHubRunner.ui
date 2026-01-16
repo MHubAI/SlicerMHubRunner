@@ -19,38 +19,38 @@
      <widget class="QWidget" name="mainPanel">
       <layout class="QVBoxLayout" name="verticalLayout_main">
        <item>
-          <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
-           <property name="text">
-            <string>Step 1 - Search and Select MHub.ai Model</string>
-           </property>
-           <property name="sizePolicy">
-            <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
-             <horstretch>0</horstretch>
-             <verstretch>1</verstretch>
-            </sizepolicy>
-           </property>
-           <property name="collapsed">
-            <bool>false</bool>
-           </property>
+        <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
+         <property name="sizePolicy">
+          <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+           <horstretch>0</horstretch>
+           <verstretch>1</verstretch>
+          </sizepolicy>
+         </property>
+         <property name="text">
+          <string>Step 1 - Search and Select MHub.ai Model</string>
+         </property>
+         <property name="collapsed">
+          <bool>false</bool>
+         </property>
          <property name="collapsedHeight">
           <number>0</number>
          </property>
-           <layout class="QFormLayout" name="formLayout_4">
-            <item row="0" column="1">
-             <widget class="ctkSearchBox" name="searchModel"/>
-            </item>
-            <item row="3" column="1">
-             <widget class="QTableWidget" name="tblModelList">
-              <property name="sizePolicy">
-               <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-                <horstretch>0</horstretch>
-                <verstretch>1</verstretch>
-               </sizepolicy>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </widget>
+         <layout class="QFormLayout" name="formLayout_4">
+          <item row="0" column="1">
+           <widget class="ctkSearchBox" name="searchModel"/>
+          </item>
+          <item row="3" column="1">
+           <widget class="QTableWidget" name="tblModelList">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+              <horstretch>0</horstretch>
+              <verstretch>1</verstretch>
+             </sizepolicy>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
        </item>
        <item>
         <widget class="ctkCollapsibleButton" name="inputsCollapsibleButton">
@@ -180,7 +180,7 @@
         </widget>
        </item>
        <item>
-        <layout class="QHBoxLayout" name="horizontalLayout_5" stretch="0,0">
+        <layout class="QHBoxLayout" name="horizontalLayout_5" stretch="0,0,0">
          <property name="spacing">
           <number>10</number>
          </property>
@@ -223,530 +223,66 @@
            </property>
           </widget>
          </item>
-       </layout>
-      </item>
-      <item>
-       <widget class="QLabel" name="lblLicenseSummary">
-        <property name="text">
-         <string/>
-        </property>
-        <property name="wordWrap">
-         <bool>true</bool>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QLabel" name="lblSetupSummary">
-        <property name="text">
-         <string/>
-        </property>
-        <property name="wordWrap">
-         <bool>true</bool>
-        </property>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="lblLicenseSummary">
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>20</height>
+          </size>
+         </property>
+         <property name="text">
+          <string/>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
         </widget>
        </item>
        <item>
-        <widget class="QWidget" name="settingsPanel">
-         <property name="visible">
-          <bool>false</bool>
+        <widget class="QLabel" name="lblSetupSummary">
+         <property name="maximumSize">
+          <size>
+           <width>16777215</width>
+           <height>20</height>
+          </size>
          </property>
-         <layout class="QVBoxLayout" name="verticalLayout_settings">
-          <item>
-           <widget class="ctkCollapsibleButton" name="mhubInfoCollapsibleButton">
-            <property name="text">
-             <string>MHub.ai</string>
-            </property>
-            <property name="collapsed">
-             <bool>false</bool>
-            </property>
-            <property name="collapsedHeight">
-             <number>0</number>
-            </property>
-            <layout class="QVBoxLayout" name="verticalLayout_mhubInfo">
-             <item>
-             <widget class="QPushButton" name="cmdShowDockerSetup">
-              <property name="autoDefault">
-               <bool>false</bool>
-              </property>
-              <property name="default">
-               <bool>false</bool>
-              </property>
-              <property name="text">
-               <string>Show Docker Setup Screen</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lblMHubLinks">
-              <property name="text">
-               <string><![CDATA[Learn more at <a href="https://mhub.ai">mhub.ai</a> and browse the model repository at <a href="https://mhub.ai/models">mhub.ai/models</a>.]]></string>
-              </property>
-              <property name="wordWrap">
-               <bool>true</bool>
-              </property>
-              <property name="openExternalLinks">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <spacer name="verticalSpacer_mhubCitation">
-              <property name="orientation">
-               <enum>Qt::Vertical</enum>
-              </property>
-              <property name="sizeHint" stdset="0">
-               <size>
-                <width>20</width>
-                <height>12</height>
-               </size>
-              </property>
-             </spacer>
-            </item>
-            <item>
-             <widget class="QLabel" name="lblMHubCitationTitle">
-              <property name="font">
-               <font>
-                <bold>true</bold>
-               </font>
-              </property>
-              <property name="text">
-               <string>Citation</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QLabel" name="lblMHubCitation">
-              <property name="text">
-               <string><![CDATA[If you use MHub.ai in your work, please cite: <a href="https://arxiv.org/abs/2601.10154">arXiv:2601.10154</a>.]]></string>
-              </property>
-               <property name="wordWrap">
-                <bool>true</bool>
-               </property>
-               <property name="openExternalLinks">
-                <bool>true</bool>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <widget class="ctkCollapsibleButton" name="ctkCollapsibleButton">
-            <property name="text">
-             <string>GPU</string>
-            </property>
-            <property name="checkable">
-             <bool>true</bool>
-            </property>
-            <property name="collapsed">
-             <bool>false</bool>
-            </property>
-            <property name="collapsedHeight">
-             <number>0</number>
-            </property>
-            <layout class="QFormLayout" name="formLayout">
-             <item row="1" column="0">
-              <widget class="QLabel" name="label_5">
-               <property name="minimumSize">
-                <size>
-                 <width>120</width>
-                 <height>0</height>
-                </size>
-               </property>
-               <property name="text">
-                <string>Available GPUs</string>
-               </property>
-               <property name="wordWrap">
-                <bool>true</bool>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="1">
-              <widget class="QListWidget" name="lstHostGpu">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
-                 <horstretch>0</horstretch>
-                 <verstretch>0</verstretch>
-                </sizepolicy>
-               </property>
-               <property name="maximumSize">
-                <size>
-                 <width>16777215</width>
-                 <height>50</height>
-                </size>
-               </property>
-              </widget>
-             </item>
-             <item row="3" column="0">
-              <widget class="QLabel" name="lblHostTestStatus">
-               <property name="font">
-                <font>
-                 <italic>true</italic>
-                </font>
-               </property>
-               <property name="text">
-                <string/>
-               </property>
-              </widget>
-             </item>
-             <item row="3" column="1">
-              <widget class="QCheckBox" name="chkGpuEnabled">
-               <property name="text">
-                <string>Use GPU Acceleration</string>
-               </property>
-               <property name="checked">
-                <bool>true</bool>
-               </property>
-              </widget>
-             </item>
-             <item row="2" column="1">
-              <widget class="QPushButton" name="cmdReloadHostGpus">
-               <property name="text">
-                <string>Refresh</string>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <widget class="ctkCollapsibleButton" name="CollapsibleButton">
-            <property name="enabled">
-             <bool>true</bool>
-            </property>
-            <property name="sizePolicy">
-             <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
-              <horstretch>0</horstretch>
-              <verstretch>0</verstretch>
-             </sizepolicy>
-            </property>
-            <property name="text">
-             <string>Docker</string>
-            </property>
-            <property name="collapsed">
-             <bool>false</bool>
-            </property>
-            <property name="collapsedHeight">
-             <number>0</number>
-            </property>
-            <layout class="QFormLayout" name="formLayout_5">
-             <item row="0" column="0">
-              <widget class="QLabel" name="label_8">
-               <property name="minimumSize">
-                <size>
-                 <width>120</width>
-                 <height>25</height>
-                </size>
-               </property>
-               <property name="maximumSize">
-                <size>
-                 <width>16777215</width>
-                 <height>16777215</height>
-                </size>
-               </property>
-               <property name="text">
-                <string>Docker</string>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="1">
-              <layout class="QHBoxLayout" name="horizontalLayout_2">
-               <property name="spacing">
-                <number>5</number>
-               </property>
-               <item>
-                <widget class="QPushButton" name="cmdBackendReload">
-                 <property name="minimumSize">
-                  <size>
-                   <width>0</width>
-                   <height>0</height>
-                  </size>
-                 </property>
-                 <property name="maximumSize">
-                  <size>
-                   <width>70</width>
-                   <height>25</height>
-                  </size>
-                 </property>
-                 <property name="text">
-                  <string>Refresh</string>
-                 </property>
-                 <property name="icon">
-                  <iconset theme="reload">
-                   <normaloff>../../../../../../../../../../.designer/backup</normaloff>../../../../../../../../../../.designer/backup</iconset>
-                 </property>
-                </widget>
-               </item>
-              </layout>
-             </item>
-             <item row="3" column="0">
-              <widget class="QLabel" name="label_9">
-               <property name="minimumSize">
-                <size>
-                 <width>0</width>
-                 <height>25</height>
-                </size>
-               </property>
-               <property name="maximumSize">
-                <size>
-                 <width>16777215</width>
-                 <height>16777215</height>
-                </size>
-               </property>
-               <property name="text">
-                <string>Version</string>
-               </property>
-              </widget>
-             </item>
-             <item row="3" column="1">
-              <widget class="QLabel" name="lblBackendVersion">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-                 <horstretch>0</horstretch>
-                 <verstretch>0</verstretch>
-                </sizepolicy>
-               </property>
-               <property name="minimumSize">
-                <size>
-                 <width>0</width>
-                 <height>25</height>
-                </size>
-               </property>
-               <property name="maximumSize">
-                <size>
-                 <width>400</width>
-                 <height>16777215</height>
-                </size>
-               </property>
-               <property name="text">
-                <string>N/A</string>
-               </property>
-               <property name="wordWrap">
-                <bool>true</bool>
-               </property>
-              </widget>
-             </item>
-             <item row="5" column="0">
-              <layout class="QVBoxLayout" name="verticalLayout_2">
-               <property name="spacing">
-                <number>5</number>
-               </property>
-               <item>
-                <widget class="QLabel" name="label_2">
-                 <property name="sizePolicy">
-                  <sizepolicy hsizetype="Preferred" vsizetype="Minimum">
-                   <horstretch>2</horstretch>
-                   <verstretch>0</verstretch>
-                  </sizepolicy>
-                 </property>
-                 <property name="text">
-                  <string>Local Images</string>
-                 </property>
-                 <property name="alignment">
-                  <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignTop</set>
-                 </property>
-                </widget>
-               </item>
-               <item>
-                <layout class="QHBoxLayout" name="horizontalLayout">
-                 <property name="spacing">
-                  <number>5</number>
-                 </property>
-                 <item>
-                  <widget class="QPushButton" name="cmdImageUpdate">
-                   <property name="enabled">
-                    <bool>false</bool>
-                   </property>
-                   <property name="maximumSize">
-                    <size>
-                     <width>55</width>
-                     <height>16777215</height>
-                    </size>
-                   </property>
-                   <property name="text">
-                    <string>Update</string>
-                   </property>
-                  </widget>
-                 </item>
-                 <item>
-                  <widget class="QPushButton" name="cmdImageRemove">
-                   <property name="enabled">
-                    <bool>false</bool>
-                   </property>
-                   <property name="maximumSize">
-                    <size>
-                     <width>55</width>
-                     <height>16777215</height>
-                    </size>
-                   </property>
-                   <property name="text">
-                    <string>Remove</string>
-                   </property>
-                  </widget>
-                 </item>
-                </layout>
-               </item>
-              </layout>
-             </item>
-             <item row="5" column="1">
-              <widget class="QListWidget" name="lstBackendImages">
-               <property name="sizePolicy">
-                <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
-                 <horstretch>0</horstretch>
-                 <verstretch>0</verstretch>
-                </sizepolicy>
-               </property>
-               <property name="minimumSize">
-                <size>
-                 <width>0</width>
-                 <height>80</height>
-                </size>
-               </property>
-               <property name="maximumSize">
-                <size>
-                 <width>16777215</width>
-                 <height>80</height>
-                </size>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <widget class="ctkCollapsibleButton" name="advancedCollapsibleButton">
-            <property name="text">
-             <string>Advanced</string>
-            </property>
-            <property name="collapsed">
-             <bool>false</bool>
-            </property>
-            <property name="collapsedHeight">
-             <number>0</number>
-            </property>
-            <layout class="QFormLayout" name="formLayout_3">
-             <item row="0" column="0">
-              <widget class="QLabel" name="label">
-               <property name="text">
-                <string>Runs Directory</string>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="1">
-              <widget class="ctkPathLineEdit" name="pthRunsDirectory">
-               <property name="filters">
-                <set>ctkPathLineEdit::Dirs|ctkPathLineEdit::Executable|ctkPathLineEdit::NoDot|ctkPathLineEdit::NoDotDot|ctkPathLineEdit::NoSymLinks|ctkPathLineEdit::Readable</set>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="0">
-              <widget class="QLabel" name="label_6">
-               <property name="text">
-                <string>Docker Executable</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="1">
-              <layout class="QHBoxLayout" name="horizontalLayout_3">
-               <item>
-                <widget class="ctkPathLineEdit" name="pthDockerExecutable"/>
-               </item>
-               <item>
-                <widget class="QPushButton" name="cmdDetectDockerExecutable">
-                 <property name="text">
-                  <string>Detect</string>
-                 </property>
-                </widget>
-               </item>
-              </layout>
-             </item>
-             <item row="2" column="0" colspan="2">
-              <widget class="QPushButton" name="cmdKillObservedProcesses">
-               <property name="text">
-                <string>Kill all Background Processes</string>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <widget class="ctkCollapsibleButton" name="logCollapsibleButton">
-            <property name="text">
-             <string>Log</string>
-            </property>
-            <property name="collapsed">
-             <bool>false</bool>
-            </property>
-            <property name="collapsedHeight">
-             <number>0</number>
-            </property>
-            <layout class="QFormLayout" name="formLayout_log">
-             <item row="0" column="0">
-              <widget class="QLabel" name="label_logLevel">
-               <property name="text">
-                <string>Log Level</string>
-               </property>
-              </widget>
-             </item>
-             <item row="0" column="1">
-              <widget class="QComboBox" name="cmbLogLevel"/>
-             </item>
-             <item row="1" column="0" colspan="2">
-              <widget class="QPlainTextEdit" name="txtLogs">
-               <property name="enabled">
-                <bool>true</bool>
-               </property>
-               <property name="undoRedoEnabled">
-                <bool>false</bool>
-               </property>
-               <property name="readOnly">
-                <bool>true</bool>
-               </property>
-              </widget>
-             </item>
-            </layout>
-           </widget>
-          </item>
-          <item>
-           <spacer name="verticalSpacer_settings">
-            <property name="orientation">
-             <enum>Qt::Vertical</enum>
-            </property>
-            <property name="sizeHint" stdset="0">
-             <size>
-              <width>20</width>
-              <height>40</height>
-             </size>
-            </property>
-           </spacer>
-          </item>
-         </layout>
+         <property name="text">
+          <string/>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
         </widget>
        </item>
-     </layout>
-    </widget>
-    <widget class="QWidget" name="dockerSetupPanel">
-     <layout class="QVBoxLayout" name="verticalLayout_dockerSetup">
-      <property name="spacing">
-       <number>16</number>
-      </property>
-      <property name="leftMargin">
-       <number>20</number>
-      </property>
-      <property name="topMargin">
-       <number>40</number>
-      </property>
-      <property name="rightMargin">
-       <number>20</number>
-      </property>
-      <property name="bottomMargin">
-       <number>20</number>
-      </property>
-      <item>
-       <layout class="QHBoxLayout" name="horizontalLayout_dockerSetupOuter">
-        <item>
-         <spacer name="horizontalSpacer_dockerSetupLeft">
+       <item>
+        <widget class="ctkDynamicSpacer" name="DynamicSpacer"/>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="dockerSetupPanel">
+      <layout class="QVBoxLayout" name="verticalLayout_dockerSetup">
+       <property name="spacing">
+        <number>16</number>
+       </property>
+       <property name="leftMargin">
+        <number>20</number>
+       </property>
+       <property name="topMargin">
+        <number>40</number>
+       </property>
+       <property name="rightMargin">
+        <number>20</number>
+       </property>
+       <property name="bottomMargin">
+        <number>20</number>
+       </property>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_dockerSetupOuter">
+         <item>
+          <spacer name="horizontalSpacer_dockerSetupLeft">
            <property name="orientation">
             <enum>Qt::Horizontal</enum>
            </property>
@@ -760,17 +296,17 @@
          </item>
          <item>
           <widget class="QFrame" name="dockerSetupCard">
-           <property name="frameShape">
-            <enum>QFrame::StyledPanel</enum>
-           </property>
-           <property name="frameShadow">
-            <enum>QFrame::Plain</enum>
-           </property>
            <property name="maximumSize">
             <size>
              <width>900</width>
              <height>16777215</height>
             </size>
+           </property>
+           <property name="frameShape">
+            <enum>QFrame::StyledPanel</enum>
+           </property>
+           <property name="frameShadow">
+            <enum>QFrame::Plain</enum>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_dockerSetupCard">
             <property name="spacing">
@@ -790,17 +326,14 @@
             </property>
             <item>
              <widget class="QLabel" name="lblDockerSetupLogo">
-              <property name="minimumHeight">
-               <number>60</number>
+              <property name="text">
+               <string/>
               </property>
               <property name="scaledContents">
                <bool>true</bool>
               </property>
-              <property name="text">
-               <string/>
-              </property>
               <property name="alignment">
-               <set>Qt::AlignHCenter|Qt::AlignVCenter</set>
+               <set>Qt::AlignCenter</set>
               </property>
              </widget>
             </item>
@@ -809,6 +342,7 @@
               <property name="font">
                <font>
                 <pointsize>14</pointsize>
+                <weight>75</weight>
                 <bold>true</bold>
                </font>
               </property>
@@ -820,7 +354,7 @@
             <item>
              <widget class="QLabel" name="lblDockerSetupAbout">
               <property name="text">
-               <string><![CDATA[MHub.ai brings a curated library of medical imaging AI models into 3D Slicer so you can run state-of-the-art methods in minutes. Explore the catalog at <a href="https://mhub.ai/models">mhub.ai/models</a> and learn more at <a href="https://mhub.ai">mhub.ai</a>.]]></string>
+               <string>MHub.ai brings a curated library of medical imaging AI models into 3D Slicer so you can run state-of-the-art methods in minutes. Explore the catalog at &lt;a href=&quot;https://mhub.ai/models&quot;&gt;mhub.ai/models&lt;/a&gt; and learn more at &lt;a href=&quot;https://mhub.ai&quot;&gt;mhub.ai&lt;/a&gt;.</string>
               </property>
               <property name="wordWrap">
                <bool>true</bool>
@@ -860,7 +394,7 @@
                 <item>
                  <widget class="QLabel" name="lblDockerStep1">
                   <property name="text">
-                   <string><![CDATA[Step 1: Install <a href="https://www.docker.com/products/docker-desktop">Docker Desktop</a> (Windows/macOS) or <a href="https://docs.docker.com/engine/install/">Docker Engine</a> (Linux).]]></string>
+                   <string>Step 1: Install &lt;a href=&quot;https://www.docker.com/products/docker-desktop&quot;&gt;Docker Desktop&lt;/a&gt; (Windows/macOS) or &lt;a href=&quot;https://docs.docker.com/engine/install/&quot;&gt;Docker Engine&lt;/a&gt; (Linux).</string>
                   </property>
                   <property name="wordWrap">
                    <bool>true</bool>
@@ -977,19 +511,19 @@
            </layout>
           </widget>
          </item>
-        <item>
-         <spacer name="horizontalSpacer_dockerSetupRight">
-          <property name="orientation">
-           <enum>Qt::Horizontal</enum>
-          </property>
-          <property name="sizeHint" stdset="0">
-           <size>
-            <width>20</width>
-            <height>20</height>
-           </size>
-          </property>
-         </spacer>
-        </item>
+         <item>
+          <spacer name="horizontalSpacer_dockerSetupRight">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>20</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
         </layout>
        </item>
        <item>
@@ -1017,6 +551,11 @@
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>ctkDynamicSpacer</class>
+   <extends>QWidget</extends>
+   <header>ctkDynamicSpacer.h</header>
   </customwidget>
   <customwidget>
    <class>ctkPathLineEdit</class>

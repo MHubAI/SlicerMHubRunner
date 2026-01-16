@@ -250,6 +250,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._modelFetchPoller = None
         self._modelStatusPoller = None
         self._settingsDialog = None
+        self._settingsWidget = None
         self._dockerSetupDismissed = False
         self._syncingDockerPath = False
 
@@ -264,15 +265,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/MHubRunner.ui'))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+        self._loadSettingsUi()
 
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
         self._applySummaryOpacity()
         self._applyMainButtonIcons()
         self._closeStaleSettingsDialogs()
-
-        if hasattr(self.ui, "settingsPanel"):
-            self.ui.settingsPanel.hide()
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
@@ -776,7 +775,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         palette.setColor(qt.QPalette.WindowText, color)
         self.ui.lblSetupSummary.setPalette(palette)
 
+    def _loadSettingsUi(self) -> None:
+        if self._settingsWidget is not None:
+            return
+        settings_widget = slicer.util.loadUI(self.resourcePath("UI/MHubRunnerSettings.ui"))
+        settings_widget.hide()
+        for child in settings_widget.findChildren(qt.QWidget):
+            name = child.objectName
+            if name and not hasattr(self.ui, name):
+                setattr(self.ui, name, child)
+        root_name = settings_widget.objectName
+        if root_name and not hasattr(self.ui, root_name):
+            setattr(self.ui, root_name, settings_widget)
+        self._settingsWidget = settings_widget
+
     def openSettingsDialog(self) -> None:
+        self._loadSettingsUi()
         for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
             widget = getattr(self.ui, attr, None)
             if widget is not None:
@@ -789,7 +803,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             dialog.setAttribute(qt.Qt.WA_DeleteOnClose, False)
             dialog.setObjectName("MHubRunnerSettingsDialog")
             layout = qt.QVBoxLayout(dialog)
-            settings_widget = getattr(self.ui, "settingsPanel", None)
+            settings_widget = self._settingsWidget
             if settings_widget is not None:
                 settings_widget.setParent(dialog)
                 settings_widget.show()
