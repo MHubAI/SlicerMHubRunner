@@ -164,15 +164,28 @@
               </property>
              </widget>
             </item>
-            <item>
-             <widget class="QPushButton" name="cmdRefreshOutputFiles">
-              <property name="text">
-               <string>Reload Files</string>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
+           <item>
+            <widget class="QPushButton" name="cmdRefreshOutputFiles">
+             <property name="text">
+              <string>Reload Files</string>
+             </property>
+             <property name="styleSheet">
+              <string>padding: 3px 8px;</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="cmdOpenOutputFile">
+             <property name="text">
+              <string>Open File</string>
+             </property>
+             <property name="styleSheet">
+              <string>padding: 3px 8px;</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </item>
           <item>
            <widget class="QListWidget" name="lstOutputFiles"/>
           </item>
@@ -217,12 +230,15 @@
           </widget>
          </item>
          <item>
-          <widget class="QPushButton" name="cmdOpenSettings">
-           <property name="text">
-            <string>Settings...</string>
-           </property>
-          </widget>
-         </item>
+         <widget class="QPushButton" name="cmdOpenSettings">
+          <property name="text">
+           <string>Settings...</string>
+          </property>
+          <property name="styleSheet">
+           <string>padding: 3px 8px;</string>
+          </property>
+         </widget>
+        </item>
         </layout>
        </item>
        <item>

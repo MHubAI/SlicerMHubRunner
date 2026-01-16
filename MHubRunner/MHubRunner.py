@@ -271,6 +271,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updateDockerSetupLogo()
         self._applySummaryOpacity()
         self._applyMainButtonIcons()
+        self._applyOutputButtonIcons()
         self._closeStaleSettingsDialogs()
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
@@ -314,6 +315,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
         self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
+        if hasattr(self.ui, "cmdOpenOutputFile"):
+            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onOpenOutputFile)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
 
@@ -650,6 +653,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmdOpenSettingsFromSetup.setIcon(self._themeIcon("hi_settings"))
             self.ui.cmdOpenSettingsFromSetup.setIconSize(icon_size)
             self._setButtonTextWithIcon(self.ui.cmdOpenSettingsFromSetup, self.ui.cmdOpenSettingsFromSetup.text)
+
+    def _applyOutputButtonIcons(self) -> None:
+        if not hasattr(self.ui, "cmdOpenOutputFile"):
+            return
+        icon_size = qt.QSize(14, 14)
+        self.ui.cmdOpenOutputFile.setIcon(self._themeIcon("hi_show"))
+        self.ui.cmdOpenOutputFile.setIconSize(icon_size)
+        self._setButtonTextWithIcon(self.ui.cmdOpenOutputFile, self.ui.cmdOpenOutputFile.text)
+        self._updateOpenOutputFileButton()
 
     def _updateMainButtonIcons(self) -> None:
         icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
@@ -1567,21 +1579,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             item.setText(os.path.relpath(output_file, output_dir))
             self.ui.lstOutputFiles.addItem(item)
 
-            # clicking on item opens the file
             item.setData(qt.Qt.UserRole, output_file)
+        self._updateOpenOutputFileButton()
 
     def onOutputFileSelect(self) -> None:
+        self._updateOpenOutputFileButton()
+
+    def onOpenOutputFile(self) -> None:
         assert self.logic is not None
-
-        # get selected item
-        selected = self.ui.lstOutputFiles.currentItem()
-        if selected is None:
+        output_file = self._getSelectedOutputFile()
+        if not output_file or not self._isSupportedOutputFile(output_file):
             return
-
-        # get output file
-        output_file = selected.data(qt.Qt.UserRole)
-
-        logger.debug("Selected output file: %s", output_file)
+        logger.debug("Opening output file: %s", output_file)
 
         # create table node
         if output_file.endswith(".json") or output_file.endswith(".csv"):
@@ -1643,6 +1652,27 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         elif output_file.endswith(".seg.dcm"):
             self.logic.importSegmentations([output_file])
+
+    def _getSelectedOutputFile(self) -> str | None:
+        selected = self.ui.lstOutputFiles.currentItem()
+        if selected is None:
+            return None
+        output_file = selected.data(qt.Qt.UserRole)
+        return output_file or None
+
+    def _isSupportedOutputFile(self, output_file: str) -> bool:
+        return output_file.endswith((".json", ".csv", ".seg.dcm"))
+
+    def _updateOpenOutputFileButton(self) -> None:
+        if not hasattr(self.ui, "cmdOpenOutputFile"):
+            return
+        output_file = self._getSelectedOutputFile()
+        enabled = bool(output_file) and self._isSupportedOutputFile(output_file)
+        self.ui.cmdOpenOutputFile.enabled = enabled
+        icon_name = "hi_show" if enabled else "hi_noshow"
+        opacity = 1.0 if enabled else self._ICON_DISABLED_OPACITY
+        self.ui.cmdOpenOutputFile.setIcon(self._themeIcon(icon_name, opacity))
+        self.ui.cmdOpenOutputFile.setIconSize(qt.QSize(14, 14))
 
     def onCancelButton(self) -> None:
 

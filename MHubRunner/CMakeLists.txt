@@ -27,6 +27,10 @@ set(MODULE_PYTHON_RESOURCES
   Resources/Icons/hi_pulled_w.png
   Resources/Icons/hi_settings_b.png
   Resources/Icons/hi_settings_w.png
+  Resources/Icons/hi_show_b.png
+  Resources/Icons/hi_show_w.png
+  Resources/Icons/hi_noshow_b.png
+  Resources/Icons/hi_noshow_w.png
   Resources/UI/MHubRunner.ui
   Resources/UI/MHubRunnerSettings.ui
   )
