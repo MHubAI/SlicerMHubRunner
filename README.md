@@ -1,4 +1,4 @@
-![MHub Runner (3DSlicer Plugin)](https://github.com/AIM-Harvard/SlicerMHubRunner/blob/main/MRunner/Resources/Icons/Name.png?raw=true)
+![MHub Runner (3DSlicer Plugin)](https://github.com/AIM-Harvard/SlicerMHubRunner/blob/main/MHubRunner/Resources/Icons/Name.png?raw=true)
 
 The MHubRunner extension seamlessly integrates Deep Learning models from [MHub.ai](https://mhub.ai) into 3D Slicer.
 
@@ -33,14 +33,12 @@ For more information, you can open the model card on MHub.ai using the web butto
 
 Here you can select and inspect the input image to run the model on.
 
-## Backend
+## Docker
 
-Under the backend tab, you can select the backend (Docker by default) and manage your local model images.
+Under the Docker tab, you can manage your local model images.
 You can select an image and use the update button to pull the latest version of this model.
 You can use the delete button to remove the image to free up space on your disk.
 You can always download the image again.
-
-We recommend running all MHub.ai models using the Docker backend. For Linux users, we are currently exploring udocker as an alternative backend.
 
 
 ## GPU

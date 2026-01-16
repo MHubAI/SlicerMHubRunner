@@ -1,5 +1,8 @@
 import logging
 import os
+import sys
+import threading
+import time
 from typing import Annotated, Any, Optional, List, Literal, Dict, Union
 
 from collections.abc import Callable
@@ -23,6 +26,70 @@ import DICOMSegmentationPlugin
 
 import hashlib
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+class Debouncer(qt.QObject):
+    def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._timer = qt.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(callback)
+
+    def start(self, interval_ms: int | None = None) -> None:
+        if interval_ms is not None:
+            self._timer.setInterval(interval_ms)
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def isActive(self) -> bool:
+        return self._timer.isActive()
+
+
+class AsyncFetchPoller(qt.QObject):
+    def __init__(self, interval_ms: int, on_done: Callable[[], None], parent: qt.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._timer = qt.QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._poll)
+        self._on_done = on_done
+        self._thread: threading.Thread | None = None
+        self._start_time: float | None = None
+
+    def start(self, worker: Callable[[], None]) -> bool:
+        if self.is_running():
+            return False
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
+        if not self._timer.isActive():
+            self._timer.start()
+        return True
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def elapsed(self) -> float | None:
+        if self._start_time is None:
+            return None
+        return time.monotonic() - self._start_time
+
+    def stop(self) -> None:
+        self._thread = None
+        self._start_time = None
+        self._timer.stop()
+
+    def _poll(self) -> None:
+        if self.is_running():
+            return
+        if self._thread is None:
+            return
+        self._timer.stop()
+        self._thread = None
+        self._on_done()
 
 #
 # MHubRunner
@@ -178,6 +245,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._parameterNodeGuiTag = None
+        self._modelSearchDebouncer = None
+        self._pendingModelSearchText = ""
+        self._modelFetchPoller = None
+        self._modelStatusPoller = None
+        self._settingsDialog = None
+        self._settingsWidget = None
+        self._dockerSetupDismissed = False
+        self._syncingDockerPath = False
 
     def setup(self) -> None:
         """
@@ -190,6 +265,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         uiWidget = slicer.util.loadUI(self.resourcePath('UI/MHubRunner.ui'))
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
+        self._loadSettingsUi()
+
+        self._ensureLoggerConfigured()
+        self._updateDockerSetupLogo()
+        self._applySummaryOpacity()
+        self._applyMainButtonIcons()
+        self._applyOutputButtonIcons()
+        self._closeStaleSettingsDialogs()
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
@@ -210,22 +293,47 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
         self.ui.cancelButton.connect('clicked(bool)', self.onCancelButton)
         self.ui.cmdKillObservedProcesses.connect('clicked(bool)', self.onKillObservedProcessesButton)
-        self.ui.cmdBackendReload.connect('clicked(bool)', self.onBackendUpdate)
-        self.ui.cmdInstallUdocker.connect('clicked(bool)', self.logic.installUdockerBackend)
-        self.ui.cmdInstallUdocker.enabled = False
+        self.ui.cmdBackendReload.connect('clicked(bool)', self.onDockerUpdate)
         # self.ui.cmdTest.connect('clicked(bool)', self.importSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
+        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
+        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.updateSettingsSummary)
         self.ui.lstBackendImages.connect('itemSelectionChanged()', self.onBackendImageSelect)
         self.ui.cmdImageUpdate.connect('clicked(bool)', self.onBackendImageUpdate)
         self.ui.cmdImageRemove.connect('clicked(bool)', self.onBackendImageRemove)
+        if hasattr(self.ui, "cmdOpenSettings"):
+            self.ui.cmdOpenSettings.connect('clicked(bool)', self.openSettingsDialog)
+        if hasattr(self.ui, "cmdOpenSettingsFromSetup"):
+            self.ui.cmdOpenSettingsFromSetup.connect('clicked(bool)', self.openSettingsDialog)
+        if hasattr(self.ui, "cmdDismissDockerSetup"):
+            self.ui.cmdDismissDockerSetup.connect('clicked(bool)', self.dismissDockerSetupScreen)
+        if hasattr(self.ui, "cmdShowDockerSetup"):
+            self.ui.cmdShowDockerSetup.connect('clicked(bool)', self.showDockerSetupScreenFromSettings)
 
         # output section
         self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
         self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
+        if hasattr(self.ui, "cmdOpenOutputFile"):
+            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onOpenOutputFile)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
+
+        # logging
+        self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
+        settings = qt.QSettings()
+        saved_level = settings.value("MHubRunner/LogLevel", "INFO")
+        if saved_level not in ["ERROR", "WARNING", "INFO", "DEBUG"]:
+            saved_level = "INFO"
+        self.ui.cmbLogLevel.setCurrentText(saved_level)
+        self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
+        self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
+
+        # model search
+        self._modelSearchDebouncer = Debouncer(200, self._applyModelSearch, parent=uiWidget)
+        self._modelFetchPoller = AsyncFetchPoller(10, self._onModelFetchDone, parent=uiWidget)
+        self._modelStatusPoller = AsyncFetchPoller(200, self._onModelStatusDone, parent=uiWidget)
 
         # search box "searchModel" and model list "lstModelList"
         self.ui.searchModel.textChanged.connect(self.onSearchModel)
@@ -233,22 +341,37 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.tblModelList.connect('cellClicked(int, int)', self.onModelSelectFromTable)
         self.onSearchModel("")
 
-        # Dropdowns
-        self.ui.backendSelector.addItems(["docker", "udocker"])
-        self.ui.backendSelector.connect('currentIndexChanged(int)', self.onBackendSelect)
+        # input modality (for non-DICOM volumes)
+        if hasattr(self.ui, "cmbInputModality"):
+            self.ui.cmbInputModality.addItems(["CT", "MR", "NM", "US", "PT", "CR", "SC"])
+            self.ui.cmbInputModality.setCurrentText("CT")
+            self.ui.cmbInputModality.enabled = False
+        if hasattr(self.ui, "inputSelector"):
+            self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
 
         # executable paths
-        self.ui.pthDockerExecutable.currentPath = self.logic.getDockerExecutable()
-        self.ui.pthUDockerExecutable.currentPath = self.logic.getUDockerExecutable()
+        settings = qt.QSettings()
+        docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
+        self._syncDockerExecutablePath(docker_exec)
+        if docker_exec:
+            self.logic._executables["docker"] = docker_exec
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
-        self.ui.pthUDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateUDockerExecutable)
+        if hasattr(self.ui, "pthDockerExecutableSetup"):
+            self.ui.pthDockerExecutableSetup.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         self.ui.cmdDetectDockerExecutable.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
-        self.ui.cmdDetectUDockerExecutable.connect('clicked(bool)', self.onAutoDetectUDockerExecutable)
+        if hasattr(self.ui, "cmdDetectDockerExecutableSetup"):
+            self.ui.cmdDetectDockerExecutableSetup.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
+
+        self.updateSettingsSummary()
+        self.updateLicenseSummary()
+        self._updateInputModalityState()
 
         # setup SubjectHierarchyTreeView
         # -> https://apidocs.slicer.org/v4.8/classqMRMLSubjectHierarchyTreeView.html#a3214047490b8efd11dc9abf59c646495
         self.ui.SubjectHierarchyTreeView.setMRMLScene(slicer.mrmlScene)
         self.ui.SubjectHierarchyTreeView.connect('currentItemChanged(vtkIdType)', self.onSubjectHierarchyTreeViewCurrentItemChanged)
+
+        self._updateDockerSetupScreen()
 
         # table selector
         self.ui.outputTableSelector.setMRMLScene(slicer.mrmlScene)
@@ -266,24 +389,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # load gpus
         self.updateHostGpuList()
 
-        # load backends
-        self.onBackendSelect(0)
+        # load docker info
+        self.onDockerUpdate()
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
 
         # print path
         import sys
-        print(sys.path)
+        logger.debug("Python sys.path: %s", sys.path)
 
         # run which python and which pip
         import subprocess
-        print(subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
-        print(subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8'))
-
+        logger.debug("which python3: %s", subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
         # try the same with slicer.utils.consoleProcess
         p = slicer.util.launchConsoleProcess(["which", "python3"])
-        print(p.stdout.read())
+        logger.debug("slicer console which python3: %s", p.stdout.read())
 
     def cleanup(self) -> None:
         """
@@ -363,8 +484,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get subject hierarchy node
         shNode = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(slicer.mrmlScene)
 
-        # print debug
-        print("SubjectHierarchyTreeView currentItemChanged: ", itemId, shNode.GetItemName(itemId))
+        logger.debug(
+            "SubjectHierarchyTreeView currentItemChanged: %s %s",
+            itemId,
+            shNode.GetItemName(itemId),
+        )
 
         # get the volume node
         volumeNode = shNode.GetItemDataNode(itemId)
@@ -372,6 +496,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update the (old) input selector based on selection
         if volumeNode:
             self.ui.inputSelector.setCurrentNode(volumeNode)
+            self._updateInputModalityState(volumeNode)
             self._checkCanApply()
 
         # --- multi selection:
@@ -384,12 +509,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # print all selected items
         for i in range(items.GetNumberOfIds()):
-            print("Selected item: ", shNode.GetItemName(items.GetId(i)))
+            logger.debug("Selected item: %s", shNode.GetItemName(items.GetId(i)))
 
         # --- selection modality
 
         # check if selected item is a volume
-        print(type(volumeNode))
+        logger.debug("Selected item type: %s", type(volumeNode))
         if volumeNode and (
             volumeNode.IsA("vtkMRMLScalarVolumeNode")
          or volumeNode.IsA("vtkMRMLSegmentationNode")
@@ -404,9 +529,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 patient_name = slicer.dicomDatabase.instanceValue(instUids[0], '0010,0010')
                 modality = slicer.dicomDatabase.instanceValue(instUids[0], '0008,0060')
 
-                print("Modality: ", modality, " | Patient", patient_name)
+                logger.debug("Modality: %s | Patient %s", modality, patient_name)
             except Exception as e:
-                print("Error accessing node's dicom data: ", e)
+                logger.warning("Error accessing node's DICOM data: %s", e)
 
 
     def onUpdateDockerExecutable(self, path) -> None:
@@ -414,11 +539,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # user enters a new path for the docker executable manually
 
         # get docker executable
-        docker_executable = self.ui.pthDockerExecutable.currentPath
+        docker_executable = path
+        if not docker_executable:
+            docker_executable = self._getDockerExecutablePath()
 
         # set docker executable
-        print("---docker_executable-->", docker_executable, path)
+        logger.debug("Docker executable updated: %s (from %s)", docker_executable, path)
         self.logic._executables["docker"] = docker_executable
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/DockerExecutable", docker_executable)
+        self._syncDockerExecutablePath(docker_executable)
+        self._updateDockerSetupScreen()
+        self.updateSettingsSummary()
 
     def onAutoDetectDockerExecutable(self) -> None:
         assert self.logic is not None
@@ -428,28 +560,320 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         docker_executable = self.logic.getDockerExecutable(refresh=True)
 
         # set docker executable
-        self.ui.pthDockerExecutable.currentPath = docker_executable
+        if docker_executable:
+            settings = qt.QSettings()
+            settings.setValue("MHubRunner/DockerExecutable", docker_executable)
+        self._syncDockerExecutablePath(docker_executable)
+        self._updateDockerSetupScreen()
+        self.updateSettingsSummary()
 
-    def onUpdateUDockerExecutable(self, path) -> None:
-        assert self.logic is not None
-        # user enters a new path for the udocker executable manually
+    def _appendLogOutput(self, stdout: str | None) -> None:
+        if stdout is None:
+            return
+        # remove ANSI escapes and control chars that can break QTextCursor
+        stdout = re.sub(r'\x1b\[[0-9;]*m', '', stdout)
+        stdout = stdout.replace('\r', '\n')
+        stdout = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', stdout)
+        if stdout.strip() != "":
+            self.ui.txtLogs.appendPlainText(stdout)
 
-        # get udocker executable
-        udocker_executable = self.ui.pthUDockerExecutable.currentPath
+    def _getDockerExecutablePath(self) -> str:
+        path = self.ui.pthDockerExecutable.currentPath if hasattr(self.ui, "pthDockerExecutable") else ""
+        if not path and hasattr(self.ui, "pthDockerExecutableSetup"):
+            path = self.ui.pthDockerExecutableSetup.currentPath
+        return path or ""
 
-        # set udocker executable
-        print("---udocker_executable-->", udocker_executable, path)
-        self.logic._executables["udocker"] = udocker_executable
+    def _syncDockerExecutablePath(self, path: str | None) -> None:
+        if path is None:
+            return
+        if self._syncingDockerPath:
+            return
+        self._syncingDockerPath = True
+        try:
+            for attr in ("pthDockerExecutable", "pthDockerExecutableSetup"):
+                widget = getattr(self.ui, attr, None)
+                if widget is None:
+                    continue
+                current = widget.currentPath
+                if current != path:
+                    widget.currentPath = path
+        finally:
+            self._syncingDockerPath = False
 
-    def onAutoDetectUDockerExecutable(self) -> None:
-        assert self.logic is not None
-        # user clicks on the detect button
+    def _dockerExecutableAvailable(self) -> bool:
+        path = self._getDockerExecutablePath()
+        if path and os.path.exists(path):
+            return True
+        try:
+            import shutil
+            return shutil.which("docker") is not None
+        except Exception:
+            return False
 
-        # get udocker executable
-        udocker_executable = self.logic.getUDockerExecutable(refresh=True)
+    def showDockerSetupScreen(self, force: bool = False) -> None:
+        if self._dockerSetupDismissed and not force:
+            return
+        self._updateDockerSetupLogo()
+        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "dockerSetupPanel"):
+            self.ui.stackedMain.setCurrentWidget(self.ui.dockerSetupPanel)
 
-        # set udocker executable
-        self.ui.pthUDockerExecutable.currentPath = udocker_executable
+    def hideDockerSetupScreen(self) -> None:
+        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "mainPanel"):
+            self.ui.stackedMain.setCurrentWidget(self.ui.mainPanel)
+
+    def dismissDockerSetupScreen(self, checked: bool = False) -> None:
+        self._dockerSetupDismissed = True
+        self.hideDockerSetupScreen()
+
+    def _updateDockerSetupScreen(self) -> None:
+        self._updateDockerSetupLogo()
+        if self._dockerExecutableAvailable():
+            self._dockerSetupDismissed = False
+            self.hideDockerSetupScreen()
+        else:
+            self.showDockerSetupScreen()
+
+    def _isDarkTheme(self) -> bool:
+        palette = qt.QApplication.palette()
+        window_color = palette.color(qt.QPalette.Window)
+        return window_color.lightness() < 128
+
+    def _updateDockerSetupLogo(self) -> None:
+        if not hasattr(self.ui, "lblDockerSetupLogo"):
+            return
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        logo_name = "MRunner_w.png" if self._isDarkTheme() else "MRunner_b.png"
+        logo_path = os.path.join(icons_path, logo_name)
+        if not os.path.exists(logo_path):
+            return
+        pixmap = qt.QPixmap(logo_path)
+        self.ui.lblDockerSetupLogo.setPixmap(pixmap)
+
+    def _applyMainButtonIcons(self) -> None:
+        icon_size = qt.QSize(14, 14)
+        self._mainButtonIconSize = icon_size
+        self._updateMainButtonIcons()
+        self._setButtonTextWithIcon(self.ui.applyButton, self.ui.applyButton.text)
+        self._setButtonTextWithIcon(self.ui.cancelButton, self.ui.cancelButton.text)
+        if hasattr(self.ui, "cmdOpenSettings"):
+            self.ui.cmdOpenSettings.setIcon(self._themeIcon("hi_settings"))
+            self.ui.cmdOpenSettings.setIconSize(icon_size)
+            self._setButtonTextWithIcon(self.ui.cmdOpenSettings, self.ui.cmdOpenSettings.text)
+        if hasattr(self.ui, "cmdOpenSettingsFromSetup"):
+            self.ui.cmdOpenSettingsFromSetup.setIcon(self._themeIcon("hi_settings"))
+            self.ui.cmdOpenSettingsFromSetup.setIconSize(icon_size)
+            self._setButtonTextWithIcon(self.ui.cmdOpenSettingsFromSetup, self.ui.cmdOpenSettingsFromSetup.text)
+
+    def _applyOutputButtonIcons(self) -> None:
+        if not hasattr(self.ui, "cmdOpenOutputFile"):
+            return
+        icon_size = qt.QSize(14, 14)
+        self.ui.cmdOpenOutputFile.setIcon(self._themeIcon("hi_show"))
+        self.ui.cmdOpenOutputFile.setIconSize(icon_size)
+        self._setButtonTextWithIcon(self.ui.cmdOpenOutputFile, self.ui.cmdOpenOutputFile.text)
+        self._updateOpenOutputFileButton()
+
+    def _updateMainButtonIcons(self) -> None:
+        icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
+        running = bool(ProgressObserver.getTasksWhere(operation="run"))
+        if running:
+            apply_icon = "hi_running"
+            apply_opacity = 1.0
+        else:
+            apply_opacity = self._ICON_DISABLED_OPACITY if not self.ui.applyButton.enabled else 1.0
+            apply_icon = "hi_noplay" if not self.ui.applyButton.enabled else "hi_play"
+        self.ui.applyButton.setIcon(self._themeIcon(apply_icon, apply_opacity))
+        self.ui.applyButton.setIconSize(icon_size)
+
+        cancel_opacity = self._ICON_DISABLED_OPACITY if not self.ui.cancelButton.enabled else 1.0
+        self.ui.cancelButton.setIcon(self._themeIcon("hi_cancel", cancel_opacity))
+        self.ui.cancelButton.setIconSize(icon_size)
+
+    def _themeIcon(self, base_name: str, opacity: float = 1.0) -> qt.QIcon:
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        if self._isDarkTheme():
+            candidates = (f"{base_name}_w.png", f"{base_name}_b.png")
+        else:
+            candidates = (f"{base_name}_b.png", f"{base_name}_w.png")
+        icon_path = None
+        for candidate in candidates:
+            candidate_path = os.path.join(icons_path, candidate)
+            if os.path.exists(candidate_path):
+                icon_path = candidate_path
+                break
+        if not icon_path:
+            return qt.QIcon()
+        pixmap = qt.QPixmap(icon_path)
+        if opacity >= 1.0:
+            return qt.QIcon(pixmap)
+        faded = qt.QPixmap(pixmap.size())
+        faded.fill(qt.Qt.transparent)
+        painter = qt.QPainter(faded)
+        painter.setOpacity(opacity)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return qt.QIcon(faded)
+
+    _ICON_DISABLED_OPACITY = 0.2
+    _ICON_TEXT_PREFIX = " "
+
+    def _withIconLabel(self, text: str) -> str:
+        if not text:
+            return ""
+        if text.startswith(self._ICON_TEXT_PREFIX):
+            return text
+        return f"{self._ICON_TEXT_PREFIX}{text}"
+
+    def _setButtonTextWithIcon(self, button, text: str) -> None:
+        button.text = self._withIconLabel(text)
+
+    def showDockerSetupScreenFromSettings(self, checked: bool = False) -> None:
+        self.showDockerSetupScreen(force=True)
+
+    def updateSettingsSummary(self) -> None:
+        gpu_count = self.ui.lstHostGpu.count
+        gpu_enabled = self.ui.chkGpuEnabled.checked
+        selected_gpus = []
+        for i in range(gpu_count):
+            item = self.ui.lstHostGpu.item(i)
+            if item.checkState() == qt.Qt.Checked:
+                selected_gpus.append(item.text())
+        if not selected_gpus:
+            selected_gpus = [item.text() for item in self.ui.lstHostGpu.selectedItems()]
+
+        if gpu_enabled and selected_gpus:
+            gpu_summary = "Selected GPU " + ", ".join(selected_gpus)
+        else:
+            gpu_summary = "No GPU"
+
+        log_level = self.ui.cmbLogLevel.currentText
+        log_level = log_level or "N/A"
+
+        docker_exec = self._getDockerExecutablePath()
+        docker_exec = docker_exec or ""
+        docker_status = "Docker unavailable"
+        if docker_exec and os.path.exists(docker_exec):
+            docker_status = f"Docker available at {docker_exec}"
+        else:
+            try:
+                import shutil
+                docker_path = shutil.which("docker")
+            except Exception:
+                docker_path = None
+            if docker_path:
+                docker_status = f"Docker available at {docker_path}"
+            elif docker_exec:
+                docker_status = f"Docker not found at {docker_exec}"
+
+        summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
+        self.ui.lblSetupSummary.text = summary_line
+
+    def _formatLicenseSummary(self, model: Optional['Model']) -> str:
+        if model is None:
+            return "License: N/A"
+        model_license = model.license_model or ""
+        weights_license = model.license_weights or ""
+        if model_license and weights_license:
+            if model_license == weights_license:
+                license_text = model_license
+            else:
+                license_text = f"Model {model_license} | Weights {weights_license}"
+        elif model_license:
+            license_text = model_license
+        elif weights_license:
+            license_text = weights_license
+        else:
+            return "License: N/A"
+        return f"License: {license_text}"
+
+    def updateLicenseSummary(self, model: Optional['Model'] = None) -> None:
+        if not hasattr(self.ui, "lblLicenseSummary"):
+            return
+        if model is None:
+            model = self.getModelFromTableSelection()
+        self.ui.lblLicenseSummary.text = self._formatLicenseSummary(model)
+
+    def _applySummaryOpacity(self, opacity: float = 0.6) -> None:
+        if not hasattr(self.ui, "lblSetupSummary"):
+            return
+        palette = self.ui.lblSetupSummary.palette
+        color = palette.color(qt.QPalette.WindowText)
+        color.setAlpha(int(255 * opacity))
+        palette.setColor(qt.QPalette.WindowText, color)
+        self.ui.lblSetupSummary.setPalette(palette)
+
+    def _loadSettingsUi(self) -> None:
+        if self._settingsWidget is not None:
+            return
+        settings_widget = slicer.util.loadUI(self.resourcePath("UI/MHubRunnerSettings.ui"))
+        settings_widget.hide()
+        for child in settings_widget.findChildren(qt.QWidget):
+            name = child.objectName
+            if name and not hasattr(self.ui, name):
+                setattr(self.ui, name, child)
+        root_name = settings_widget.objectName
+        if root_name and not hasattr(self.ui, root_name):
+            setattr(self.ui, root_name, settings_widget)
+        self._settingsWidget = settings_widget
+
+    def openSettingsDialog(self) -> None:
+        self._loadSettingsUi()
+        # for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
+        #     widget = getattr(self.ui, attr, None)
+        #     if widget is not None:
+        #         widget.collapsed = False
+        if self._settingsDialog is None:
+            self._closeStaleSettingsDialogs()
+            dialog = qt.QDialog(slicer.util.mainWindow())
+            dialog.setWindowTitle("MHubRunner Settings")
+            dialog.setModal(False)
+            dialog.setAttribute(qt.Qt.WA_DeleteOnClose, False)
+            dialog.setObjectName("MHubRunnerSettingsDialog")
+            layout = qt.QVBoxLayout(dialog)
+            settings_widget = self._settingsWidget
+            if settings_widget is not None:
+                settings_widget.setParent(dialog)
+                settings_widget.show()
+                layout.addWidget(settings_widget)
+            dialog.setLayout(layout)
+            dialog.setMinimumWidth(520)
+            self._settingsDialog = dialog
+        self._settingsDialog.show()
+        self._settingsDialog.raise_()
+        self._settingsDialog.activateWindow()
+
+    def _closeStaleSettingsDialogs(self) -> None:
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        stale_dialogs = main_window.findChildren(qt.QDialog, "MHubRunnerSettingsDialog")
+        for dialog in stale_dialogs:
+            if dialog is self._settingsDialog:
+                continue
+            dialog.close()
+            dialog.deleteLater()
+
+    def _ensureLoggerConfigured(self) -> None:
+        for handler in list(logger.handlers):
+            if getattr(handler, "_mhubrunner_handler", False):
+                logger.removeHandler(handler)
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("[MHubRunner] %(levelname)s: %(message)s"))
+        handler.setLevel(logging.DEBUG)
+        handler._mhubrunner_handler = True
+        logger.addHandler(handler)
+        logger.propagate = False
+
+    def onLogLevelChanged(self, level_text) -> None:
+        self._ensureLoggerConfigured()
+        if isinstance(level_text, int):
+            level_text = self.ui.cmbLogLevel.itemText(level_text)
+        level_name = str(level_text).upper()
+        level = getattr(logging, level_name, logging.INFO)
+        logger.setLevel(level)
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/LogLevel", level_name)
+        self.updateSettingsSummary()
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
@@ -457,13 +881,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         tasks = ProgressObserver.getTasksWhere(operation="run")
         if len(tasks) > 0:
             self.ui.cancelButton.enabled = True
+            self._updateMainButtonIcons()
             return
         self.ui.cancelButton.enabled = False
 
         # check if model is selected
         model = self.getModelFromTableSelection()
 
-        # check if backend is selected / available
+        # check if docker is available
         # TODO: ...
 
         # chekc if gpu requirements are met
@@ -473,21 +898,48 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if model and model.inputs_compatibility and self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
-            self.ui.applyButton.text = f"Run {model.label}"
+            self._setButtonTextWithIcon(self.ui.applyButton, f"Run {model.label}")
         else:
             self.ui.applyButton.toolTip = _("Select input volume node")
             self.ui.applyButton.enabled = False
 
             if not model:
-                self.ui.applyButton.text = "Select an MHub.ai Model"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
             elif not self._parameterNode or not self._parameterNode.inputVolume:
-                self.ui.applyButton.text = "Select an Input Volume"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             elif not model.inputs_compatibility:
-                self.ui.applyButton.text = "Select a Model compatible with 3D Slicer Extension"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             else:
-                self.ui.applyButton.text = "N/A"
+                self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
+        self.updateLicenseSummary(model)
+        self._updateMainButtonIcons()
 
+    def onInputNodeChanged(self, node=None) -> None:
+        self._updateInputModalityState(node)
+
+    def _updateInputModalityState(self, node=None) -> None:
+        if not hasattr(self.ui, "cmbInputModality"):
+            return
+        if node is None:
+            node = self.ui.inputSelector.currentNode() if hasattr(self.ui, "inputSelector") else None
+        if node is None:
+            self.ui.cmbInputModality.enabled = False
+            return
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        if instanceUIDs:
+            self.ui.cmbInputModality.enabled = False
+            modality = None
+            try:
+                inst_uids = instanceUIDs.split()
+                if inst_uids:
+                    modality = slicer.dicomDatabase.instanceValue(inst_uids[0], '0008,0060')
+            except Exception:
+                modality = None
+            if modality and modality in [self.ui.cmbInputModality.itemText(i) for i in range(self.ui.cmbInputModality.count)]:
+                self.ui.cmbInputModality.setCurrentText(modality)
+            return
+        self.ui.cmbInputModality.enabled = True
 
     def onKillObservedProcessesButton(self) -> None:
         """
@@ -522,6 +974,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.lstHostGpu.addItem(gpu)
         self.ui.chkGpuEnabled.checked = len(gpus) > 0
         self.ui.chkGpuEnabled.enabled = len(gpus) > 0
+        self.updateSettingsSummary()
 
     def onGpuEnabled(self) -> None:
 
@@ -531,47 +984,125 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # enable/disable apply button
         self._checkCanApply()
+        self.updateSettingsSummary()
 
     def loadModelRepo(self) -> None:
         pass
 
     def onSearchModel(self, text: str) -> None:
         assert self.logic is not None
-        print("Search model: ", text)
+        logger.debug("Search model: %s", text)
+        self._pendingModelSearchText = text
+        if self._modelSearchDebouncer is not None:
+            self._modelSearchDebouncer.start()
 
-        # get models
-        models = self.logic.getModels()
+    def _applyModelSearch(self) -> None:
+        assert self.logic is not None
+        text = self._pendingModelSearchText or ""
+        if hasattr(self.logic, "_model_cache"):
+            models = self.logic.getModels(cached=True, hydrate_status=False)
+            self._renderFilteredModels(models, text)
+            return
+        self._fetchModelsAsync()
 
-        # filter models
-        models = [model for model in models if model.str_match(text)]
+    def _renderFilteredModels(self, models: list['Model'], text: str) -> None:
+        filtered = [model for model in models if model.str_match(text)]
+        self.renderModelTable(filtered)
 
-        # render models
-        self.renderModelTable(models)
+    def _fetchModelsAsync(self) -> None:
+        if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
+            return
+        if not hasattr(self.logic, "_model_cache"):
+            self._setModelTableStatus("Loading models...")
+
+        logger.debug("Starting async model fetch for docker backend")
+        fetch_poller = self._modelFetchPoller
+        def worker():
+            logger.debug("Fetching models from docker backend")
+            assert self.logic is not None
+            self.logic.getModels(cached=False, hydrate_status=False)
+            if fetch_poller is not None:
+                elapsed = fetch_poller.elapsed()
+                if elapsed is not None:
+                    logger.debug("Finished fetching models from docker backend elapsed=%.2fs", elapsed)
+                else:
+                    logger.debug("Finished fetching models from docker backend")
+            else:
+                logger.debug("Finished fetching models from docker backend")
+        self._modelFetchPoller.start(worker)
+
+    def _onModelFetchDone(self) -> None:
+        if self._modelFetchPoller is not None:
+            elapsed = self._modelFetchPoller.elapsed()
+            if elapsed is not None:
+                logger.debug("Model fetch thread done; UI update elapsed=%.2fs", elapsed)
+        models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        if not models:
+            self._setModelTableStatus("No models available.")
+            return
+        self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._startModelStatusHydration()
+
+    def _setModelTableStatus(self, message: str) -> None:
+        self.ui.tblModelList.clear()
+        self.ui.tblModelList.setRowCount(1)
+        self.ui.tblModelList.setColumnCount(1)
+        self.ui.tblModelList.setHorizontalHeaderLabels([message])
+        item = qt.QTableWidgetItem(message)
+        item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)
+        self.ui.tblModelList.setItem(0, 0, item)
+
+    def _startModelStatusHydration(self) -> None:
+        if self._modelStatusPoller is None or self._modelStatusPoller.is_running():
+            return
+        if not hasattr(self.logic, "_model_cache"):
+            return
+
+        for model in self.logic._model_cache:
+            model.status = ModelStatus.UNKNOWN
+        self._renderFilteredModels(self.logic._model_cache, self._pendingModelSearchText or "")
+
+        def worker():
+            assert self.logic is not None
+            self.logic.hydrateModelStatus()
+
+        self._modelStatusPoller.start(worker)
+
+    def _onModelStatusDone(self) -> None:
+        models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        if models:
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
 
     def renderModelTable(self, models: list['Model']) -> None:
 
         # set table height to 10 rows
         self.ui.tblModelList.setRowCount(10)
+        self.ui.tblModelList.clear()
 
         # remove all rows from model table
         self.ui.tblModelList.setRowCount(0)
 
-        # add models to table with 3 columns
-        self.ui.tblModelList.setColumnCount(4)
-        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "Actions"])
+        # add models to table with columns
+        self.ui.tblModelList.setColumnCount(5)
+        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "CU", "Actions"])
 
         # make table rows slim
-        self.ui.tblModelList.verticalHeader().setDefaultSectionSize(20)
+        self.ui.tblModelList.verticalHeader().setDefaultSectionSize(24)
 
-        # make table columns use all available space
-        self.ui.tblModelList.horizontalHeader().setStretchLastSection(True)
+        # size columns to content, only model label stretches
+        header = self.ui.tblModelList.horizontalHeader()
+        header.setStretchLastSection(False)
 
         # select full row when cell is clicked
         self.ui.tblModelList.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
 
         # make first column (model label) stretchable
         # NOTE: makes label column un-editable - not the best UX?!
-        self.ui.tblModelList.horizontalHeader().setSectionResizeMode(0, qt.QHeaderView.Stretch)
+        header.setSectionResizeMode(0, qt.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
 
         # fill table with models that match the search text
         for model in models:
@@ -589,6 +1120,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # add model image (placeholder)
             self.ui.tblModelList.setItem(rowPosition, 2, qt.QTableWidgetItem(",".join(model.modalities)))
 
+            # add commercial use column
+            cu_item = qt.QTableWidgetItem("Yes" if model.commercial_use else "No")
+            cu_item.setFlags(cu_item.flags() & ~qt.Qt.ItemIsEditable)
+            cu_item.setTextAlignment(qt.Qt.AlignCenter)
+            cu_item.setToolTip(
+                "Commercial use likely allowed; check license"
+                if model.commercial_use
+                else "Commercial use likely not allowed; check license"
+            )
+            self.ui.tblModelList.setItem(rowPosition, 3, cu_item)
+
             # create horizontal layout, add pull, run, and details buttons, and set layout to cell
             layout = qt.QHBoxLayout()
             layout.setSpacing(0)
@@ -604,45 +1146,82 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             def create_web_handler(model):
                 return lambda: self.onModelWeb(model)
 
-            btnPull = qt.QPushButton("Pull")
+            icon_size = qt.QSize(14, 14)
+            button_size = 24
+            loading_width = 72
+
+            btnPull = qt.QPushButton()
+            btnPull.setIcon(self._themeIcon("hi_pull"))
+            btnPull.setIconSize(icon_size)
+            btnPull.setFixedHeight(button_size)
+            btnPull.setMinimumWidth(button_size)
             btnPull.clicked.connect(create_pull_handler(btnPull, model))
             layout.addWidget(btnPull)
 
-            if model.status == ModelStatus.PULLING:
+            if model.status == ModelStatus.UNKNOWN:
                 btnPull.enabled = False
-                btnPull.text = "Pulling..."
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
+                btnPull.toolTip = "Checking image status"
+
+            elif model.status == ModelStatus.PULLING:
+                btnPull.enabled = False
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
                 btnPull.toolTip = "Image is being pulled"
 
             elif model.status == ModelStatus.PULLED:
                 btnPull.enabled = False
-                btnPull.text = "Pulled"
+                btnPull.setIcon(self._themeIcon("hi_pulled", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("")
+                btnPull.setMinimumWidth(button_size)
                 btnPull.toolTip = "Image is available locally"
+
+            elif model.status == ModelStatus.RUNNING:
+                btnPull.enabled = False
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
+                btnPull.toolTip = "Image is currently running"
 
             else:
                 btnPull.enabled = True
-                btnPull.text = "Pull"
                 btnPull.toolTip = "Pull image from MHub.ai"
+                btnPull.setText("")
+                btnPull.setMinimumWidth(button_size)
 
-            btnDetails = qt.QPushButton("Details")
+            btnDetails = qt.QPushButton()
+            btnDetails.setIcon(self._themeIcon("hi_info"))
+            btnDetails.setIconSize(icon_size)
+            btnDetails.setFixedSize(button_size, button_size)
+            btnDetails.toolTip = "Show model details"
             btnDetails.clicked.connect(create_details_handler(model))
             layout.addWidget(btnDetails)
 
-            btnWeb = qt.QPushButton("Web")
+            btnWeb = qt.QPushButton()
+            btnWeb.setIcon(self._themeIcon("hi_modelcard"))
+            btnWeb.setIconSize(icon_size)
+            btnWeb.setFixedSize(button_size, button_size)
+            btnWeb.toolTip = "Open model card in browser"
             btnWeb.clicked.connect(create_web_handler(model))
             layout.addWidget(btnWeb)
 
             widget = qt.QWidget()
             widget.setLayout(layout)
-            self.ui.tblModelList.setCellWidget(rowPosition, 3, widget)
+            self.ui.tblModelList.setCellWidget(rowPosition, 4, widget)
 
             # if model has more than 1 input, disable row
             if not model.inputs_compatibility:
-                for ci in range(4):
+                for ci in range(5):
                     item = self.ui.tblModelList.item(rowPosition, ci)
                     if item:
                         item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)  # Make it non-editable
                         item.setBackground(qt.Qt.gray)  # Change background color to indicate it's disabled
                         item.setForeground(qt.Qt.white)  # Change text color to white
+
+        self.updateLicenseSummary()
 
 
     def onModelDetails(self, model: 'Model') -> None:
@@ -660,6 +1239,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         details += [hlst("Modalities", model.modalities)]
         details += [hlst("Categories", model.categories)]
         details += [hlst("Inputs", model.inputs)]
+        license_lines = []
+        if model.license_model:
+            license_lines.append(f"Model: {model.license_model}")
+        if model.license_weights:
+            license_lines.append(f"Weights: {model.license_weights}")
+        if license_lines:
+            details += [hlst("License", license_lines)]
+        else:
+            details += ["License: N/A"]
+        details += [f"Commercial use allowed: {'Yes' if model.commercial_use else 'No'}"]
         details += ["\n REQUIRED CITATION: \n"]
         details += [f"The model was provided through the MHub.ai platform and is available under https://mhub.ai/models/{model.name}."]
         details += [model.cite]
@@ -697,8 +1286,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # construct image name
         image_name = f"mhubai/{model.name}:latest"
 
-        # debug
-        print("Pulling image: ", image_name)
+        logger.info("Pulling image: %s", image_name)
 
         # on stop handler
         def on_stop(*args):
@@ -706,11 +1294,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             button.text = "Pulled" # <-- NOTE: optimistic update
             self.updateBackendImagesList()
 
-            # debug
-            print(f"Image {image_name} pulled, args: {args}")
+            logger.debug("Image %s pulled, args: %s", image_name, args)
+
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                button.text = f"Pulling ({sec}s)"
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
 
         # pull model
-        self.logic.update_image(image_name, on_stop=on_stop)
+        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def onModelLoadTest(self, model: str) -> None:
 
@@ -744,51 +1340,28 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         model = self.getModelFromTableSelection(row)
         model_name = model.name if model else "N/A"
 
-        # debug
-        print("Model selected: ", row, col, model_name)
+        logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
         # update apply button
         self._checkCanApply()
 
-    def onBackendSelect(self, index: int) -> None:
-        self.onBackendUpdate()
-
-    def onBackendUpdate(self) -> None:
+    def onDockerUpdate(self) -> None:
         assert self.logic is not None
 
-        # get selected backend
-        backend = self.ui.backendSelector.currentText
-
-        # get backend information
-        bi = self.logic.getBackendInformation(backend)
-
-        # get host version
-        if not bi.available:
-            self.ui.lblBackendVersion.setText("Selected backend not available.")
-
+        info = self.logic.getDockerInformation()
+        if not info.available:
+            self.ui.lblBackendVersion.setText("Docker not available.")
         else:
-            self.ui.lblBackendVersion.setText(bi.version)
+            self.ui.lblBackendVersion.setText(info.version)
 
-        # enable / disable gpus seclection based on backend
-        self.ui.lstHostGpu.enabled = backend == "docker"
-
-        # update install backend button and images list
-        self.updateInstallUDockerBackendButtonState()
         self.updateBackendImagesList()
-
-    def updateInstallUDockerBackendButtonState(self) -> None:
-        assert self.logic
-
-        if self.ui.backendSelector.currentText == "udocker":
-            is_installed = self.logic.isUdockerBackendInstalled()
-            self.ui.cmdInstallUdocker.enabled = True
-
-            if is_installed:
-                self.ui.cmdInstallUdocker.text = "uninstall"
-            else:
-                self.ui.cmdInstallUdocker.text = "install"
+        search_text = self.ui.searchModel.text
+        self._pendingModelSearchText = search_text or ""
+        if hasattr(self.logic, "_model_cache"):
+            self._startModelStatusHydration()
         else:
-            self.ui.cmdInstallUdocker.enabled = False
+            self.onSearchModel(search_text)
+        self.updateSettingsSummary()
 
     def onBackendImageSelect(self) -> None:
 
@@ -803,18 +1376,25 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmdImageUpdate.enabled = selected is not None and enabled
         self.ui.cmdImageRemove.enabled = selected is not None and enabled
 
-        # debug
-        print(f"Selected image: {selected.text()}, status: {enabled}")
+        logger.debug("Selected image: %s, enabled=%s", selected.text(), enabled)
 
     def onBackendImageUpdate(self) -> None:
         assert self.logic
 
         # get selected image
         selected = self.ui.lstBackendImages.currentItem()
-        image_name = selected.text()
+        if selected is None:
+            return
+        image_name = selected.data(qt.Qt.UserRole)
+        if not image_name:
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Update image")
+            msg.setText("Selected image is missing its stored name. Please refresh the image list.")
+            msg.exec_()
+            return
 
-        # debug
-        print(f"Updating image: {image_name}")
+        logger.info("Updating image: %s", image_name)
 
         # show a message box
         msg = qt.QMessageBox()
@@ -828,29 +1408,58 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if ret != qt.QMessageBox.Ok:
             return
 
-        # debug
-        print("Updating image")
+        logger.debug("Updating image confirmed")
 
         # add `updating...` to image and disable entry
         selected.setText(f"{image_name} (updating...)")
         selected.setFlags(qt.Qt.ItemIsEnabled)
 
         # on stop callback removes `updating...` from image
-        def on_stop(*args):
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
             selected.setText(image_name)
+            if returncode != 0 or timedout or killed:
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Update image failed")
+                text = f"Updating image {image_name} failed with return code {returncode}."
+                text += "\nProcess timed out." if timedout else ""
+                text += "\nProcess was killed." if killed else ""
+                msg.setText(text)
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
+                return
+            self.updateBackendImagesList()
+
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                selected.setText(f"{image_name} (updating... {sec}s)")
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
 
         # update image
-        self.logic.update_image(image_name, on_stop=on_stop)
+        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def onBackendImageRemove(self) -> None:
         assert self.logic
 
         # get selected image
         selected = self.ui.lstBackendImages.currentItem()
-        image_name = selected.text()
+        if selected is None:
+            return
+        image_name = selected.data(qt.Qt.UserRole)
+        if not image_name:
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Remove image")
+            msg.setText("Selected image is missing its stored name. Please refresh the image list.")
+            msg.exec_()
+            return
 
-        # debug
-        print(f"Removing image: {image_name}")
+        logger.info("Removing image: %s", image_name)
 
         # show a message box
         msg = qt.QMessageBox()
@@ -864,41 +1473,61 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if ret != qt.QMessageBox.Ok:
             return
 
-        # debug
-        print("Removing image")
+        logger.debug("Removing image confirmed")
 
         # add `removing...` to image and disable entry
         selected.setText(f"{image_name} (removing...)")
         selected.setFlags(qt.Qt.ItemIsEnabled)
 
         # on stop callback removes entry
-        def on_stop(errorcode: int, stdout: str, *args):
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
+            logger.debug("Image %s removed (returnCode: %s)", image_name, returncode)
+            if stdout:
+                logger.debug("Image remove stdout: %s", stdout)
 
-            # debug
-            print(f"/ Image {image_name} removed \\")
-            print(stdout)
-            print(f"\\ Image {image_name} removed (errorCode: {errorcode}) /")
+            if returncode != 0 or timedout or killed:
+                selected.setText(image_name)
+                selected.setFlags(qt.Qt.ItemIsEnabled | qt.Qt.ItemIsSelectable)
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Remove image failed")
+                text = f"Removing image {image_name} failed with return code {returncode}."
+                text += "\nProcess timed out." if timedout else ""
+                text += "\nProcess was killed." if killed else ""
+                msg.setText(text)
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
+                return
 
-            # FIXME: this is very optimistic...
+            # remove from list on success
             self.ui.lstBackendImages.takeItem(self.ui.lstBackendImages.row(selected))
 
+        last_progress_sec = {"value": -1}
+
+        def on_progress(progress: float, stdout: str | None):
+            sec = int(progress)
+            if sec != last_progress_sec["value"]:
+                selected.setText(f"{image_name} (removing... {sec}s)")
+                last_progress_sec["value"] = sec
+            self._appendLogOutput(stdout)
+
         # remove image
-        self.logic.remove_image(image_name, on_stop=on_stop)
+        self.logic.remove_image(image_name, on_stop=on_stop, on_progress=on_progress)
 
     def updateBackendImagesList(self) -> None:
         assert self.logic is not None
 
-        # get selected backend
-        backend = self.ui.backendSelector.currentText
-
-        # get available images
-        images = self.logic.getLocalImages(backend, cached=False)
+        # get available docker images
+        images = self.logic.getLocalImages(cached=False)
 
         # update list
         self.ui.lstBackendImages.clear()
         for image in images:
             item = qt.QListWidgetItem()
             item.setText(image)
+            raw_name = image.split(" (", 1)[0] if " (" in image else image
+            item.setData(qt.Qt.UserRole, raw_name)
             self.ui.lstBackendImages.addItem(item)
 
     # def initiateHostTest(self) -> None:
@@ -948,7 +1577,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         run_dirs = [str(d.name) for d in run_dirs]
 
         # run_dirs = [str(d.name) for d in os.scandir(runs_dir) if d.is_dir() and not d.name.startswith(".")]
-        print("run_dirs: ", run_dirs)
+        logger.debug("run_dirs: %s", run_dirs)
 
         # clear run list
         self.ui.cmbSelectRunOutput.clear()
@@ -963,7 +1592,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # open latest run directory
         if open_latest and run_dirs:
-            self.ui.cmbSelectRunOutput.setCurrentText(run_dirs[-1])
+            self.ui.cmbSelectRunOutput.setCurrentText(run_dirs[0])
 
     def prepareOutput(self) -> None:
         assert self.logic is not None
@@ -977,13 +1606,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         output_dir = os.path.join(runs_dir, selected_run)
 
         # get output files
-        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv"])
+        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv", ".seg.dcm"])
 
         # clear output list
         self.ui.lstOutputFiles.clear()
 
-        # debug
-        print("Output files: ", output_files)
+        logger.debug("Output files: %s", output_files)
 
         # update list
         for output_file in output_files:
@@ -991,31 +1619,28 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             item.setText(os.path.relpath(output_file, output_dir))
             self.ui.lstOutputFiles.addItem(item)
 
-            # clicking on item opens the file
             item.setData(qt.Qt.UserRole, output_file)
+        self._updateOpenOutputFileButton()
 
     def onOutputFileSelect(self) -> None:
+        self._updateOpenOutputFileButton()
+
+    def onOpenOutputFile(self) -> None:
         assert self.logic is not None
-
-        # get selected item
-        selected = self.ui.lstOutputFiles.currentItem()
-        if selected is None:
+        output_file = self._getSelectedOutputFile()
+        if not output_file or not self._isSupportedOutputFile(output_file):
             return
-
-        # get output file
-        output_file = selected.data(qt.Qt.UserRole)
-
-        # debug
-        print("Selected output file: ", output_file)
+        logger.debug("Opening output file: %s", output_file)
 
         # create table node
-        if not self.ui.outputTableSelector.currentNode():
-            print("create table node")
-            tableNode = slicer.vtkMRMLTableNode()
-            slicer.mrmlScene.AddNode(tableNode)
-            self.ui.outputTableSelector.setCurrentNode(tableNode)
-        else:
-            tableNode = self.ui.outputTableSelector.currentNode()
+        if output_file.endswith(".json") or output_file.endswith(".csv"):
+            if not self.ui.outputTableSelector.currentNode():
+                logger.debug("Creating table node")
+                tableNode = slicer.vtkMRMLTableNode()
+                slicer.mrmlScene.AddNode(tableNode)
+                self.ui.outputTableSelector.setCurrentNode(tableNode)
+            else:
+                tableNode = self.ui.outputTableSelector.currentNode()
 
         # if file is json, open text
         if output_file.endswith(".json"):
@@ -1047,8 +1672,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # flatten json
             data = flatten_json(data)
 
-            # debug
-            print("Flattened json: ", data)
+            logger.debug("Flattened json: %s", data)
 
             # create table
             self.logic.renderTableData(tableNode, ["Key", "Value"], [[k, v] for k, v in data.items()])
@@ -1065,6 +1689,30 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # create table
             self.logic.renderTableData(tableNode, csv_header, csv_data)
+
+        elif output_file.endswith(".seg.dcm"):
+            self.logic.importSegmentations([output_file])
+
+    def _getSelectedOutputFile(self) -> str | None:
+        selected = self.ui.lstOutputFiles.currentItem()
+        if selected is None:
+            return None
+        output_file = selected.data(qt.Qt.UserRole)
+        return output_file or None
+
+    def _isSupportedOutputFile(self, output_file: str) -> bool:
+        return output_file.endswith((".json", ".csv", ".seg.dcm"))
+
+    def _updateOpenOutputFileButton(self) -> None:
+        if not hasattr(self.ui, "cmdOpenOutputFile"):
+            return
+        output_file = self._getSelectedOutputFile()
+        enabled = bool(output_file) and self._isSupportedOutputFile(output_file)
+        self.ui.cmdOpenOutputFile.enabled = enabled
+        icon_name = "hi_show" if enabled else "hi_noshow"
+        opacity = 1.0 if enabled else self._ICON_DISABLED_OPACITY
+        self.ui.cmdOpenOutputFile.setIcon(self._themeIcon(icon_name, opacity))
+        self.ui.cmdOpenOutputFile.setIconSize(qt.QSize(14, 14))
 
     def onCancelButton(self) -> None:
 
@@ -1119,25 +1767,28 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
-
-        # get backend
-        backend = self.ui.backendSelector.currentText
+        self._updateMainButtonIcons()
 
         ###### TEST (for caching on host)
         # get InstanceUIDs (only available for nodes loaded through the dicom module)
         node = self.ui.inputSelector.currentNode()
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
+        input_is_dicom = bool(instanceUIDs)
 
-        # create hash from instanceUIDs
-        hash = hashlib.sha256()
-        hash.update(instanceUIDs.encode('utf-8'))
-        instance_idh = hash.hexdigest()
+        # create hash from instanceUIDs if available
+        if instanceUIDs:
+            hash = hashlib.sha256()
+            hash.update(instanceUIDs.encode('utf-8'))
+            instance_idh = hash.hexdigest()
+        else:
+            instance_idh = "non-dicom"
+            logger.debug("No DICOM instanceUIDs for node: %s", node.GetName() if node else None)
 
         # get selected model
         model = self.getModelFromTableSelection()
         assert model is not None, "No model selected"
 
-        print(instance_idh)
+        logger.debug("Instance UID hash: %s", instance_idh)
 
         # runid as yy.mm.dd-hh.mm.ss-model.name
         runid = f"{datetime.now().strftime('%y.%m.%d-%H.%M.%S')}_{model.name}"
@@ -1171,13 +1822,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 for i in range(self.ui.lstHostGpu.count):
                     item = self.ui.lstHostGpu.item(i)
                     if item.checkState() == qt.Qt.Checked:
-                        print("Selected GPU: ", item.text())
+                        logger.debug("Selected GPU: %s", item.text())
                         gpus.append(i)
 
             # copy selected dicom data into input directory
+            modality = None
+            if hasattr(self.ui, "cmbInputModality"):
+                modality = self.ui.cmbInputModality.currentText
             self.logic.copy_node(
                 self.ui.inputSelector.currentNode(),
-                input_dir
+                input_dir,
+                modality=modality
             )
 
             # clear logs
@@ -1185,15 +1840,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # PROGRESS handler
             def onProgress(progress: float, stdout: str | None):
-                self.ui.applyButton.text = f"Running {model.label} ({progress}s)"
-
-                # remove all color formatting from stdout string
-                if stdout is not None:
-                    stdout = re.sub(r'\x1b\[[0-9;]*m', '', stdout)
-
-                # display stdout in txtLogs
-                if stdout is not None and stdout.strip() != "":
-                    self.ui.txtLogs.appendPlainText(stdout)
+                self._setButtonTextWithIcon(self.ui.applyButton, f"Running {model.label} ({progress}s)")
+                self._appendLogOutput(stdout)
 
             # TERMINATION handler
             def onStop(returncode: int, stdout: str, timedout: bool, killed: bool):
@@ -1203,7 +1851,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
                 if 'Segmentation' in model.categories:
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    self.logic.addFilesToDatabase(dsegfiles, operation="copy")
+                    if input_is_dicom:
+                        self.logic.addFilesToDatabase(dsegfiles, operation="copy")
                     self.logic.importSegmentations(dsegfiles)
 
                 if 'Prediction' in model.categories:
@@ -1230,13 +1879,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # run model logic
             self.logic.run_mhub(
                 model=model,
-                backend=backend,
                 gpus=gpus,
                 input_dir=input_dir,
                 output_dir=output_dir,
                 onProgress=onProgress,
                 onStop=onStop
             )
+            self._updateMainButtonIcons()
 
 
 #
@@ -1315,6 +1964,9 @@ class Model:
     categories: list[str]
     roi: list[str]
     cite: str
+    license_model: str
+    license_weights: str
+    commercial_use: bool
 
     inputs: list[str]
     inputs_compatibility: bool
@@ -1344,8 +1996,7 @@ class Model:
 #     cachedSubjects: List[str]
 
 @dataclass
-class BackendInformation:
-    name: str
+class DockerInformation:
     version: str
     available: bool
 
@@ -1485,7 +2136,7 @@ class ProgressObserver:
 
     @classmethod
     def killAll(cls):
-        for task in cls._tasks:
+        for task in list(cls._tasks):
             task.kill()
 
     @classmethod
@@ -1510,7 +2161,14 @@ class ProgressObserver:
 
         return matched_tasks
 
-    def __init__(self, cmd: list[str], frequency: float = 2, timeout: int = 0, data: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        cmd: list[str],
+        frequency: float = 2,
+        timeout: int = 0,
+        data: dict[str, Any] | None = None,
+        env: dict[str, str] | None = None,
+    ):
         """
         cmd:       command to execute in subprocess
         frequency: progress update frequency in Hz
@@ -1528,6 +2186,7 @@ class ProgressObserver:
         self._seconds_elapsed = 0.0
 
         self._proc = None
+        self._env = env
         self._onProgress: Callable[[float, str], None] | None = None
         self._onStop: Callable[[int, str, bool, bool], None] | None = None
 
@@ -1540,15 +2199,18 @@ class ProgressObserver:
         stdout_file = tempfile.NamedTemporaryFile(delete=False, prefix="mhub_slicer_stdout_", suffix=".txt")
         stdout_file.close()
 
-        print("Temp File Created: ", stdout_file.name)
+        logger.debug("Temp file created: %s", stdout_file.name)
         self._stdout_file_name = stdout_file.name
 
         # create empty file
         with open(stdout_file.name, 'w') as f:
             f.write("")
 
-        # print if file exists
-        print("Temp File Exists: ", self._stdout_file_name, os.path.exists(self._stdout_file_name))
+        logger.debug(
+            "Temp file exists: %s %s",
+            self._stdout_file_name,
+            os.path.exists(self._stdout_file_name),
+        )
         self._stdout_readpointer = 0
 
         # run command
@@ -1566,6 +2228,7 @@ class ProgressObserver:
                 cmd,
                 stdout=stdout_file,
                 stderr=subprocess.STDOUT,
+                env=self._env,
                 text=True,
                 encoding='utf-8'
             )
@@ -1576,7 +2239,11 @@ class ProgressObserver:
     def _stop(self, returncode: int, timedout: bool, killed: bool):
 
         # cleanup (delete stdout file)
-        print("read and remove temp stdout file", self._stdout_file_name, os.path.exists(self._stdout_file_name))
+        logger.debug(
+            "Read and remove temp stdout file: %s %s",
+            self._stdout_file_name,
+            os.path.exists(self._stdout_file_name),
+        )
 
         # retrieve stdout
         with open(self._stdout_file_name, encoding='utf-8') as f:
@@ -1644,8 +2311,8 @@ class ProgressObserver:
         # try to stop
         try:
             self._stop(-1, False, True)
-        except Exception as e:
-            print("Error when killing process: stop method failed. ", self.cmd, e)
+        except Exception:
+            logger.exception("Error when killing process: stop method failed. cmd=%s", self.cmd)
 
         # then stop timer, kill process and remove from tasks
         if self._proc is not None:
@@ -1653,82 +2320,6 @@ class ProgressObserver:
 
         # remove from tasks
         self._tasks.remove(self)
-
-class ProcessChain:
-
-    @dataclass
-    class CMD:
-        index: int
-        cmd: list[str]
-        name: str | None = None
-        frequency: float = 2
-        timeout: int = 0
-        returncode: int | None = None
-        success: bool | None = None
-        started: bool = False
-
-    def __init__(self):
-        self.cmds: list['ProcessChain.CMD'] = []
-        self.started = False
-        self.stopped = False
-        self.success = True
-        self.index = -1
-
-        self._seconds_elapsed = 0.0
-
-        self._onStop: Callable[[bool], None] | None = None
-        self._onProgress: Callable[['ProcessChain.CMD', float], None] | None = None
-
-    def add(self, cmd: list[str], name: str | None = None, timeout: int = 0, frequency: float = 2):
-        assert not self.started, "Process chain already started"
-        self.cmds.append(self.CMD(len(self.cmds), cmd, name, frequency, timeout))
-
-    def start(self):
-        self.started = True
-
-        # start first process
-        self._start_next()
-
-    def _start_next(self):
-        if self.index < len(self.cmds):
-            self.index += 1
-            self._start_process(self.cmds[self.index].cmd)
-        else:
-            self.stopped = True
-
-            # invoke callback if defined
-            if self._onStop:
-                self._onStop(True)
-
-    def _on_process_stop(self, returncode: int, stdout: str, timedout: bool, killed: bool):
-        if timedout or killed or returncode != 0:
-            self.success = False
-            self.stopped = True
-
-            # invoke callback if defined
-            if self._onStop:
-                self._onStop(False)
-        else:
-            self._start_next()
-
-    def _on_process_progress(self, time: float, stdout: str):
-        self._seconds_elapsed += time
-
-        # invoke progress callback if defined
-        if self._onProgress:
-            self._onProgress(self.cmds[self.index], time)
-
-    def _start_process(self, cmd: list[str]):
-        p = ProgressObserver(cmd)
-        p.onStop(self._on_process_stop)
-        p.onProgress(self._on_process_progress)
-
-    def onStop(self, callback: Callable[[bool], None]):
-        self._onStop = callback
-
-    def onProgress(self, callback: Callable[['ProcessChain.CMD', float], None]):
-        self._onProgress = callback
-
 
 # MHubRunnerLogic
 #
@@ -1775,6 +2366,36 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             #self.log('paramiko is required. Installing...')
             slicer.util.pip_install('paramiko')
 
+    def _build_subprocess_env(self, executable_path: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        if executable_path:
+            path_entries = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+            exec_dir = os.path.dirname(executable_path)
+            real_exec_dir = os.path.dirname(os.path.realpath(executable_path))
+            for path in (exec_dir, real_exec_dir):
+                if path and path not in path_entries:
+                    path_entries.insert(0, path)
+            env["PATH"] = os.pathsep.join(path_entries)
+        return env
+
+    def _license_allows_commercial_use(self, license_text: str | None) -> bool:
+        if not license_text:
+            return False
+        text = license_text.lower()
+        if "mit" in text:
+            return True
+        if "apache" in text:
+            return True
+        if "cc" in text or "creative commons" in text:
+            return "nc" not in text
+        return False
+
+    def _commercial_use_allowed(self, model_license: str | None, weights_license: str | None) -> bool:
+        return (
+            self._license_allows_commercial_use(model_license)
+            and self._license_allows_commercial_use(weights_license)
+        )
+
     def getModel(self, model_name: str) -> Model:
 
         # get models
@@ -1790,8 +2411,12 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # return
         return model
 
-    def getModels(self, cached: bool = True, backend: str = 'docker') -> list[Model]:
-        import requests, json
+    def getModels(self, cached: bool = True, hydrate_status: bool = True) -> list[Model]:
+        try:
+            import requests
+        except ModuleNotFoundError as e:
+            logger.error("requests not available: %s", e)
+            return getattr(self, "_model_cache", [])
 
         # -- 1 ----------- LOAD MODELS
 
@@ -1801,46 +2426,68 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             models = self._model_cache
 
         else:
+            models = []
 
             # download model information from api endpoint (json)
             # -> migrate from https://mhub.ai/api/v2/models to https://mhub.ai/api/v2/models/detailed
             MHUBAI_API_ENDPOINT_MODELS = "https://mhub.ai/api/v2/models/detailed"
 
-            # fetch
-            response = requests.get(MHUBAI_API_ENDPOINT_MODELS)
+            try:
+                response = requests.get(MHUBAI_API_ENDPOINT_MODELS, timeout=10)
+                response.raise_for_status()
+                payload = response.json()
 
-            # parse
-            payload = json.loads(response.text)
+                # get model list
+                for model_data in payload['data']:
 
-            # get model list
-            models: list[Model] = []
-            for model_data in payload['data']:
+                    # check if model inputs are compatible with slicer extension
+                    inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    license_info = model_data.get('licence') or {}
+                    license_model = license_info.get('model') or ""
+                    license_weights = license_info.get('weights') or ""
+                    commercial_use = self._commercial_use_allowed(license_model, license_weights)
 
-                # check if model inputs are compatible with slicer extension
-                inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    # create model
+                    models.append(Model(
+                        id=model_data['id'],
+                        name=model_data['name'],
+                        label=model_data['label'],
+                        description=model_data['description'],
+                        modalities=model_data['modalities'],
+                        roi=model_data['segmentations'],
+                        categories=model_data['categories'],
+                        cite=model_data['cite'],
+                        license_model=license_model,
+                        license_weights=license_weights,
+                        commercial_use=commercial_use,
+                        inputs=[i['description'] for i in model_data['inputs']],
+                        inputs_compatibility=inputs_compatibility
+                    ))
 
-                # create model
-                models.append(Model(
-                    id=model_data['id'],
-                    name=model_data['name'],
-                    label=model_data['label'],
-                    description=model_data['description'],
-                    modalities=model_data['modalities'],
-                    roi=model_data['segmentations'],
-                    categories=model_data['categories'],
-                    cite=model_data['cite'],
-                    inputs=[i['description'] for i in model_data['inputs']],
-                    inputs_compatibility=inputs_compatibility
-                ))
-
-            # cache
-            self._model_cache = models
+                # cache
+                self._model_cache = models
+            except Exception as e:
+                logger.warning("Failed to fetch models: %s", e)
+                models = getattr(self, "_model_cache", [])
 
         # -- 2 ----------- HYDRATE MODEL STATE
+        if hydrate_status:
+            self.hydrateModelStatus(models=models, cached_images=cached)
+
+        # -- 3 ----------- RETURN MODELS
+        return models
+
+    def hydrateModelStatus(
+        self,
+        models: list[Model] | None = None,
+        cached_images: bool = False,
+    ) -> list[Model]:
+        if models is None:
+            models = getattr(self, "_model_cache", [])
 
         # get local images
-        # NOTE: this is backend specific, thus needs to be re-loaded when backend changes
-        images = self.getLocalImages(backend=backend, cached=cached)
+        # NOTE: refresh when docker images change
+        images = self.getLocalImages(cached=cached_images)
         images = [i.split()[0] for i in images]
 
         # iterate models and update state
@@ -1859,7 +2506,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             else:
                 model.status = ModelStatus.PULLABLE
 
-        # -- 3 ----------- RETURN MODELS
         return models
 
     def getDockerExecutable(self, refresh: bool = False) -> str | None:
@@ -1884,12 +2530,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             except Exception as e:
                 pass
 
-        # debug
-        print("Docker executable: ", docker_executable)
+        logger.debug("Docker executable: %s", docker_executable)
 
         # error
         if docker_executable is None or docker_executable == "":
-            print("WARNING: ", "Docker executable not found.")
+            logger.warning("Docker executable not found.")
 
         # cache
         if docker_executable:
@@ -1898,122 +2543,24 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # deliver
         return docker_executable
 
-    def getUDockerExecutable(self, refresh: bool = False) -> str | None:
-        # TODO: return optional and display installation instructions under backend tab
-
-        # TODO: figure out installation path.
-        # TODO: pro/cons installing udocker in slicer vs. using system wide installation (also consider the nature of the tool)
-        #return "/home/exouser/Downloads/Slicer-5.6.2-linux-amd64/lib/Python/bin/udocker" # <- linux: pip install executable
-        #return "/home/exouser/Downloads/Slicer-5.6.2-linux-amd64/lib/Python/lib/python3.9/site-packages/udocker" # <- linux: pip install directory
-        #return "/Applications/Slicer.app/Contents/lib/Python/bin/udocker" #  <- macos: pip install executable
-
-        import platform
+    def getDockerInformation(self) -> DockerInformation:
         import subprocess
 
-        # cache lookup
-        if not refresh and "udocker" in self._executables and self._executables["udocker"]:
-            return self._executables["udocker"]
-
-        # get operation system
-        ops = platform.system()
-
-        # find docker executable
-        udocker_executable = None
-        if ops == "Linux":
-            try:
-                udocker_executable = subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8').strip('\n')
-            except Exception as e:
-                pass
-
-        # debug
-        print("U-Docker executable: ", udocker_executable)
-
-        # error
-        if udocker_executable is None or udocker_executable == "":
-            print("WARNING: ", "U-Docker executable not found.")
-
-        # cache
-        if udocker_executable:
-            self._executables["udocker"] = udocker_executable
-
-        # deliver
-        return udocker_executable
-
-    def getBackendInformation(self, name: str) -> BackendInformation:
-        assert name in ["docker", "udocker"]
-        import subprocess, re
-
-        # initialize bi
-        bi = BackendInformation(name, "N/A", False)
-
-        # fetch version and availability from backend
-        if name == "docker":
-            try:
-                docker_exec = self.getDockerExecutable()
-                assert docker_exec is not None, "Docker executable not found"
-                print("running" , docker_exec, "--version")
-                result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True)
-                bi.version = result.stdout.decode('utf-8')
-                bi.available = True
-                print("Docker available")
-            except Exception as e:
-                bi.version = "E"
-                bi.available = False
-
-        elif name == "udocker":
-            try:
-                # use launchConsoleProcess to run udocker --version
-                # import udocker
-                # bi.version = udocker.__version__ #proc.stdout.read().decode('utf-8')
-                # bi.available = True
-
-                # get udocker exec
-                # TODO: check https://github.com/Slicer/Slicer/blob/9391c208f0d25a2fe2e6b19667766e759c6160c7/Base/Python/
-                # slicer/util.py#L3857
-
-                # run
-                udocker_exec = self.getUDockerExecutable()
-                assert udocker_exec is not None, "Udocker executable not found"
-                print("running: ", udocker_exec, "--version")
-                result = subprocess.run([udocker_exec, "--version"], timeout=5, check=True, capture_output=True)
-                print("result: ", result.stdout.decode('utf-8'))
-
-                # extract "version: x.x.x" from string
-                version = re.search(r"version: ([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.decode('utf-8'))
-
-                bi.version = f"Version: {version.groups()[0]}" if version else "???"
-                bi.available = True
-                print("Udocker available")
-
-            except Exception as e:
-                bi.version = "E"
-                bi.available = False
-
-        # return
-        return bi
-
-    def isUdockerBackendInstalled(self) -> bool:
+        info = DockerInformation(version="N/A", available=False)
         try:
-            import udocker
-            return True
-        except ModuleNotFoundError as e:
-            return False
+            docker_exec = self.getDockerExecutable()
+            assert docker_exec is not None, "Docker executable not found"
+            logger.debug("Running %s --version", docker_exec)
+            env = self._build_subprocess_env(docker_exec)
+            result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
+            info.version = result.stdout.decode('utf-8')
+            info.available = True
+            logger.debug("Docker available")
+        except Exception:
+            info.version = "E"
+            info.available = False
 
-    def installUdockerBackend(self):
-
-        # chekc if udocker is already installed
-        is_installed = self.isUdockerBackendInstalled()
-
-        # install udocker in slicer
-        if not is_installed:
-            # install udocker
-            slicer.util.pip_install('udocker')
-            udocker_exec = self.getUDockerExecutable()
-
-            # install additional dependencies
-            slicer.util.launchConsoleProcess([udocker_exec, "install"]) # --force
-        else:
-            slicer.util.pip_uninstall('udocker')
+        return info
 
     def getGPUInformation(self) -> list[str]:
         import subprocess
@@ -2030,30 +2577,29 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # return
         return gpus
 
-    def getLocalImages(self, backend: str, cached: bool = True) -> list[str]:
+    def getLocalImages(self, cached: bool = True) -> list[str]:
 
         # get images
         import subprocess
 
         # cache
-        if cached and hasattr(self, "_images_cache") and backend in self._images_cache:
-            return self._images_cache[backend]
+        if cached and hasattr(self, "_images_cache"):
+            return self._images_cache
 
-        # load images based on backend
+        # load docker images
         try:
-            if backend == "docker":
-                docker_exec = self.getDockerExecutable()
-                assert docker_exec is not None, "Docker executable not found"
-                result = subprocess.run([docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"], timeout=5, check=True, capture_output=True)
-                images = [i.split("|") for i in result.stdout.decode('utf-8').split("\n")]
-                images = [f"{i[0]}:latest ({i[2]})" for i in images if len(i) == 3 and i[1] == "latest"]
-
-            elif backend == "udocker":
-                udocker_exec = self.getUDockerExecutable()
-                assert udocker_exec is not None, "Udocker executable not found"
-                result = subprocess.run([udocker_exec, "images"], timeout=5, check=True, capture_output=True)
-                images = result.stdout.decode('utf-8').split("\n")
-                images = [image.split()[0] for image in images if image.startswith("mhubai/")]
+            docker_exec = self.getDockerExecutable()
+            assert docker_exec is not None, "Docker executable not found"
+            env = self._build_subprocess_env(docker_exec)
+            result = subprocess.run(
+                [docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"],
+                timeout=5,
+                check=True,
+                capture_output=True,
+                env=env,
+            )
+            images = [i.split("|") for i in result.stdout.decode('utf-8').split("\n")]
+            images = [f"{i[0]}:latest ({i[2]})" for i in images if len(i) == 3 and i[1] == "latest"]
 
             # remove empty strings
             images = [image for image in images if image != ""]
@@ -2062,20 +2608,86 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             images = []
 
         # cache
-        if not hasattr(self, "_images_cache"):
-            self._images_cache = {}
-        self._images_cache[backend] = images
+        self._images_cache = images
 
         # return
         return images
 
     def get_node_paths(self, node) -> list[str]:
-        storageNode=node.GetStorageNode()
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
+        if instanceUIDs:
+            instanceUIDs = instanceUIDs.split()
+            files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
+            return [f for f in files if f]
+
+        storageNode = node.GetStorageNode() if node else None
         if storageNode is not None:
-            return [storageNode.GetFullNameFromFileName()]
-        else:
-            instanceUIDs=node.GetAttribute('DICOM.instanceUIDs').split()
-            return [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
+            file_path = storageNode.GetFullNameFromFileName()
+            if file_path:
+                return [file_path]
+
+        raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
+
+    def _normalize_modality(self, modality: str | None) -> str:
+        if not modality:
+            return "SC"
+        normalized = str(modality).strip().upper()
+        if normalized in ("CT", "MR", "NM", "US", "PT", "CR", "SC"):
+            return normalized
+        return "SC"
+
+    def _build_dicom_export_tags(self, volume_node, modality: str | None = None) -> dict[str, str]:
+        now = datetime.now()
+        date = now.strftime("%Y%m%d")
+        time_value = now.strftime("%H%M%S")
+        volume_name = volume_node.GetName() if volume_node else "SlicerVolume"
+        try:
+            import pydicom
+        except Exception as exc:
+            raise RuntimeError("pydicom is required to generate DICOM UIDs.") from exc
+        study_uid = pydicom.uid.generate_uid()
+        series_uid = pydicom.uid.generate_uid()
+        frame_uid = pydicom.uid.generate_uid()
+
+        return {
+            "Patient Name": "Slicer^User",
+            "Patient ID": "Slicer",
+            "Patient Birth Date": "",
+            "Patient Sex": "",
+            "Patient Comments": "",
+            "Study ID": f"SLICER-{date}",
+            "Study Date": date,
+            "Study Time": time_value,
+            "Study Description": "Slicer Export",
+            "Modality": self._normalize_modality(modality),
+            "Manufacturer": "3D Slicer",
+            "Model": "MHubRunner",
+            "Series Description": volume_name,
+            "Series Number": "1",
+            "Series Date": date,
+            "Series Time": time_value,
+            "Content Date": date,
+            "Content Time": time_value,
+            "Study Instance UID": study_uid,
+            "Series Instance UID": series_uid,
+            "Frame of Reference UID": frame_uid,
+        }
+
+    def export_volume_to_dicom(self, volume_node, output_dir: str, modality: str | None = None) -> list[str]:
+        if not volume_node or not volume_node.IsA("vtkMRMLScalarVolumeNode"):
+            raise ValueError("Selected input node must be a scalar volume.")
+        os.makedirs(output_dir, exist_ok=True)
+        try:
+            from DICOMLib import DICOMExportScalarVolume
+        except Exception as exc:
+            raise RuntimeError("DICOM export is unavailable in this Slicer build.") from exc
+
+        tags = self._build_dicom_export_tags(volume_node, modality=modality)
+        exporter = DICOMExportScalarVolume(tags["Study ID"], volume_node, tags, output_dir)
+        if not exporter.export():
+            raise RuntimeError("Creating DICOM files from the selected volume failed.")
+
+        return self.scanDirectoryForFilesWithExtension(output_dir, extension=[])
 
     def renderTableData(self, tableNode, header: list[str], data: list[list[str]]) -> None:
 
@@ -2115,7 +2727,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """
         Switch to a layout where tables are visible and show the selected one.
         """
-        print("Show table view")
+        logger.debug("Show table view")
         currentLayout = slicer.app.layoutManager().layout
         layoutWithTable = slicer.modules.tables.logic().GetLayoutWithTable(currentLayout)
         slicer.app.layoutManager().setLayout(layoutWithTable)
@@ -2168,29 +2780,32 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
     #             # let slicer breathe :D
     #             slicer.app.processEvents()
 
-    def copy_node(self, node, copy_dir: str, verbose: bool = True):
+    def copy_node(self, node, copy_dir: str, verbose: bool = True, modality: str | None = None):
         """
         Copy all dicom files from a dicom image node to the specified location.
         """
         import shutil
 
-        # get list of all dicom files
-        files = self.get_node_paths(node)
+        if node is None:
+            raise ValueError("No input node selected.")
 
-        # print number of files
+        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
+        if instanceUIDs:
+            files = self.get_node_paths(node)
+            if verbose:
+                logger.debug("Number of files: %s", len(files))
+            if not os.path.exists(copy_dir):
+                os.makedirs(copy_dir)
+            for file in files:
+                shutil.copy(file, copy_dir)
+                slicer.app.processEvents()
+            return
+
         if verbose:
-            print(f"number of files: {len(files)}")
-
-        # check if the path exists
-        if not os.path.exists(copy_dir):
-            os.makedirs(copy_dir)
-
-        # copy all files to the specified location
-        for file in files:
-            shutil.copy(file, copy_dir)
-
-            # let slicer breathe :D
-            slicer.app.processEvents()
+            logger.info("Exporting non-DICOM volume to DICOM for model input.")
+        files = self.export_volume_to_dicom(node, copy_dir, modality=modality)
+        if verbose:
+            logger.debug("Exported %s DICOM files.", len(files))
 
     def _run_mhub_docker(self, model: 'Model', gpus: list[int] | None, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
 
@@ -2200,10 +2815,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         elif len(gpus) == 0:
             mhub_run_gpus = ["--gpus", "all"]
         else:
-            mhub_run_gpus = ["--gpus", f"'\"device={','.join(str(i) for i in gpus)}\"'"]
+            mhub_run_gpus = ["--gpus", f"device={','.join(str(i) for i in gpus)}"]
 
         # get executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # run mhub
         run_cmd = [
@@ -2219,83 +2835,27 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # callback wrapper
         def _on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
-            print(f"Command chain stopped with return code {returncode}. Timedout [{timedout}] Killed [{killed}]")
+            logger.info(
+                "Command chain stopped with return code %s. Timedout [%s] Killed [%s]",
+                returncode,
+                timedout,
+                killed,
+            )
             onStop(returncode, stdout, timedout, killed)
 
         # run async
-        po = ProgressObserver(run_cmd, frequency=2, timeout=timeout, data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"})
+        po = ProgressObserver(
+            run_cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"},
+            env=env,
+        )
         po.onStop(_on_stop)
         po.onProgress(onProgress)
 
-    def _run_mhub_udocker(self, model: 'Model', gpu: bool, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
-
-        # get executable
-        udocker_exec = self.getUDockerExecutable()
-
-        # callback wrapper
-        def _on_progress(cmd: ProcessChain.CMD, time: float):
-            #print(f"Command {cmd.name} running {time} seconds")
-            onProgress(float(time), "")
-
-        def _on_stop(success: bool):
-            print(f"Command chain stopped with success: {success}")
-            onStop(int(success), "", False, False)
-
-        # initialize async processing chain
-        pc = ProcessChain()
-        pc.onStop(_on_stop)
-        pc.onProgress(_on_progress)
-
-        # setup gpu if required
-        if gpu:
-            print("udocker with gpu")
-
-            # check if image is already available or optionally pull image
-            images = self.getLocalImages("udocker", cached=True)
-            print(images)
-            if f"mhubai/{model.name}:latest" not in images:
-                pull_cmd = [udocker_exec, "pull", f"mhubai/{model.name}:latest"]
-                pc.add(pull_cmd, name="Pull image")
-
-            # create container
-            create_cmd = [udocker_exec, "create", f"--name={model.name}", f"mhubai/{model.name}:latest"]
-
-            # setup container
-            setup_cmd = [udocker_exec, "setup", "--nvidia", "--force", model.name]
-
-            # run container
-            run_cmd = [udocker_exec, "run", "--rm", "-t",
-                       "-v", f"{input_dir}:/app/data/input_data:ro",
-                       "-v", f"{output_dir}:/app/data/output_data:rw",
-                       model.name]
-
-            # processing chain
-            pc.add(create_cmd, name="Create container")
-            pc.add(setup_cmd, name="Setup container")
-            pc.add(run_cmd, name="Run container")
-
-            # print execution plan
-            for cmd in pc.cmds:
-                print(cmd.name, cmd.cmd)
-
-        else:
-
-            # run container
-            run_cmd = [udocker_exec, "run", "--rm", "-t",
-                       "-v", f"{input_dir}:/app/data/input_data:ro",
-                       "-v", f"{output_dir}:/app/data/output_data:rw",
-                       f"mhubai/{model.name}:latest"]
-
-            # processing chain
-            pc.add(run_cmd, name="Run container")
-
-
-        # run async
-        pc.start()
-
     def run_mhub(self,
                  model: 'Model',
-                 backend: Literal["docker", "udocker"],
                  gpus: list[int] | None,
                  input_dir: str,
                  output_dir: str,
@@ -2316,42 +2876,78 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             if onStop is not None and callable(onStop):
                 onStop(returncode, stdout, timedout, killed)
 
-        # run backend
-        if backend == "docker":
-            self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
-        elif backend == "udocker":
-            self._run_mhub_udocker(model, gpus is not None, input_dir, output_dir, _on_progress, _on_stop, timeout)
+        # run docker backend
+        self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
 
 
-    def remove_image(self, image_name, on_stop: Callable[[int, str, bool, bool], None] | None = None, timeout: int = 0):
+    def remove_image(
+        self,
+        image_name,
+        on_stop: Callable[[int, str, bool, bool], None] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        timeout: int = 0,
+    ):
 
         # get docker executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # remove image cli command
         cmd = [docker_exec, "rmi", image_name]
 
         # run command in bg
-        po = ProgressObserver(cmd, frequency=2, timeout=timeout, data={"image_name": image_name, "operation": "remove"})
+        po = ProgressObserver(
+            cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": image_name, "operation": "remove"},
+            env=env,
+        )
         if on_stop: po.onStop(on_stop)
 
-    def update_image(self, image_name, on_stop: Callable[[int, str, bool, bool], None] | None = None, timeout: int = 0):
+        def onProgress(t: float, stdout: str):
+            if on_progress:
+                on_progress(t, stdout)
+            for line in stdout.split("\n"):
+                if line:
+                    logger.info("Remove image: %s", line)
+
+        po.onProgress(onProgress)
+
+    def update_image(
+        self,
+        image_name,
+        on_stop: Callable[[int, str, bool, bool], None] | None = None,
+        on_progress: Callable[[float, str], None] | None = None,
+        timeout: int = 0,
+    ):
 
         # get docker executable
         docker_exec = self.getDockerExecutable()
+        env = self._build_subprocess_env(docker_exec)
 
         # remove image cli command
         cmd = [docker_exec, "pull", image_name]
 
+        # log command
+        logger.debug("Pull image command: %s", " ".join(cmd))
+
         # run command in bg
-        po = ProgressObserver(cmd, frequency=2, timeout=timeout, data={"image_name": image_name, "operation": "update"})
+        po = ProgressObserver(
+            cmd,
+            frequency=2,
+            timeout=timeout,
+            data={"image_name": image_name, "operation": "update"},
+            env=env,
+        )
         if on_stop: po.onStop(on_stop)
 
-        # log output (DEBUG ONLY)
         def onProgress(t: float, stdout: str):
-            print(f">> __pull image ({t})__")
+            if on_progress:
+                on_progress(t, stdout)
             for line in stdout.split("\n"):
-                print(f">> {line}")
+                if line:
+                    logger.info("Pull image: %s", line)
 
         po.onProgress(onProgress)
 
@@ -2372,6 +2968,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # DICOM indexer uses the current DICOM database folder as the basis for relative paths,
         # therefore we must convert the folder path to absolute to ensure this code works
         # even when a relative path is used as self.extractedFilesDirectory.
+
+        # TODO: check https://github.com/ImagingDataCommons/SlicerIDCBrowser/blob/67d3ea7117749254b83d5fcdad88828096c4748f/IDCBrowser/IDCBrowser.py#L1006-L1019
 
         # get indexer
         indexer = ctk.ctkDICOMIndexer()
@@ -2401,9 +2999,20 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # examine files
         loadables = importer.examineFiles(files)
 
+        logger.debug("Segmentation loadables: %s", loadables)
+
         # import files
+        loaded_any = False
         for loadable in loadables:
-            importer.load(loadable)
+            if importer.load(loadable):
+                loaded_any = True
+
+        if not loaded_any:
+            logger.warning("No segmentations loaded for files: %s", files)
+
+
+    def openSegmentation(self, files: list[str]):
+        self.importSegmentations(files)
 
 #
 # MHubRunnerTest
