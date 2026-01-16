@@ -665,8 +665,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _updateMainButtonIcons(self) -> None:
         icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
-        apply_opacity = self._ICON_DISABLED_OPACITY if not self.ui.applyButton.enabled else 1.0
-        apply_icon = "hi_noplay" if not self.ui.applyButton.enabled else "hi_play"
+        running = bool(ProgressObserver.getTasksWhere(operation="run"))
+        if running:
+            apply_icon = "hi_running"
+            apply_opacity = 1.0
+        else:
+            apply_opacity = self._ICON_DISABLED_OPACITY if not self.ui.applyButton.enabled else 1.0
+            apply_icon = "hi_noplay" if not self.ui.applyButton.enabled else "hi_play"
         self.ui.applyButton.setIcon(self._themeIcon(apply_icon, apply_opacity))
         self.ui.applyButton.setIconSize(icon_size)
 
@@ -1839,6 +1844,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 onProgress=onProgress,
                 onStop=onStop
             )
+            self._updateMainButtonIcons()
 
 
 #
