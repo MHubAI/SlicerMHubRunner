@@ -7,8 +7,28 @@ set(MODULE_PYTHON_SCRIPTS
   )
 
 set(MODULE_PYTHON_RESOURCES
-  Resources/Icons/${MODULE_NAME}.png
-  Resources/UI/${MODULE_NAME}.ui
+  Resources/Icons/MHubRunner.png
+  Resources/Icons/MRunner_b.png
+  Resources/Icons/MRunner_w.png
+  Resources/Icons/Name.png
+  Resources/Icons/hi_cancel_b.png
+  Resources/Icons/hi_cancel_w.png
+  Resources/Icons/hi_info_b.png
+  Resources/Icons/hi_info_w.png
+  Resources/Icons/hi_modelcard_b.png
+  Resources/Icons/hi_modelcard_w.png
+  Resources/Icons/hi_noplay_b.png
+  Resources/Icons/hi_noplay_w.png
+  Resources/Icons/hi_play_b.png
+  Resources/Icons/hi_play_w.png
+  Resources/Icons/hi_pull_b.png
+  Resources/Icons/hi_pull_w.png
+  Resources/Icons/hi_pulled_b.png
+  Resources/Icons/hi_pulled_w.png
+  Resources/Icons/hi_settings_b.png
+  Resources/Icons/hi_settings_w.png
+  Resources/UI/MHubRunner.ui
+  Resources/UI/MHubRunnerSettings.ui
   )
 
 #-----------------------------------------------------------------------------
