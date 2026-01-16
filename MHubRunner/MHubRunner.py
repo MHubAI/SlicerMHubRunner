@@ -1125,9 +1125,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             cu_item.setFlags(cu_item.flags() & ~qt.Qt.ItemIsEditable)
             cu_item.setTextAlignment(qt.Qt.AlignCenter)
             cu_item.setToolTip(
-                "Commercial use likely allowed; check licence"
+                "Commercial use likely allowed; check license"
                 if model.commercial_use
-                else "Commercial use likely not allowed; check licence"
+                else "Commercial use likely not allowed; check license"
             )
             self.ui.tblModelList.setItem(rowPosition, 3, cu_item)
 
