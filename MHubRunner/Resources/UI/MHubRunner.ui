@@ -19,25 +19,38 @@
      <widget class="QWidget" name="mainPanel">
       <layout class="QVBoxLayout" name="verticalLayout_main">
        <item>
-        <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
-         <property name="text">
-          <string>Step 1 - Search and Select MHub.ai Model</string>
-         </property>
-         <property name="collapsed">
-          <bool>false</bool>
-         </property>
+          <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
+           <property name="text">
+            <string>Step 1 - Search and Select MHub.ai Model</string>
+           </property>
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+             <horstretch>0</horstretch>
+             <verstretch>1</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="collapsed">
+            <bool>false</bool>
+           </property>
          <property name="collapsedHeight">
           <number>0</number>
          </property>
-         <layout class="QFormLayout" name="formLayout_4">
-          <item row="0" column="1">
-           <widget class="ctkSearchBox" name="searchModel"/>
-          </item>
-          <item row="3" column="1">
-           <widget class="QTableWidget" name="tblModelList"/>
-          </item>
-         </layout>
-        </widget>
+           <layout class="QFormLayout" name="formLayout_4">
+            <item row="0" column="1">
+             <widget class="ctkSearchBox" name="searchModel"/>
+            </item>
+            <item row="3" column="1">
+             <widget class="QTableWidget" name="tblModelList">
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+                <horstretch>0</horstretch>
+                <verstretch>1</verstretch>
+               </sizepolicy>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </widget>
        </item>
        <item>
         <widget class="ctkCollapsibleButton" name="inputsCollapsibleButton">
@@ -231,19 +244,6 @@
          <bool>true</bool>
         </property>
         </widget>
-       </item>
-       <item>
-        <spacer name="verticalSpacer">
-         <property name="orientation">
-          <enum>Qt::Vertical</enum>
-         </property>
-         <property name="sizeHint" stdset="0">
-          <size>
-           <width>20</width>
-           <height>40</height>
-          </size>
-         </property>
-        </spacer>
        </item>
        <item>
         <widget class="QWidget" name="settingsPanel">
