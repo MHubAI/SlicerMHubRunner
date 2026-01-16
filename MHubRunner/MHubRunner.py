@@ -638,10 +638,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _applyMainButtonIcons(self) -> None:
         icon_size = qt.QSize(14, 14)
-        self.ui.applyButton.setIcon(self._themeIcon("hi_play"))
-        self.ui.applyButton.setIconSize(icon_size)
-        self.ui.cancelButton.setIcon(self._themeIcon("hi_cancel"))
-        self.ui.cancelButton.setIconSize(icon_size)
+        self._mainButtonIconSize = icon_size
+        self._updateMainButtonIcons()
         self._setButtonTextWithIcon(self.ui.applyButton, self.ui.applyButton.text)
         self._setButtonTextWithIcon(self.ui.cancelButton, self.ui.cancelButton.text)
         if hasattr(self.ui, "cmdOpenSettings"):
@@ -652,6 +650,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmdOpenSettingsFromSetup.setIcon(self._themeIcon("hi_settings"))
             self.ui.cmdOpenSettingsFromSetup.setIconSize(icon_size)
             self._setButtonTextWithIcon(self.ui.cmdOpenSettingsFromSetup, self.ui.cmdOpenSettingsFromSetup.text)
+
+    def _updateMainButtonIcons(self) -> None:
+        icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
+        apply_opacity = self._ICON_DISABLED_OPACITY if not self.ui.applyButton.enabled else 1.0
+        apply_icon = "hi_noplay" if not self.ui.applyButton.enabled else "hi_play"
+        self.ui.applyButton.setIcon(self._themeIcon(apply_icon, apply_opacity))
+        self.ui.applyButton.setIconSize(icon_size)
+
+        cancel_opacity = self._ICON_DISABLED_OPACITY if not self.ui.cancelButton.enabled else 1.0
+        self.ui.cancelButton.setIcon(self._themeIcon("hi_cancel", cancel_opacity))
+        self.ui.cancelButton.setIconSize(icon_size)
 
     def _themeIcon(self, base_name: str, opacity: float = 1.0) -> qt.QIcon:
         icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
@@ -804,6 +813,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         tasks = ProgressObserver.getTasksWhere(operation="run")
         if len(tasks) > 0:
             self.ui.cancelButton.enabled = True
+            self._updateMainButtonIcons()
             return
         self.ui.cancelButton.enabled = False
 
@@ -834,6 +844,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             else:
                 self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
+        self._updateMainButtonIcons()
 
 
     def onKillObservedProcessesButton(self) -> None:
@@ -1620,6 +1631,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
+        self._updateMainButtonIcons()
 
         ###### TEST (for caching on host)
         # get InstanceUIDs (only available for nodes loaded through the dicom module)
