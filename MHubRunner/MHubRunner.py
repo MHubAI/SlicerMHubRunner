@@ -1,5 +1,8 @@
 import logging
 import os
+import sys
+import threading
+import time
 from typing import Annotated, Any, Optional, List, Literal, Dict, Union
 
 from collections.abc import Callable
@@ -25,6 +28,68 @@ import hashlib
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+class Debouncer(qt.QObject):
+    def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._timer = qt.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(callback)
+
+    def start(self, interval_ms: int | None = None) -> None:
+        if interval_ms is not None:
+            self._timer.setInterval(interval_ms)
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def isActive(self) -> bool:
+        return self._timer.isActive()
+
+
+class AsyncFetchPoller(qt.QObject):
+    def __init__(self, interval_ms: int, on_done: Callable[[], None], parent: qt.QObject | None = None) -> None:
+        super().__init__(parent)
+        self._timer = qt.QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._poll)
+        self._on_done = on_done
+        self._thread: threading.Thread | None = None
+        self._start_time: float | None = None
+
+    def start(self, worker: Callable[[], None]) -> bool:
+        if self.is_running():
+            return False
+        self._start_time = time.monotonic()
+        self._thread = threading.Thread(target=worker, daemon=True)
+        self._thread.start()
+        if not self._timer.isActive():
+            self._timer.start()
+        return True
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def elapsed(self) -> float | None:
+        if self._start_time is None:
+            return None
+        return time.monotonic() - self._start_time
+
+    def stop(self) -> None:
+        self._thread = None
+        self._start_time = None
+        self._timer.stop()
+
+    def _poll(self) -> None:
+        if self.is_running():
+            return
+        if self._thread is None:
+            return
+        self._timer.stop()
+        self._thread = None
+        self._on_done()
 
 #
 # MHubRunner
@@ -180,6 +245,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic = None
         self._parameterNode = None
         self._parameterNodeGuiTag = None
+        self._modelSearchDebouncer = None
+        self._pendingModelSearchText = ""
+        self._modelFetchPoller = None
+        self._modelStatusPoller = None
 
     def setup(self) -> None:
         """
@@ -240,6 +309,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmbLogLevel.setCurrentText(saved_level)
         self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
         self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
+
+        # model search
+        self._modelSearchDebouncer = Debouncer(200, self._applyModelSearch, parent=uiWidget)
+        self._modelFetchPoller = AsyncFetchPoller(10, self._onModelFetchDone, parent=uiWidget)
+        self._modelStatusPoller = AsyncFetchPoller(200, self._onModelStatusDone, parent=uiWidget)
 
         # search box "searchModel" and model list "lstModelList"
         self.ui.searchModel.textChanged.connect(self.onSearchModel)
@@ -499,7 +573,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         for handler in list(logger.handlers):
             if getattr(handler, "_mhubrunner_handler", False):
                 logger.removeHandler(handler)
-        logger.propagate = True
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("[MHubRunner] %(levelname)s: %(message)s"))
+        handler.setLevel(logging.DEBUG)
+        handler._mhubrunner_handler = True
+        logger.addHandler(handler)
+        logger.propagate = False
 
     def onLogLevelChanged(self, level_text) -> None:
         self._ensureLoggerConfigured()
@@ -598,20 +677,107 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def onSearchModel(self, text: str) -> None:
         assert self.logic is not None
         logger.debug("Search model: %s", text)
+        self._pendingModelSearchText = text
+        if self._modelSearchDebouncer is not None:
+            self._modelSearchDebouncer.start()
 
-        # get models
-        models = self.logic.getModels()
+    def _applyModelSearch(self) -> None:
+        assert self.logic is not None
+        text = self._pendingModelSearchText or ""
+        if hasattr(self.logic, "_model_cache"):
+            backend = self.ui.backendSelector.currentText
+            if callable(backend):
+                backend = backend()
+            models = self.logic.getModels(cached=True, backend=backend, hydrate_status=False)
+            self._renderFilteredModels(models, text)
+            return
+        self._fetchModelsAsync()
 
-        # filter models
-        models = [model for model in models if model.str_match(text)]
+    def _renderFilteredModels(self, models: list['Model'], text: str) -> None:
+        filtered = [model for model in models if model.str_match(text)]
+        self.renderModelTable(filtered)
 
-        # render models
-        self.renderModelTable(models)
+    def _fetchModelsAsync(self) -> None:
+        if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
+            return
+        backend = self.ui.backendSelector.currentText
+        if callable(backend):
+            backend = backend()
+        if not hasattr(self.logic, "_model_cache"):
+            self._setModelTableStatus("Loading models...")
+
+        logger.debug("Starting async model fetch for backend: %s", backend)
+        fetch_poller = self._modelFetchPoller
+        def worker():
+            logger.debug("Fetching models from backend: %s", backend)
+            assert self.logic is not None
+            self.logic.getModels(cached=False, backend=backend, hydrate_status=False)
+            if fetch_poller is not None:
+                elapsed = fetch_poller.elapsed()
+                if elapsed is not None:
+                    logger.debug("Finished fetching models from backend: %s elapsed=%.2fs", backend, elapsed)
+                else:
+                    logger.debug("Finished fetching models from backend: %s", backend)
+            else:
+                logger.debug("Finished fetching models from backend: %s", backend)
+        self._modelFetchPoller.start(worker)
+
+    def _onModelFetchDone(self) -> None:
+        if self._modelFetchPoller is not None:
+            elapsed = self._modelFetchPoller.elapsed()
+            if elapsed is not None:
+                logger.debug("Model fetch thread done; UI update elapsed=%.2fs", elapsed)
+        current_backend = self.ui.backendSelector.currentText
+        if callable(current_backend):
+            current_backend = current_backend()
+        models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        if not models:
+            self._setModelTableStatus("No models available.")
+            return
+        self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._startModelStatusHydration()
+
+    def _setModelTableStatus(self, message: str) -> None:
+        self.ui.tblModelList.clear()
+        self.ui.tblModelList.setRowCount(1)
+        self.ui.tblModelList.setColumnCount(1)
+        self.ui.tblModelList.setHorizontalHeaderLabels([message])
+        item = qt.QTableWidgetItem(message)
+        item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)
+        self.ui.tblModelList.setItem(0, 0, item)
+
+    def _startModelStatusHydration(self) -> None:
+        if self._modelStatusPoller is None or self._modelStatusPoller.is_running():
+            return
+        if not hasattr(self.logic, "_model_cache"):
+            return
+        backend = self.ui.backendSelector.currentText
+        if callable(backend):
+            backend = backend()
+
+        for model in self.logic._model_cache:
+            model.status = ModelStatus.UNKNOWN
+        self._renderFilteredModels(self.logic._model_cache, self._pendingModelSearchText or "")
+
+        def worker():
+            assert self.logic is not None
+            self.logic.hydrateModelStatus(backend)
+
+        self._modelStatusPoller.start(worker)
+
+    def _onModelStatusDone(self) -> None:
+        current_backend = self.ui.backendSelector.currentText
+        if callable(current_backend):
+            current_backend = current_backend()
+        models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        if models:
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
 
     def renderModelTable(self, models: list['Model']) -> None:
 
         # set table height to 10 rows
         self.ui.tblModelList.setRowCount(10)
+        self.ui.tblModelList.clear()
 
         # remove all rows from model table
         self.ui.tblModelList.setRowCount(0)
@@ -668,7 +834,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             btnPull.clicked.connect(create_pull_handler(btnPull, model))
             layout.addWidget(btnPull)
 
-            if model.status == ModelStatus.PULLING:
+            if model.status == ModelStatus.UNKNOWN:
+                btnPull.enabled = False
+                btnPull.text = "Checking..."
+                btnPull.toolTip = "Checking image status"
+
+            elif model.status == ModelStatus.PULLING:
                 btnPull.enabled = False
                 btnPull.text = "Pulling..."
                 btnPull.toolTip = "Image is being pulled"
@@ -677,6 +848,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 btnPull.enabled = False
                 btnPull.text = "Pulled"
                 btnPull.toolTip = "Image is available locally"
+
+            elif model.status == ModelStatus.RUNNING:
+                btnPull.enabled = False
+                btnPull.text = "Running"
+                btnPull.toolTip = "Image is currently running"
 
             else:
                 btnPull.enabled = True
@@ -841,6 +1017,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update install backend button and images list
         self.updateInstallUDockerBackendButtonState()
         self.updateBackendImagesList()
+        search_text = self.ui.searchModel.text
+        if callable(search_text):
+            search_text = search_text()
+        self._pendingModelSearchText = search_text or ""
+        if hasattr(self.logic, "_model_cache"):
+            self._startModelStatusHydration()
+        else:
+            self.onSearchModel(search_text)
 
     def updateInstallUDockerBackendButtonState(self) -> None:
         assert self.logic
@@ -1088,7 +1272,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # open latest run directory
         if open_latest and run_dirs:
-            self.ui.cmbSelectRunOutput.setCurrentText(run_dirs[-1])
+            self.ui.cmbSelectRunOutput.setCurrentText(run_dirs[0])
 
     def prepareOutput(self) -> None:
         assert self.logic is not None
@@ -1943,8 +2127,12 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # return
         return model
 
-    def getModels(self, cached: bool = True, backend: str = 'docker') -> list[Model]:
-        import requests, json
+    def getModels(self, cached: bool = True, backend: str = 'docker', hydrate_status: bool = True) -> list[Model]:
+        try:
+            import requests
+        except ModuleNotFoundError as e:
+            logger.error("requests not available: %s", e)
+            return getattr(self, "_model_cache", [])
 
         # -- 1 ----------- LOAD MODELS
 
@@ -1954,46 +2142,62 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             models = self._model_cache
 
         else:
+            models = []
 
             # download model information from api endpoint (json)
             # -> migrate from https://mhub.ai/api/v2/models to https://mhub.ai/api/v2/models/detailed
             MHUBAI_API_ENDPOINT_MODELS = "https://mhub.ai/api/v2/models/detailed"
 
-            # fetch
-            response = requests.get(MHUBAI_API_ENDPOINT_MODELS)
+            try:
+                response = requests.get(MHUBAI_API_ENDPOINT_MODELS, timeout=10)
+                response.raise_for_status()
+                payload = response.json()
 
-            # parse
-            payload = json.loads(response.text)
+                # get model list
+                for model_data in payload['data']:
 
-            # get model list
-            models: list[Model] = []
-            for model_data in payload['data']:
+                    # check if model inputs are compatible with slicer extension
+                    inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
 
-                # check if model inputs are compatible with slicer extension
-                inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    # create model
+                    models.append(Model(
+                        id=model_data['id'],
+                        name=model_data['name'],
+                        label=model_data['label'],
+                        description=model_data['description'],
+                        modalities=model_data['modalities'],
+                        roi=model_data['segmentations'],
+                        categories=model_data['categories'],
+                        cite=model_data['cite'],
+                        inputs=[i['description'] for i in model_data['inputs']],
+                        inputs_compatibility=inputs_compatibility
+                    ))
 
-                # create model
-                models.append(Model(
-                    id=model_data['id'],
-                    name=model_data['name'],
-                    label=model_data['label'],
-                    description=model_data['description'],
-                    modalities=model_data['modalities'],
-                    roi=model_data['segmentations'],
-                    categories=model_data['categories'],
-                    cite=model_data['cite'],
-                    inputs=[i['description'] for i in model_data['inputs']],
-                    inputs_compatibility=inputs_compatibility
-                ))
-
-            # cache
-            self._model_cache = models
+                # cache
+                self._model_cache = models
+            except Exception as e:
+                logger.warning("Failed to fetch models: %s", e)
+                models = getattr(self, "_model_cache", [])
 
         # -- 2 ----------- HYDRATE MODEL STATE
+        if hydrate_status:
+            self.hydrateModelStatus(backend, models=models, cached_images=cached)
+
+        # -- 3 ----------- RETURN MODELS
+        return models
+
+    def hydrateModelStatus(
+        self,
+        backend: str,
+        models: list[Model] | None = None,
+        cached_images: bool = False,
+    ) -> list[Model]:
+        if models is None:
+            models = getattr(self, "_model_cache", [])
 
         # get local images
         # NOTE: this is backend specific, thus needs to be re-loaded when backend changes
-        images = self.getLocalImages(backend=backend, cached=cached)
+        images = self.getLocalImages(backend=backend, cached=cached_images)
         images = [i.split()[0] for i in images]
 
         # iterate models and update state
@@ -2012,7 +2216,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             else:
                 model.status = ModelStatus.PULLABLE
 
-        # -- 3 ----------- RETURN MODELS
         return models
 
     def getDockerExecutable(self, refresh: bool = False) -> str | None:
