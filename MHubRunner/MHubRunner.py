@@ -353,6 +353,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmdDetectDockerExecutableSetup.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
 
         self.updateSettingsSummary()
+        self.updateLicenseSummary()
 
         # setup SubjectHierarchyTreeView
         # -> https://apidocs.slicer.org/v4.8/classqMRMLSubjectHierarchyTreeView.html#a3214047490b8efd11dc9abf59c646495
@@ -741,6 +742,31 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
         self.ui.lblSetupSummary.text = summary_line
 
+    def _formatLicenseSummary(self, model: Optional['Model']) -> str:
+        if model is None:
+            return "License: N/A"
+        model_license = model.license_model or ""
+        weights_license = model.license_weights or ""
+        if model_license and weights_license:
+            if model_license == weights_license:
+                license_text = model_license
+            else:
+                license_text = f"Model {model_license} | Weights {weights_license}"
+        elif model_license:
+            license_text = model_license
+        elif weights_license:
+            license_text = weights_license
+        else:
+            return "License: N/A"
+        return f"License: {license_text}"
+
+    def updateLicenseSummary(self, model: Optional['Model'] = None) -> None:
+        if not hasattr(self.ui, "lblLicenseSummary"):
+            return
+        if model is None:
+            model = self.getModelFromTableSelection()
+        self.ui.lblLicenseSummary.text = self._formatLicenseSummary(model)
+
     def _applySummaryOpacity(self, opacity: float = 0.6) -> None:
         if not hasattr(self.ui, "lblSetupSummary"):
             return
@@ -844,6 +870,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             else:
                 self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
+        self.updateLicenseSummary(model)
         self._updateMainButtonIcons()
 
 
@@ -988,9 +1015,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # remove all rows from model table
         self.ui.tblModelList.setRowCount(0)
 
-        # add models to table with 3 columns
-        self.ui.tblModelList.setColumnCount(4)
-        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "Actions"])
+        # add models to table with columns
+        self.ui.tblModelList.setColumnCount(5)
+        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "CU", "Actions"])
 
         # make table rows slim
         self.ui.tblModelList.verticalHeader().setDefaultSectionSize(24)
@@ -1008,6 +1035,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         header.setSectionResizeMode(1, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
 
         # fill table with models that match the search text
         for model in models:
@@ -1024,6 +1052,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # add model image (placeholder)
             self.ui.tblModelList.setItem(rowPosition, 2, qt.QTableWidgetItem(",".join(model.modalities)))
+
+            # add commercial use column
+            cu_item = qt.QTableWidgetItem("Yes" if model.commercial_use else "No")
+            cu_item.setFlags(cu_item.flags() & ~qt.Qt.ItemIsEditable)
+            cu_item.setTextAlignment(qt.Qt.AlignCenter)
+            cu_item.setToolTip(
+                "Commercial use likely allowed; check licence"
+                if model.commercial_use
+                else "Commercial use likely not allowed; check licence"
+            )
+            self.ui.tblModelList.setItem(rowPosition, 3, cu_item)
 
             # create horizontal layout, add pull, run, and details buttons, and set layout to cell
             layout = qt.QHBoxLayout()
@@ -1104,16 +1143,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             widget = qt.QWidget()
             widget.setLayout(layout)
-            self.ui.tblModelList.setCellWidget(rowPosition, 3, widget)
+            self.ui.tblModelList.setCellWidget(rowPosition, 4, widget)
 
             # if model has more than 1 input, disable row
             if not model.inputs_compatibility:
-                for ci in range(4):
+                for ci in range(5):
                     item = self.ui.tblModelList.item(rowPosition, ci)
                     if item:
                         item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)  # Make it non-editable
                         item.setBackground(qt.Qt.gray)  # Change background color to indicate it's disabled
                         item.setForeground(qt.Qt.white)  # Change text color to white
+
+        self.updateLicenseSummary()
 
 
     def onModelDetails(self, model: 'Model') -> None:
@@ -1131,6 +1172,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         details += [hlst("Modalities", model.modalities)]
         details += [hlst("Categories", model.categories)]
         details += [hlst("Inputs", model.inputs)]
+        license_lines = []
+        if model.license_model:
+            license_lines.append(f"Model: {model.license_model}")
+        if model.license_weights:
+            license_lines.append(f"Weights: {model.license_weights}")
+        if license_lines:
+            details += [hlst("License", license_lines)]
+        else:
+            details += ["License: N/A"]
+        details += [f"Commercial use allowed: {'Yes' if model.commercial_use else 'No'}"]
         details += ["\n REQUIRED CITATION: \n"]
         details += [f"The model was provided through the MHub.ai platform and is available under https://mhub.ai/models/{model.name}."]
         details += [model.cite]
@@ -1821,6 +1872,9 @@ class Model:
     categories: list[str]
     roi: list[str]
     cite: str
+    license_model: str
+    license_weights: str
+    commercial_use: bool
 
     inputs: list[str]
     inputs_compatibility: bool
@@ -2232,6 +2286,24 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             env["PATH"] = os.pathsep.join(path_entries)
         return env
 
+    def _license_allows_commercial_use(self, license_text: str | None) -> bool:
+        if not license_text:
+            return False
+        text = license_text.lower()
+        if "mit" in text:
+            return True
+        if "apache" in text:
+            return True
+        if "cc" in text or "creative commons" in text:
+            return "nc" not in text
+        return False
+
+    def _commercial_use_allowed(self, model_license: str | None, weights_license: str | None) -> bool:
+        return (
+            self._license_allows_commercial_use(model_license)
+            and self._license_allows_commercial_use(weights_license)
+        )
+
     def getModel(self, model_name: str) -> Model:
 
         # get models
@@ -2278,6 +2350,10 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
                     # check if model inputs are compatible with slicer extension
                     inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    license_info = model_data.get('licence') or {}
+                    license_model = license_info.get('model') or ""
+                    license_weights = license_info.get('weights') or ""
+                    commercial_use = self._commercial_use_allowed(license_model, license_weights)
 
                     # create model
                     models.append(Model(
@@ -2289,6 +2365,9 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                         roi=model_data['segmentations'],
                         categories=model_data['categories'],
                         cite=model_data['cite'],
+                        license_model=license_model,
+                        license_weights=license_weights,
+                        commercial_use=commercial_use,
                         inputs=[i['description'] for i in model_data['inputs']],
                         inputs_compatibility=inputs_compatibility
                     ))

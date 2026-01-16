@@ -210,9 +210,19 @@
            </property>
           </widget>
          </item>
-        </layout>
-       </item>
-       <item>
+       </layout>
+      </item>
+      <item>
+       <widget class="QLabel" name="lblLicenseSummary">
+        <property name="text">
+         <string/>
+        </property>
+        <property name="wordWrap">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item>
        <widget class="QLabel" name="lblSetupSummary">
         <property name="text">
          <string/>
