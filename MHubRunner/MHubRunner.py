@@ -249,6 +249,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._pendingModelSearchText = ""
         self._modelFetchPoller = None
         self._modelStatusPoller = None
+        self._settingsDialog = None
+        self._dockerSetupDismissed = False
+        self._syncingDockerPath = False
 
     def setup(self) -> None:
         """
@@ -263,6 +266,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui = slicer.util.childWidgetVariables(uiWidget)
 
         self._ensureLoggerConfigured()
+        self._updateDockerSetupLogo()
+        self._applySummaryOpacity()
+        self._closeStaleSettingsDialogs()
+
+        if hasattr(self.ui, "settingsPanel"):
+            self.ui.settingsPanel.hide()
 
         # Set scene in MRML widgets. Make sure that in Qt designer the top-level qMRMLWidget's
         # "mrmlSceneChanged(vtkMRMLScene*)" signal in is connected to each MRML widget's.
@@ -289,9 +298,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # self.ui.cmdTest.connect('clicked(bool)', self.importSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
+        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
+        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.updateSettingsSummary)
         self.ui.lstBackendImages.connect('itemSelectionChanged()', self.onBackendImageSelect)
         self.ui.cmdImageUpdate.connect('clicked(bool)', self.onBackendImageUpdate)
         self.ui.cmdImageRemove.connect('clicked(bool)', self.onBackendImageRemove)
+        if hasattr(self.ui, "cmdOpenSettings"):
+            self.ui.cmdOpenSettings.connect('clicked(bool)', self.openSettingsDialog)
+        if hasattr(self.ui, "cmdOpenSettingsFromSetup"):
+            self.ui.cmdOpenSettingsFromSetup.connect('clicked(bool)', self.openSettingsDialog)
+        if hasattr(self.ui, "cmdDismissDockerSetup"):
+            self.ui.cmdDismissDockerSetup.connect('clicked(bool)', self.dismissDockerSetupScreen)
+        if hasattr(self.ui, "cmdShowDockerSetup"):
+            self.ui.cmdShowDockerSetup.connect('clicked(bool)', self.showDockerSetupScreenFromSettings)
 
         # output section
         self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
@@ -329,21 +348,29 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         settings = qt.QSettings()
         docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
         udocker_exec = settings.value("MHubRunner/UDockerExecutable", self.logic.getUDockerExecutable())
-        self.ui.pthDockerExecutable.currentPath = docker_exec
+        self._syncDockerExecutablePath(docker_exec)
         self.ui.pthUDockerExecutable.currentPath = udocker_exec
         if docker_exec:
             self.logic._executables["docker"] = docker_exec
         if udocker_exec:
             self.logic._executables["udocker"] = udocker_exec
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
+        if hasattr(self.ui, "pthDockerExecutableSetup"):
+            self.ui.pthDockerExecutableSetup.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         self.ui.pthUDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateUDockerExecutable)
         self.ui.cmdDetectDockerExecutable.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
+        if hasattr(self.ui, "cmdDetectDockerExecutableSetup"):
+            self.ui.cmdDetectDockerExecutableSetup.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
         self.ui.cmdDetectUDockerExecutable.connect('clicked(bool)', self.onAutoDetectUDockerExecutable)
+
+        self.updateSettingsSummary()
 
         # setup SubjectHierarchyTreeView
         # -> https://apidocs.slicer.org/v4.8/classqMRMLSubjectHierarchyTreeView.html#a3214047490b8efd11dc9abf59c646495
         self.ui.SubjectHierarchyTreeView.setMRMLScene(slicer.mrmlScene)
         self.ui.SubjectHierarchyTreeView.connect('currentItemChanged(vtkIdType)', self.onSubjectHierarchyTreeViewCurrentItemChanged)
+
+        self._updateDockerSetupScreen()
 
         # table selector
         self.ui.outputTableSelector.setMRMLScene(slicer.mrmlScene)
@@ -512,13 +539,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # user enters a new path for the docker executable manually
 
         # get docker executable
-        docker_executable = self.ui.pthDockerExecutable.currentPath
+        docker_executable = path
+        if not docker_executable:
+            docker_executable = self._getDockerExecutablePath()
 
         # set docker executable
         logger.debug("Docker executable updated: %s (from %s)", docker_executable, path)
         self.logic._executables["docker"] = docker_executable
         settings = qt.QSettings()
         settings.setValue("MHubRunner/DockerExecutable", docker_executable)
+        self._syncDockerExecutablePath(docker_executable)
+        self._updateDockerSetupScreen()
+        self.updateSettingsSummary()
 
     def onAutoDetectDockerExecutable(self) -> None:
         assert self.logic is not None
@@ -528,10 +560,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         docker_executable = self.logic.getDockerExecutable(refresh=True)
 
         # set docker executable
-        self.ui.pthDockerExecutable.currentPath = docker_executable
         if docker_executable:
             settings = qt.QSettings()
             settings.setValue("MHubRunner/DockerExecutable", docker_executable)
+        self._syncDockerExecutablePath(docker_executable)
+        self._updateDockerSetupScreen()
+        self.updateSettingsSummary()
 
     def onUpdateUDockerExecutable(self, path) -> None:
         assert self.logic is not None
@@ -545,6 +579,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.logic._executables["udocker"] = udocker_executable
         settings = qt.QSettings()
         settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
+        self.updateSettingsSummary()
 
     def onAutoDetectUDockerExecutable(self) -> None:
         assert self.logic is not None
@@ -558,6 +593,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if udocker_executable:
             settings = qt.QSettings()
             settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
+        self.updateSettingsSummary()
 
     def _appendLogOutput(self, stdout: str | None) -> None:
         if stdout is None:
@@ -568,6 +604,163 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         stdout = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', stdout)
         if stdout.strip() != "":
             self.ui.txtLogs.appendPlainText(stdout)
+
+    def _getDockerExecutablePath(self) -> str:
+        path = self.ui.pthDockerExecutable.currentPath if hasattr(self.ui, "pthDockerExecutable") else ""
+        if not path and hasattr(self.ui, "pthDockerExecutableSetup"):
+            path = self.ui.pthDockerExecutableSetup.currentPath
+        return path or ""
+
+    def _syncDockerExecutablePath(self, path: str | None) -> None:
+        if path is None:
+            return
+        if self._syncingDockerPath:
+            return
+        self._syncingDockerPath = True
+        try:
+            for attr in ("pthDockerExecutable", "pthDockerExecutableSetup"):
+                widget = getattr(self.ui, attr, None)
+                if widget is None:
+                    continue
+                current = widget.currentPath
+                if current != path:
+                    widget.currentPath = path
+        finally:
+            self._syncingDockerPath = False
+
+    def _dockerExecutableAvailable(self) -> bool:
+        path = self._getDockerExecutablePath()
+        if path and os.path.exists(path):
+            return True
+        try:
+            import shutil
+            return shutil.which("docker") is not None
+        except Exception:
+            return False
+
+    def showDockerSetupScreen(self, force: bool = False) -> None:
+        if self._dockerSetupDismissed and not force:
+            return
+        self._updateDockerSetupLogo()
+        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "dockerSetupPanel"):
+            self.ui.stackedMain.setCurrentWidget(self.ui.dockerSetupPanel)
+
+    def hideDockerSetupScreen(self) -> None:
+        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "mainPanel"):
+            self.ui.stackedMain.setCurrentWidget(self.ui.mainPanel)
+
+    def dismissDockerSetupScreen(self, checked: bool = False) -> None:
+        self._dockerSetupDismissed = True
+        self.hideDockerSetupScreen()
+
+    def _updateDockerSetupScreen(self) -> None:
+        self._updateDockerSetupLogo()
+        if self._dockerExecutableAvailable():
+            self._dockerSetupDismissed = False
+            self.hideDockerSetupScreen()
+        else:
+            self.showDockerSetupScreen()
+
+    def _isDarkTheme(self) -> bool:
+        palette = qt.QApplication.palette()
+        window_color = palette.color(qt.QPalette.Window)
+        return window_color.lightness() < 128
+
+    def _updateDockerSetupLogo(self) -> None:
+        if not hasattr(self.ui, "lblDockerSetupLogo"):
+            return
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        logo_name = "MRunner_w.png" if self._isDarkTheme() else "MRunner_b.png"
+        logo_path = os.path.join(icons_path, logo_name)
+        if not os.path.exists(logo_path):
+            return
+        pixmap = qt.QPixmap(logo_path)
+        self.ui.lblDockerSetupLogo.setPixmap(pixmap)
+
+    def showDockerSetupScreenFromSettings(self, checked: bool = False) -> None:
+        self.showDockerSetupScreen(force=True)
+
+    def updateSettingsSummary(self) -> None:
+        gpu_count = self.ui.lstHostGpu.count
+        gpu_enabled = self.ui.chkGpuEnabled.checked
+        selected_gpus = []
+        for i in range(gpu_count):
+            item = self.ui.lstHostGpu.item(i)
+            if item.checkState() == qt.Qt.Checked:
+                selected_gpus.append(item.text())
+        if not selected_gpus:
+            selected_gpus = [item.text() for item in self.ui.lstHostGpu.selectedItems()]
+
+        if gpu_enabled and selected_gpus:
+            gpu_summary = "Selected GPU " + ", ".join(selected_gpus)
+        else:
+            gpu_summary = "No GPU"
+
+        log_level = self.ui.cmbLogLevel.currentText
+        log_level = log_level or "N/A"
+
+        docker_exec = self._getDockerExecutablePath()
+        docker_exec = docker_exec or ""
+        docker_status = "Docker unavailable"
+        if docker_exec and os.path.exists(docker_exec):
+            docker_status = f"Docker available at {docker_exec}"
+        else:
+            try:
+                import shutil
+                docker_path = shutil.which("docker")
+            except Exception:
+                docker_path = None
+            if docker_path:
+                docker_status = f"Docker available at {docker_path}"
+            elif docker_exec:
+                docker_status = f"Docker not found at {docker_exec}"
+
+        summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
+        self.ui.lblSetupSummary.text = summary_line
+
+    def _applySummaryOpacity(self, opacity: float = 0.6) -> None:
+        if not hasattr(self.ui, "lblSetupSummary"):
+            return
+        palette = self.ui.lblSetupSummary.palette
+        color = palette.color(qt.QPalette.WindowText)
+        color.setAlpha(int(255 * opacity))
+        palette.setColor(qt.QPalette.WindowText, color)
+        self.ui.lblSetupSummary.setPalette(palette)
+
+    def openSettingsDialog(self) -> None:
+        for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
+            widget = getattr(self.ui, attr, None)
+            if widget is not None:
+                widget.collapsed = False
+        if self._settingsDialog is None:
+            self._closeStaleSettingsDialogs()
+            dialog = qt.QDialog(slicer.util.mainWindow())
+            dialog.setWindowTitle("MHubRunner Settings")
+            dialog.setModal(False)
+            dialog.setAttribute(qt.Qt.WA_DeleteOnClose, False)
+            dialog.setObjectName("MHubRunnerSettingsDialog")
+            layout = qt.QVBoxLayout(dialog)
+            settings_widget = getattr(self.ui, "settingsPanel", None)
+            if settings_widget is not None:
+                settings_widget.setParent(dialog)
+                settings_widget.show()
+                layout.addWidget(settings_widget)
+            dialog.setLayout(layout)
+            self._settingsDialog = dialog
+        self._settingsDialog.show()
+        self._settingsDialog.raise_()
+        self._settingsDialog.activateWindow()
+
+    def _closeStaleSettingsDialogs(self) -> None:
+        main_window = slicer.util.mainWindow()
+        if main_window is None:
+            return
+        stale_dialogs = main_window.findChildren(qt.QDialog, "MHubRunnerSettingsDialog")
+        for dialog in stale_dialogs:
+            if dialog is self._settingsDialog:
+                continue
+            dialog.close()
+            dialog.deleteLater()
 
     def _ensureLoggerConfigured(self) -> None:
         for handler in list(logger.handlers):
@@ -589,6 +782,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         logger.setLevel(level)
         settings = qt.QSettings()
         settings.setValue("MHubRunner/LogLevel", level_name)
+        self.updateSettingsSummary()
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
@@ -661,6 +855,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.lstHostGpu.addItem(gpu)
         self.ui.chkGpuEnabled.checked = len(gpus) > 0
         self.ui.chkGpuEnabled.enabled = len(gpus) > 0
+        self.updateSettingsSummary()
 
     def onGpuEnabled(self) -> None:
 
@@ -670,6 +865,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # enable/disable apply button
         self._checkCanApply()
+        self.updateSettingsSummary()
 
     def loadModelRepo(self) -> None:
         pass
@@ -686,8 +882,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         text = self._pendingModelSearchText or ""
         if hasattr(self.logic, "_model_cache"):
             backend = self.ui.backendSelector.currentText
-            if callable(backend):
-                backend = backend()
             models = self.logic.getModels(cached=True, backend=backend, hydrate_status=False)
             self._renderFilteredModels(models, text)
             return
@@ -701,8 +895,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
             return
         backend = self.ui.backendSelector.currentText
-        if callable(backend):
-            backend = backend()
         if not hasattr(self.logic, "_model_cache"):
             self._setModelTableStatus("Loading models...")
 
@@ -728,8 +920,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if elapsed is not None:
                 logger.debug("Model fetch thread done; UI update elapsed=%.2fs", elapsed)
         current_backend = self.ui.backendSelector.currentText
-        if callable(current_backend):
-            current_backend = current_backend()
         models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if not models:
             self._setModelTableStatus("No models available.")
@@ -752,8 +942,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not hasattr(self.logic, "_model_cache"):
             return
         backend = self.ui.backendSelector.currentText
-        if callable(backend):
-            backend = backend()
 
         for model in self.logic._model_cache:
             model.status = ModelStatus.UNKNOWN
@@ -767,8 +955,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _onModelStatusDone(self) -> None:
         current_backend = self.ui.backendSelector.currentText
-        if callable(current_backend):
-            current_backend = current_backend()
         models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if models:
             self._renderFilteredModels(models, self._pendingModelSearchText or "")
@@ -1018,13 +1204,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateInstallUDockerBackendButtonState()
         self.updateBackendImagesList()
         search_text = self.ui.searchModel.text
-        if callable(search_text):
-            search_text = search_text()
         self._pendingModelSearchText = search_text or ""
         if hasattr(self.logic, "_model_cache"):
             self._startModelStatusHydration()
         else:
             self.onSearchModel(search_text)
+        self.updateSettingsSummary()
 
     def updateInstallUDockerBackendButtonState(self) -> None:
         assert self.logic
@@ -1482,7 +1667,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             gpus: list[int] | None = None
             if self.ui.chkGpuEnabled.checked:
                 gpus = []
-                for i in range(self.ui.lstHostGpu.count()):
+                for i in range(self.ui.lstHostGpu.count):
                     item = self.ui.lstHostGpu.item(i)
                     if item.checkState() == qt.Qt.Checked:
                         logger.debug("Selected GPU: %s", item.text())
