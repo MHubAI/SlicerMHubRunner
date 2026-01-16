@@ -292,9 +292,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.connect('clicked(bool)', self.onApplyButton)
         self.ui.cancelButton.connect('clicked(bool)', self.onCancelButton)
         self.ui.cmdKillObservedProcesses.connect('clicked(bool)', self.onKillObservedProcessesButton)
-        self.ui.cmdBackendReload.connect('clicked(bool)', self.onBackendUpdate)
-        self.ui.cmdInstallUdocker.connect('clicked(bool)', self.logic.installUdockerBackend)
-        self.ui.cmdInstallUdocker.enabled = False
+        self.ui.cmdBackendReload.connect('clicked(bool)', self.onDockerUpdate)
         # self.ui.cmdTest.connect('clicked(bool)', self.importSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
@@ -340,28 +338,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.tblModelList.connect('cellClicked(int, int)', self.onModelSelectFromTable)
         self.onSearchModel("")
 
-        # Dropdowns
-        self.ui.backendSelector.addItems(["docker", "udocker"])
-        self.ui.backendSelector.connect('currentIndexChanged(int)', self.onBackendSelect)
-
         # executable paths
         settings = qt.QSettings()
         docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
-        udocker_exec = settings.value("MHubRunner/UDockerExecutable", self.logic.getUDockerExecutable())
         self._syncDockerExecutablePath(docker_exec)
-        self.ui.pthUDockerExecutable.currentPath = udocker_exec
         if docker_exec:
             self.logic._executables["docker"] = docker_exec
-        if udocker_exec:
-            self.logic._executables["udocker"] = udocker_exec
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         if hasattr(self.ui, "pthDockerExecutableSetup"):
             self.ui.pthDockerExecutableSetup.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
-        self.ui.pthUDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateUDockerExecutable)
         self.ui.cmdDetectDockerExecutable.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
         if hasattr(self.ui, "cmdDetectDockerExecutableSetup"):
             self.ui.cmdDetectDockerExecutableSetup.connect('clicked(bool)', self.onAutoDetectDockerExecutable)
-        self.ui.cmdDetectUDockerExecutable.connect('clicked(bool)', self.onAutoDetectUDockerExecutable)
 
         self.updateSettingsSummary()
 
@@ -388,8 +376,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # load gpus
         self.updateHostGpuList()
 
-        # load backends
-        self.onBackendSelect(0)
+        # load docker info
+        self.onDockerUpdate()
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
@@ -401,8 +389,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # run which python and which pip
         import subprocess
         logger.debug("which python3: %s", subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
-        logger.debug("which udocker: %s", subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8'))
-
         # try the same with slicer.utils.consoleProcess
         p = slicer.util.launchConsoleProcess(["which", "python3"])
         logger.debug("slicer console which python3: %s", p.stdout.read())
@@ -565,34 +551,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             settings.setValue("MHubRunner/DockerExecutable", docker_executable)
         self._syncDockerExecutablePath(docker_executable)
         self._updateDockerSetupScreen()
-        self.updateSettingsSummary()
-
-    def onUpdateUDockerExecutable(self, path) -> None:
-        assert self.logic is not None
-        # user enters a new path for the udocker executable manually
-
-        # get udocker executable
-        udocker_executable = self.ui.pthUDockerExecutable.currentPath
-
-        # set udocker executable
-        logger.debug("Udocker executable updated: %s (from %s)", udocker_executable, path)
-        self.logic._executables["udocker"] = udocker_executable
-        settings = qt.QSettings()
-        settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
-        self.updateSettingsSummary()
-
-    def onAutoDetectUDockerExecutable(self) -> None:
-        assert self.logic is not None
-        # user clicks on the detect button
-
-        # get udocker executable
-        udocker_executable = self.logic.getUDockerExecutable(refresh=True)
-
-        # set udocker executable
-        self.ui.pthUDockerExecutable.currentPath = udocker_executable
-        if udocker_executable:
-            settings = qt.QSettings()
-            settings.setValue("MHubRunner/UDockerExecutable", udocker_executable)
         self.updateSettingsSummary()
 
     def _appendLogOutput(self, stdout: str | None) -> None:
@@ -796,7 +754,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # check if model is selected
         model = self.getModelFromTableSelection()
 
-        # check if backend is selected / available
+        # check if docker is available
         # TODO: ...
 
         # chekc if gpu requirements are met
@@ -881,8 +839,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         assert self.logic is not None
         text = self._pendingModelSearchText or ""
         if hasattr(self.logic, "_model_cache"):
-            backend = self.ui.backendSelector.currentText
-            models = self.logic.getModels(cached=True, backend=backend, hydrate_status=False)
+            models = self.logic.getModels(cached=True, hydrate_status=False)
             self._renderFilteredModels(models, text)
             return
         self._fetchModelsAsync()
@@ -894,24 +851,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _fetchModelsAsync(self) -> None:
         if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
             return
-        backend = self.ui.backendSelector.currentText
         if not hasattr(self.logic, "_model_cache"):
             self._setModelTableStatus("Loading models...")
 
-        logger.debug("Starting async model fetch for backend: %s", backend)
+        logger.debug("Starting async model fetch for docker backend")
         fetch_poller = self._modelFetchPoller
         def worker():
-            logger.debug("Fetching models from backend: %s", backend)
+            logger.debug("Fetching models from docker backend")
             assert self.logic is not None
-            self.logic.getModels(cached=False, backend=backend, hydrate_status=False)
+            self.logic.getModels(cached=False, hydrate_status=False)
             if fetch_poller is not None:
                 elapsed = fetch_poller.elapsed()
                 if elapsed is not None:
-                    logger.debug("Finished fetching models from backend: %s elapsed=%.2fs", backend, elapsed)
+                    logger.debug("Finished fetching models from docker backend elapsed=%.2fs", elapsed)
                 else:
-                    logger.debug("Finished fetching models from backend: %s", backend)
+                    logger.debug("Finished fetching models from docker backend")
             else:
-                logger.debug("Finished fetching models from backend: %s", backend)
+                logger.debug("Finished fetching models from docker backend")
         self._modelFetchPoller.start(worker)
 
     def _onModelFetchDone(self) -> None:
@@ -919,8 +875,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             elapsed = self._modelFetchPoller.elapsed()
             if elapsed is not None:
                 logger.debug("Model fetch thread done; UI update elapsed=%.2fs", elapsed)
-        current_backend = self.ui.backendSelector.currentText
-        models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if not models:
             self._setModelTableStatus("No models available.")
             return
@@ -941,7 +896,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
         if not hasattr(self.logic, "_model_cache"):
             return
-        backend = self.ui.backendSelector.currentText
 
         for model in self.logic._model_cache:
             model.status = ModelStatus.UNKNOWN
@@ -949,13 +903,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         def worker():
             assert self.logic is not None
-            self.logic.hydrateModelStatus(backend)
+            self.logic.hydrateModelStatus()
 
         self._modelStatusPoller.start(worker)
 
     def _onModelStatusDone(self) -> None:
-        current_backend = self.ui.backendSelector.currentText
-        models = self.logic.getModels(cached=True, backend=current_backend, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
+        models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if models:
             self._renderFilteredModels(models, self._pendingModelSearchText or "")
 
@@ -1178,30 +1131,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update apply button
         self._checkCanApply()
 
-    def onBackendSelect(self, index: int) -> None:
-        self.onBackendUpdate()
-
-    def onBackendUpdate(self) -> None:
+    def onDockerUpdate(self) -> None:
         assert self.logic is not None
 
-        # get selected backend
-        backend = self.ui.backendSelector.currentText
-
-        # get backend information
-        bi = self.logic.getBackendInformation(backend)
-
-        # get host version
-        if not bi.available:
-            self.ui.lblBackendVersion.setText("Selected backend not available.")
-
+        info = self.logic.getDockerInformation()
+        if not info.available:
+            self.ui.lblBackendVersion.setText("Docker not available.")
         else:
-            self.ui.lblBackendVersion.setText(bi.version)
+            self.ui.lblBackendVersion.setText(info.version)
 
-        # enable / disable gpus seclection based on backend
-        self.ui.lstHostGpu.enabled = backend == "docker"
-
-        # update install backend button and images list
-        self.updateInstallUDockerBackendButtonState()
         self.updateBackendImagesList()
         search_text = self.ui.searchModel.text
         self._pendingModelSearchText = search_text or ""
@@ -1210,20 +1148,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             self.onSearchModel(search_text)
         self.updateSettingsSummary()
-
-    def updateInstallUDockerBackendButtonState(self) -> None:
-        assert self.logic
-
-        if self.ui.backendSelector.currentText == "udocker":
-            is_installed = self.logic.isUdockerBackendInstalled()
-            self.ui.cmdInstallUdocker.enabled = True
-
-            if is_installed:
-                self.ui.cmdInstallUdocker.text = "uninstall"
-            else:
-                self.ui.cmdInstallUdocker.text = "install"
-        else:
-            self.ui.cmdInstallUdocker.enabled = False
 
     def onBackendImageSelect(self) -> None:
 
@@ -1380,11 +1304,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def updateBackendImagesList(self) -> None:
         assert self.logic is not None
 
-        # get selected backend
-        backend = self.ui.backendSelector.currentText
-
-        # get available images
-        images = self.logic.getLocalImages(backend, cached=False)
+        # get available docker images
+        images = self.logic.getLocalImages(cached=False)
 
         # update list
         self.ui.lstBackendImages.clear()
@@ -1615,9 +1536,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
 
-        # get backend
-        backend = self.ui.backendSelector.currentText
-
         ###### TEST (for caching on host)
         # get InstanceUIDs (only available for nodes loaded through the dicom module)
         node = self.ui.inputSelector.currentNode()
@@ -1722,7 +1640,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # run model logic
             self.logic.run_mhub(
                 model=model,
-                backend=backend,
                 gpus=gpus,
                 input_dir=input_dir,
                 output_dir=output_dir,
@@ -1836,8 +1753,7 @@ class Model:
 #     cachedSubjects: List[str]
 
 @dataclass
-class BackendInformation:
-    name: str
+class DockerInformation:
     version: str
     available: bool
 
@@ -2162,84 +2078,6 @@ class ProgressObserver:
         # remove from tasks
         self._tasks.remove(self)
 
-class ProcessChain:
-
-    @dataclass
-    class CMD:
-        index: int
-        cmd: list[str]
-        name: str | None = None
-        frequency: float = 2
-        timeout: int = 0
-        returncode: int | None = None
-        success: bool | None = None
-        started: bool = False
-
-    def __init__(self, env: dict[str, str] | None = None):
-        self.cmds: list['ProcessChain.CMD'] = []
-        self.started = False
-        self.stopped = False
-        self.success = True
-        self.index = -1
-        self._env = env
-
-        self._seconds_elapsed = 0.0
-
-        self._onStop: Callable[[bool], None] | None = None
-        self._onProgress: Callable[['ProcessChain.CMD', float], None] | None = None
-
-    def add(self, cmd: list[str], name: str | None = None, timeout: int = 0, frequency: float = 2):
-        assert not self.started, "Process chain already started"
-        self.cmds.append(self.CMD(len(self.cmds), cmd, name, frequency, timeout))
-
-    def start(self):
-        self.started = True
-
-        # start first process
-        self._start_next()
-
-    def _start_next(self):
-        if self.index + 1 < len(self.cmds):
-            self.index += 1
-            self._start_process(self.cmds[self.index].cmd)
-            return
-
-        self.stopped = True
-
-        # invoke callback if defined
-        if self._onStop:
-            self._onStop(True)
-
-    def _on_process_stop(self, returncode: int, stdout: str, timedout: bool, killed: bool):
-        if timedout or killed or returncode != 0:
-            self.success = False
-            self.stopped = True
-
-            # invoke callback if defined
-            if self._onStop:
-                self._onStop(False)
-        else:
-            self._start_next()
-
-    def _on_process_progress(self, time: float, stdout: str):
-        self._seconds_elapsed += time
-
-        # invoke progress callback if defined
-        if self._onProgress:
-            self._onProgress(self.cmds[self.index], time)
-
-    def _start_process(self, cmd: list[str]):
-        p = ProgressObserver(cmd, env=self._env)
-        p.onStop(self._on_process_stop)
-        p.onProgress(self._on_process_progress)
-
-    def onStop(self, callback: Callable[[bool], None]):
-        self._onStop = callback
-
-    def onProgress(self, callback: Callable[['ProcessChain.CMD', float], None]):
-        self._onProgress = callback
-
-
 # MHubRunnerLogic
 #
 
@@ -2312,7 +2150,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # return
         return model
 
-    def getModels(self, cached: bool = True, backend: str = 'docker', hydrate_status: bool = True) -> list[Model]:
+    def getModels(self, cached: bool = True, hydrate_status: bool = True) -> list[Model]:
         try:
             import requests
         except ModuleNotFoundError as e:
@@ -2366,14 +2204,13 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # -- 2 ----------- HYDRATE MODEL STATE
         if hydrate_status:
-            self.hydrateModelStatus(backend, models=models, cached_images=cached)
+            self.hydrateModelStatus(models=models, cached_images=cached)
 
         # -- 3 ----------- RETURN MODELS
         return models
 
     def hydrateModelStatus(
         self,
-        backend: str,
         models: list[Model] | None = None,
         cached_images: bool = False,
     ) -> list[Model]:
@@ -2381,8 +2218,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             models = getattr(self, "_model_cache", [])
 
         # get local images
-        # NOTE: this is backend specific, thus needs to be re-loaded when backend changes
-        images = self.getLocalImages(backend=backend, cached=cached_images)
+        # NOTE: refresh when docker images change
+        images = self.getLocalImages(cached=cached_images)
         images = [i.split()[0] for i in images]
 
         # iterate models and update state
@@ -2438,123 +2275,24 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # deliver
         return docker_executable
 
-    def getUDockerExecutable(self, refresh: bool = False) -> str | None:
-        # TODO: return optional and display installation instructions under backend tab
-
-        # TODO: figure out installation path.
-        # TODO: pro/cons installing udocker in slicer vs. using system wide installation (also consider the nature of the tool)
-        #return "/home/exouser/Downloads/Slicer-5.6.2-linux-amd64/lib/Python/bin/udocker" # <- linux: pip install executable
-        #return "/home/exouser/Downloads/Slicer-5.6.2-linux-amd64/lib/Python/lib/python3.9/site-packages/udocker" # <- linux: pip install directory
-        #return "/Applications/Slicer.app/Contents/lib/Python/bin/udocker" #  <- macos: pip install executable
-
-        import platform
+    def getDockerInformation(self) -> DockerInformation:
         import subprocess
 
-        # cache lookup
-        if not refresh and "udocker" in self._executables and self._executables["udocker"]:
-            return self._executables["udocker"]
-
-        # get operation system
-        ops = platform.system()
-
-        # find docker executable
-        udocker_executable = None
-        if ops == "Linux":
-            try:
-                udocker_executable = subprocess.run(["which", "udocker"], capture_output=True).stdout.decode('utf-8').strip('\n')
-            except Exception as e:
-                pass
-
-        logger.debug("U-Docker executable: %s", udocker_executable)
-
-        # error
-        if udocker_executable is None or udocker_executable == "":
-            logger.warning("U-Docker executable not found.")
-
-        # cache
-        if udocker_executable:
-            self._executables["udocker"] = udocker_executable
-
-        # deliver
-        return udocker_executable
-
-    def getBackendInformation(self, name: str) -> BackendInformation:
-        assert name in ["docker", "udocker"]
-        import subprocess, re
-
-        # initialize bi
-        bi = BackendInformation(name, "N/A", False)
-
-        # fetch version and availability from backend
-        if name == "docker":
-            try:
-                docker_exec = self.getDockerExecutable()
-                assert docker_exec is not None, "Docker executable not found"
-                logger.debug("Running %s --version", docker_exec)
-                env = self._build_subprocess_env(docker_exec)
-                result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
-                bi.version = result.stdout.decode('utf-8')
-                bi.available = True
-                logger.debug("Docker available")
-            except Exception as e:
-                bi.version = "E"
-                bi.available = False
-
-        elif name == "udocker":
-            try:
-                # use launchConsoleProcess to run udocker --version
-                # import udocker
-                # bi.version = udocker.__version__ #proc.stdout.read().decode('utf-8')
-                # bi.available = True
-
-                # get udocker exec
-                # TODO: check https://github.com/Slicer/Slicer/blob/9391c208f0d25a2fe2e6b19667766e759c6160c7/Base/Python/
-                # slicer/util.py#L3857
-
-                # run
-                udocker_exec = self.getUDockerExecutable()
-                assert udocker_exec is not None, "Udocker executable not found"
-                logger.debug("Running %s --version", udocker_exec)
-                env = self._build_subprocess_env(udocker_exec)
-                result = subprocess.run([udocker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
-                logger.debug("Udocker --version output: %s", result.stdout.decode('utf-8'))
-
-                # extract "version: x.x.x" from string
-                version = re.search(r"version: ([0-9]+\.[0-9]+\.[0-9]+)", result.stdout.decode('utf-8'))
-
-                bi.version = f"Version: {version.groups()[0]}" if version else "???"
-                bi.available = True
-                logger.debug("Udocker available")
-
-            except Exception as e:
-                bi.version = "E"
-                bi.available = False
-
-        # return
-        return bi
-
-    def isUdockerBackendInstalled(self) -> bool:
+        info = DockerInformation(version="N/A", available=False)
         try:
-            import udocker
-            return True
-        except ModuleNotFoundError as e:
-            return False
+            docker_exec = self.getDockerExecutable()
+            assert docker_exec is not None, "Docker executable not found"
+            logger.debug("Running %s --version", docker_exec)
+            env = self._build_subprocess_env(docker_exec)
+            result = subprocess.run([docker_exec, "--version"], timeout=5, check=True, capture_output=True, env=env)
+            info.version = result.stdout.decode('utf-8')
+            info.available = True
+            logger.debug("Docker available")
+        except Exception:
+            info.version = "E"
+            info.available = False
 
-    def installUdockerBackend(self):
-
-        # chekc if udocker is already installed
-        is_installed = self.isUdockerBackendInstalled()
-
-        # install udocker in slicer
-        if not is_installed:
-            # install udocker
-            slicer.util.pip_install('udocker')
-            udocker_exec = self.getUDockerExecutable()
-
-            # install additional dependencies
-            slicer.util.launchConsoleProcess([udocker_exec, "install"]) # --force
-        else:
-            slicer.util.pip_uninstall('udocker')
+        return info
 
     def getGPUInformation(self) -> list[str]:
         import subprocess
@@ -2571,32 +2309,29 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # return
         return gpus
 
-    def getLocalImages(self, backend: str, cached: bool = True) -> list[str]:
+    def getLocalImages(self, cached: bool = True) -> list[str]:
 
         # get images
         import subprocess
 
         # cache
-        if cached and hasattr(self, "_images_cache") and backend in self._images_cache:
-            return self._images_cache[backend]
+        if cached and hasattr(self, "_images_cache"):
+            return self._images_cache
 
-        # load images based on backend
+        # load docker images
         try:
-            if backend == "docker":
-                docker_exec = self.getDockerExecutable()
-                assert docker_exec is not None, "Docker executable not found"
-                env = self._build_subprocess_env(docker_exec)
-                result = subprocess.run([docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"], timeout=5, check=True, capture_output=True, env=env)
-                images = [i.split("|") for i in result.stdout.decode('utf-8').split("\n")]
-                images = [f"{i[0]}:latest ({i[2]})" for i in images if len(i) == 3 and i[1] == "latest"]
-
-            elif backend == "udocker":
-                udocker_exec = self.getUDockerExecutable()
-                assert udocker_exec is not None, "Udocker executable not found"
-                env = self._build_subprocess_env(udocker_exec)
-                result = subprocess.run([udocker_exec, "images"], timeout=5, check=True, capture_output=True, env=env)
-                images = result.stdout.decode('utf-8').split("\n")
-                images = [image.split()[0] for image in images if image.startswith("mhubai/")]
+            docker_exec = self.getDockerExecutable()
+            assert docker_exec is not None, "Docker executable not found"
+            env = self._build_subprocess_env(docker_exec)
+            result = subprocess.run(
+                [docker_exec, "images", "--filter", "reference=mhubai/*", "--format", "{{.Repository}}|{{.Tag}}|{{.Size}}"],
+                timeout=5,
+                check=True,
+                capture_output=True,
+                env=env,
+            )
+            images = [i.split("|") for i in result.stdout.decode('utf-8').split("\n")]
+            images = [f"{i[0]}:latest ({i[2]})" for i in images if len(i) == 3 and i[1] == "latest"]
 
             # remove empty strings
             images = [image for image in images if image != ""]
@@ -2605,9 +2340,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             images = []
 
         # cache
-        if not hasattr(self, "_images_cache"):
-            self._images_cache = {}
-        self._images_cache[backend] = images
+        self._images_cache = images
 
         # return
         return images
@@ -2789,76 +2522,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         po.onStop(_on_stop)
         po.onProgress(onProgress)
 
-    def _run_mhub_udocker(self, model: 'Model', gpu: bool, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
-
-        # get executable
-        udocker_exec = self.getUDockerExecutable()
-        env = self._build_subprocess_env(udocker_exec)
-
-        # callback wrapper
-        def _on_progress(cmd: ProcessChain.CMD, time: float):
-            #print(f"Command {cmd.name} running {time} seconds")
-            onProgress(float(time), "")
-
-        def _on_stop(success: bool):
-            logger.info("Command chain stopped with success: %s", success)
-            onStop(int(success), "", False, False)
-
-        # initialize async processing chain
-        pc = ProcessChain(env=env)
-        pc.onStop(_on_stop)
-        pc.onProgress(_on_progress)
-
-        # setup gpu if required
-        if gpu:
-            logger.debug("Udocker with GPU")
-
-            # check if image is already available or optionally pull image
-            images = self.getLocalImages("udocker", cached=True)
-            logger.debug("Udocker local images: %s", images)
-            if f"mhubai/{model.name}:latest" not in images:
-                pull_cmd = [udocker_exec, "pull", f"mhubai/{model.name}:latest"]
-                pc.add(pull_cmd, name="Pull image")
-
-            # create container
-            create_cmd = [udocker_exec, "create", f"--name={model.name}", f"mhubai/{model.name}:latest"]
-
-            # setup container
-            setup_cmd = [udocker_exec, "setup", "--nvidia", "--force", model.name]
-
-            # run container
-            run_cmd = [udocker_exec, "run", "--rm", "-t",
-                       "-v", f"{input_dir}:/app/data/input_data:ro",
-                       "-v", f"{output_dir}:/app/data/output_data:rw",
-                       model.name]
-
-            # processing chain
-            pc.add(create_cmd, name="Create container")
-            pc.add(setup_cmd, name="Setup container")
-            pc.add(run_cmd, name="Run container")
-
-            # print execution plan
-            for cmd in pc.cmds:
-                logger.debug("Udocker cmd: %s %s", cmd.name, cmd.cmd)
-
-        else:
-
-            # run container
-            run_cmd = [udocker_exec, "run", "--rm", "-t",
-                       "-v", f"{input_dir}:/app/data/input_data:ro",
-                       "-v", f"{output_dir}:/app/data/output_data:rw",
-                       f"mhubai/{model.name}:latest"]
-
-            # processing chain
-            pc.add(run_cmd, name="Run container")
-
-
-        # run async
-        pc.start()
-
     def run_mhub(self,
                  model: 'Model',
-                 backend: Literal["docker", "udocker"],
                  gpus: list[int] | None,
                  input_dir: str,
                  output_dir: str,
@@ -2879,11 +2544,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             if onStop is not None and callable(onStop):
                 onStop(returncode, stdout, timedout, killed)
 
-        # run backend
-        if backend == "docker":
-            self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
-        elif backend == "udocker":
-            self._run_mhub_udocker(model, gpus is not None, input_dir, output_dir, _on_progress, _on_stop, timeout)
+        # run docker backend
+        self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
 
 
     def remove_image(
