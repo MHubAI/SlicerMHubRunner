@@ -268,6 +268,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
         self._applySummaryOpacity()
+        self._applyMainButtonIcons()
         self._closeStaleSettingsDialogs()
 
         if hasattr(self.ui, "settingsPanel"):
@@ -635,6 +636,61 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         pixmap = qt.QPixmap(logo_path)
         self.ui.lblDockerSetupLogo.setPixmap(pixmap)
 
+    def _applyMainButtonIcons(self) -> None:
+        icon_size = qt.QSize(14, 14)
+        self.ui.applyButton.setIcon(self._themeIcon("hi_play"))
+        self.ui.applyButton.setIconSize(icon_size)
+        self.ui.cancelButton.setIcon(self._themeIcon("hi_cancel"))
+        self.ui.cancelButton.setIconSize(icon_size)
+        self._setButtonTextWithIcon(self.ui.applyButton, self.ui.applyButton.text)
+        self._setButtonTextWithIcon(self.ui.cancelButton, self.ui.cancelButton.text)
+        if hasattr(self.ui, "cmdOpenSettings"):
+            self.ui.cmdOpenSettings.setIcon(self._themeIcon("hi_settings"))
+            self.ui.cmdOpenSettings.setIconSize(icon_size)
+            self._setButtonTextWithIcon(self.ui.cmdOpenSettings, self.ui.cmdOpenSettings.text)
+        if hasattr(self.ui, "cmdOpenSettingsFromSetup"):
+            self.ui.cmdOpenSettingsFromSetup.setIcon(self._themeIcon("hi_settings"))
+            self.ui.cmdOpenSettingsFromSetup.setIconSize(icon_size)
+            self._setButtonTextWithIcon(self.ui.cmdOpenSettingsFromSetup, self.ui.cmdOpenSettingsFromSetup.text)
+
+    def _themeIcon(self, base_name: str, opacity: float = 1.0) -> qt.QIcon:
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        if self._isDarkTheme():
+            candidates = (f"{base_name}_w.png", f"{base_name}_b.png")
+        else:
+            candidates = (f"{base_name}_b.png", f"{base_name}_w.png")
+        icon_path = None
+        for candidate in candidates:
+            candidate_path = os.path.join(icons_path, candidate)
+            if os.path.exists(candidate_path):
+                icon_path = candidate_path
+                break
+        if not icon_path:
+            return qt.QIcon()
+        pixmap = qt.QPixmap(icon_path)
+        if opacity >= 1.0:
+            return qt.QIcon(pixmap)
+        faded = qt.QPixmap(pixmap.size())
+        faded.fill(qt.Qt.transparent)
+        painter = qt.QPainter(faded)
+        painter.setOpacity(opacity)
+        painter.drawPixmap(0, 0, pixmap)
+        painter.end()
+        return qt.QIcon(faded)
+
+    _ICON_DISABLED_OPACITY = 0.2
+    _ICON_TEXT_PREFIX = " "
+
+    def _withIconLabel(self, text: str) -> str:
+        if not text:
+            return ""
+        if text.startswith(self._ICON_TEXT_PREFIX):
+            return text
+        return f"{self._ICON_TEXT_PREFIX}{text}"
+
+    def _setButtonTextWithIcon(self, button, text: str) -> None:
+        button.text = self._withIconLabel(text)
+
     def showDockerSetupScreenFromSettings(self, checked: bool = False) -> None:
         self.showDockerSetupScreen(force=True)
 
@@ -764,20 +820,20 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if model and model.inputs_compatibility and self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
-            self.ui.applyButton.text = f"Run {model.label}"
+            self._setButtonTextWithIcon(self.ui.applyButton, f"Run {model.label}")
         else:
             self.ui.applyButton.toolTip = _("Select input volume node")
             self.ui.applyButton.enabled = False
 
             if not model:
-                self.ui.applyButton.text = "Select an MHub.ai Model"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
             elif not self._parameterNode or not self._parameterNode.inputVolume:
-                self.ui.applyButton.text = "Select an Input Volume"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             elif not model.inputs_compatibility:
-                self.ui.applyButton.text = "Select a Model compatible with 3D Slicer Extension"
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             else:
-                self.ui.applyButton.text = "N/A"
+                self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
 
 
     def onKillObservedProcessesButton(self) -> None:
@@ -926,17 +982,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "Actions"])
 
         # make table rows slim
-        self.ui.tblModelList.verticalHeader().setDefaultSectionSize(20)
+        self.ui.tblModelList.verticalHeader().setDefaultSectionSize(24)
 
-        # make table columns use all available space
-        self.ui.tblModelList.horizontalHeader().setStretchLastSection(True)
+        # size columns to content, only model label stretches
+        header = self.ui.tblModelList.horizontalHeader()
+        header.setStretchLastSection(False)
 
         # select full row when cell is clicked
         self.ui.tblModelList.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
 
         # make first column (model label) stretchable
         # NOTE: makes label column un-editable - not the best UX?!
-        self.ui.tblModelList.horizontalHeader().setSectionResizeMode(0, qt.QHeaderView.Stretch)
+        header.setSectionResizeMode(0, qt.QHeaderView.Stretch)
+        header.setSectionResizeMode(1, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
 
         # fill table with models that match the search text
         for model in models:
@@ -969,40 +1029,65 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             def create_web_handler(model):
                 return lambda: self.onModelWeb(model)
 
-            btnPull = qt.QPushButton("Pull")
+            icon_size = qt.QSize(14, 14)
+            button_size = 24
+            loading_width = 72
+
+            btnPull = qt.QPushButton()
+            btnPull.setIcon(self._themeIcon("hi_pull"))
+            btnPull.setIconSize(icon_size)
+            btnPull.setFixedHeight(button_size)
+            btnPull.setMinimumWidth(button_size)
             btnPull.clicked.connect(create_pull_handler(btnPull, model))
             layout.addWidget(btnPull)
 
             if model.status == ModelStatus.UNKNOWN:
                 btnPull.enabled = False
-                btnPull.text = "Checking..."
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
                 btnPull.toolTip = "Checking image status"
 
             elif model.status == ModelStatus.PULLING:
                 btnPull.enabled = False
-                btnPull.text = "Pulling..."
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
                 btnPull.toolTip = "Image is being pulled"
 
             elif model.status == ModelStatus.PULLED:
                 btnPull.enabled = False
-                btnPull.text = "Pulled"
+                btnPull.setIcon(self._themeIcon("hi_pulled", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("")
+                btnPull.setMinimumWidth(button_size)
                 btnPull.toolTip = "Image is available locally"
 
             elif model.status == ModelStatus.RUNNING:
                 btnPull.enabled = False
-                btnPull.text = "Running"
+                btnPull.setIcon(self._themeIcon("hi_pull", self._ICON_DISABLED_OPACITY))
+                btnPull.setText("loading...")
+                btnPull.setMinimumWidth(loading_width)
                 btnPull.toolTip = "Image is currently running"
 
             else:
                 btnPull.enabled = True
-                btnPull.text = "Pull"
                 btnPull.toolTip = "Pull image from MHub.ai"
+                btnPull.setText("")
+                btnPull.setMinimumWidth(button_size)
 
-            btnDetails = qt.QPushButton("Details")
+            btnDetails = qt.QPushButton()
+            btnDetails.setIcon(self._themeIcon("hi_info"))
+            btnDetails.setIconSize(icon_size)
+            btnDetails.setFixedSize(button_size, button_size)
+            btnDetails.toolTip = "Show model details"
             btnDetails.clicked.connect(create_details_handler(model))
             layout.addWidget(btnDetails)
 
-            btnWeb = qt.QPushButton("Web")
+            btnWeb = qt.QPushButton()
+            btnWeb.setIcon(self._themeIcon("hi_modelcard"))
+            btnWeb.setIconSize(icon_size)
+            btnWeb.setFixedSize(button_size, button_size)
+            btnWeb.toolTip = "Open model card in browser"
             btnWeb.clicked.connect(create_web_handler(model))
             layout.addWidget(btnWeb)
 
@@ -1602,7 +1687,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # PROGRESS handler
             def onProgress(progress: float, stdout: str | None):
-                self.ui.applyButton.text = f"Running {model.label} ({progress}s)"
+                self._setButtonTextWithIcon(self.ui.applyButton, f"Running {model.label} ({progress}s)")
                 self._appendLogOutput(stdout)
 
             # TERMINATION handler
