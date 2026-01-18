@@ -3263,6 +3263,9 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             for segmentationId, segmentAttributes in enumerate(data.get("segmentAttributes", [])):
                 labelFileName = os.path.join(temp_dir, f"{segmentationId + 1}.nrrd")
                 labelNode = slicer.util.loadLabelVolume(labelFileName, {"singleFile": True})
+                if not labelNode:
+                    logger.error("Failed to load label volume: %s", labelFileName)
+                    return False
                 labelNode.labelAttributes = []
 
                 for segment in segmentAttributes:
