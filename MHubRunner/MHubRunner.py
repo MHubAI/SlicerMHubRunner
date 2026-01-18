@@ -984,7 +984,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if value is None:
             settings = qt.QSettings()
             value = settings.value("MHubRunner/OutputHandling", "load_import")
-        value = str(value) if value is not None else "load_import"
+        value = str(value)
         if value not in {"load_import", "load_only", "import_only", "none"}:
             return "load_import"
         return value

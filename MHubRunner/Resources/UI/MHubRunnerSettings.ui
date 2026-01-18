@@ -450,46 +450,46 @@
         </property>
        </widget>
       </item>
-            <item row="2" column="0">
-             <widget class="QLabel" name="label_outputHandling">
-              <property name="text">
-               <string>Output Handling</string>
-              </property>
-             </widget>
-            </item>
-            <item row="2" column="1">
-             <widget class="QComboBox" name="cmbOutputHandling"/>
-            </item>
-            <item row="3" column="0" colspan="2">
-             <widget class="QCheckBox" name="chkShowCompletionNotification">
-              <property name="text">
-               <string>Show completion notification</string>
-              </property>
-              <property name="checked">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-            <item row="4" column="0" colspan="2">
-             <widget class="QCheckBox" name="chkOpenOutputPanelOnComplete">
-              <property name="text">
-               <string>Open output panel when run completes</string>
-              </property>
-              <property name="checked">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-            <item row="5" column="0" colspan="2">
-             <widget class="QCheckBox" name="chkOpenRunFolderOnComplete">
-              <property name="text">
-               <string>Open output folder in file explorer when run completes</string>
-              </property>
-              <property name="checked">
-               <bool>false</bool>
-              </property>
-             </widget>
-            </item>
+      <item row="2" column="0">
+       <widget class="QLabel" name="label_outputHandling">
+        <property name="text">
+         <string>Output Handling</string>
+        </property>
+       </widget>
+      </item>
+      <item row="2" column="1">
+       <widget class="QComboBox" name="cmbOutputHandling"/>
+      </item>
+      <item row="3" column="0" colspan="2">
+       <widget class="QCheckBox" name="chkShowCompletionNotification">
+        <property name="text">
+         <string>Show completion notification</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="4" column="0" colspan="2">
+       <widget class="QCheckBox" name="chkOpenOutputPanelOnComplete">
+        <property name="text">
+         <string>Open output panel when run completes</string>
+        </property>
+        <property name="checked">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+      <item row="5" column="0" colspan="2">
+       <widget class="QCheckBox" name="chkOpenRunFolderOnComplete">
+        <property name="text">
+         <string>Open output folder in file explorer when run completes</string>
+        </property>
+        <property name="checked">
+         <bool>false</bool>
+        </property>
+       </widget>
+      </item>
      </layout>
     </widget>
    </item>
