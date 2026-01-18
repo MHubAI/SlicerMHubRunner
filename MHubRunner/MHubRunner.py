@@ -749,6 +749,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     _ICON_DISABLED_OPACITY = 0.2
     _ICON_TEXT_PREFIX = " "
+    _SETTINGS_SECTION_WIDGET_NAMES = (
+        "ctkCollapsibleButton",
+        "CollapsibleButton",
+        "advancedCollapsibleButton",
+        "logCollapsibleButton",
+    )
     _OUTPUT_HANDLING_OPTIONS = (
         ("Load and import (DICOMSEG)", "load_import"),
         ("Load only", "load_only"),
@@ -859,7 +865,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if getattr(self, "_settingsSectionSignalsWired", False):
             return
         self._settingsSectionSignalsWired = True
-        for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+        for name in self._SETTINGS_SECTION_WIDGET_NAMES:
             widget = getattr(self.ui, name, None)
             if widget is None:
                 continue
@@ -871,7 +877,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _closeOtherSettingsSections(self, opened_widget) -> None:
         if opened_widget is None or opened_widget.collapsed:
             return
-        for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+        for name in self._SETTINGS_SECTION_WIDGET_NAMES:
             widget = getattr(self.ui, name, None)
             if widget is None or widget is opened_widget:
                 continue
