@@ -295,7 +295,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cancelButton.connect('clicked(bool)', self.onCancelButton)
         self.ui.cmdKillObservedProcesses.connect('clicked(bool)', self.onKillObservedProcessesButton)
         self.ui.cmdBackendReload.connect('clicked(bool)', self.onDockerUpdate)
-        # self.ui.cmdTest.connect('clicked(bool)', self.importSegmentations)
+        # self.ui.cmdTest.connect('clicked(bool)', self.loadSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
         self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
@@ -1825,7 +1825,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.logic.renderTableData(tableNode, csv_header, csv_data)
 
         elif output_file.endswith(".seg.dcm"):
-            self.logic.importSegmentations([output_file])
+            self.logic.loadSegmentations([output_file])
 
     def _loadTabularOutputsFromRun(self, output_dir: str) -> None:
         assert self.logic is not None
@@ -1903,7 +1903,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # local_dir = "/Users/lenny/Projects/SlicerMHubIntegration/SlicerMHubRunner/return_data"
         # dsegfiles = self.logic.scanDirectoryForFilesWithExtension(local_dir)
         # self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-        # self.logic.importSegmentations(dsegfiles)
+        # self.logic.loadSegmentations(dsegfiles)
         # return
 
         ###### TEST (works)
@@ -2005,7 +2005,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                     if output_handling in ("load_import", "import_only") and input_is_dicom:
                         self.logic.addFilesToDatabase(dsegfiles, operation="copy")
                     if output_handling in ("load_import", "load_only"):
-                        self.logic.importSegmentations(dsegfiles)
+                        self.logic.loadSegmentations(dsegfiles)
 
                 if output_handling in ("load_import", "load_only"):
                     self._loadTabularOutputsFromRun(output_dir)
@@ -3150,7 +3150,19 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             for file in files:
                 os.remove(file)
 
-    def importSegmentations(self, files: list[str]):
+    def loadSegmentations(self, files: list[str]):
+        loaded_any, loaded_paths = self._load_segmentation_from_database(files)
+        for file in files:
+            if os.path.abspath(file) in loaded_paths:
+                continue
+            logger.debug("Loading segmentation without database: %s", file)
+            if self._load_segmentation_manually(file):
+                loaded_any = True
+
+        if not loaded_any:
+            logger.warning("No segmentations loaded for files: %s", files)
+
+    def _load_segmentation_from_database(self, files: list[str]) -> tuple[bool, set[str]]:
         import DICOMSegmentationPlugin
 
         # create importer
@@ -3163,16 +3175,147 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # import files
         loaded_any = False
+        loaded_paths: set[str] = set()
         for loadable in loadables:
             if importer.load(loadable):
                 loaded_any = True
+                if loadable.files:
+                    loaded_paths.add(os.path.abspath(loadable.files[0]))
+        if loaded_paths:
+            logger.debug("Loaded segmentations from database: %s", sorted(loaded_paths))
+        return loaded_any, loaded_paths
 
-        if not loaded_any:
-            logger.warning("No segmentations loaded for files: %s", files)
+    def _load_segmentation_manually(self, seg_file: str) -> bool:
+        import DICOMSegmentationPlugin
+        import glob
+        import json
+        import shutil
+        import types
+
+        if not os.path.exists(seg_file):
+            logger.error("Segmentation file not found: %s", seg_file)
+            return False
+
+        try:
+            segimage2itkimage = slicer.modules.segimage2itkimage
+        except AttributeError:
+            logger.error("segimage2itkimage CLI module is not available; cannot load %s", seg_file)
+            return False
+
+        importer = DICOMSegmentationPlugin.DICOMSegmentationPluginClass()
+
+        temp_dir = slicer.util.tempDirectory()
+        try:
+            parameters = {
+                "inputSEGFileName": seg_file,
+                "outputDirName": temp_dir,
+                "mergeSegments": True,
+            }
+            cliNode = slicer.cli.run(segimage2itkimage, None, parameters, wait_for_completion=True)
+            if cliNode.GetStatusString() != "Completed":
+                logger.error("SEG2NRRD did not complete successfully for %s", seg_file)
+                return False
+
+            metaFileName = os.path.join(temp_dir, "meta.json")
+            if not os.path.exists(metaFileName):
+                logger.error("Missing meta.json for DICOM SEG: %s", seg_file)
+                return False
+
+            with open(metaFileName) as metaFile:
+                data = json.load(metaFile)
+
+            numberOfSegmentations = len(glob.glob(os.path.join(temp_dir, "*.nrrd")))
+            if numberOfSegmentations != len(data.get("segmentAttributes", [])):
+                logger.error("Loading failed for %s: inconsistent segment count", seg_file)
+                return False
+
+            terminologiesLogic = slicer.modules.terminologies.logic()
+            display_name = os.path.splitext(os.path.basename(seg_file))[0]
+
+            categoryContextName = display_name
+            if not terminologiesLogic.LoadTerminologyFromSegmentDescriptorFile(categoryContextName, metaFileName):
+                categoryContextName = "Segmentation category and type - DICOM master list"
+
+            anatomicContextName = display_name
+            try:
+                if not terminologiesLogic.LoadRegionContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
+                    anatomicContextName = "Anatomic codes - DICOM master list"
+            except AttributeError:
+                if not terminologiesLogic.LoadAnatomicContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
+                    anatomicContextName = "Anatomic codes - DICOM master list"
+
+            segmentLabelNodes = []
+            for segmentationId, segmentAttributes in enumerate(data.get("segmentAttributes", [])):
+                labelFileName = os.path.join(temp_dir, f"{segmentationId + 1}.nrrd")
+                labelNode = slicer.util.loadLabelVolume(labelFileName, {"singleFile": True})
+                labelNode.labelAttributes = []
+
+                for segment in segmentAttributes:
+                    rgb255 = segment.get("recommendedDisplayRGBValue")
+                    if rgb255:
+                        rgb = [float(c) / 255.0 for c in rgb255]
+                    else:
+                        rgb = (150.0, 150.0, 0.0)
+
+                    categoryCode, categoryCodingScheme, categoryCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyCategoryCodeSequence")
+                    typeCode, typeCodingScheme, typeCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeCodeSequence")
+                    typeModCode, typeModCodingScheme, typeModCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeModifierCodeSequence")
+                    regionCode, regionCodingScheme, regionCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "AnatomicRegionSequence")
+                    regionModCode, regionModCodingScheme, regionModCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "AnatomicRegionModifierSequence")
+
+                    segmentTerminologyTag = terminologiesLogic.SerializeTerminologyEntry(
+                        categoryContextName,
+                        categoryCode, categoryCodingScheme, categoryCodeMeaning,
+                        typeCode, typeCodingScheme, typeCodeMeaning,
+                        typeModCode, typeModCodingScheme, typeModCodeMeaning,
+                        anatomicContextName,
+                        regionCode, regionCodingScheme, regionCodeMeaning,
+                        regionModCode, regionModCodingScheme, regionModCodeMeaning,
+                    )
+
+                    if segment.get("SegmentLabel"):
+                        segmentName = segment["SegmentLabel"]
+                        segmentNameAutoGenerated = False
+                    elif segment.get("SegmentDescription"):
+                        segmentName = segment["SegmentDescription"]
+                        segmentNameAutoGenerated = False
+                    else:
+                        segmentName = typeCodeMeaning
+                        segmentNameAutoGenerated = True
+
+                    labelAttributes = {}
+                    labelAttributes["Name"] = segmentName
+                    labelAttributes["NameAutoGenerated"] = segmentNameAutoGenerated
+                    labelAttributes["Description"] = segment.get("SegmentDescription")
+                    labelAttributes["Terminology"] = segmentTerminologyTag
+                    labelAttributes["ColorR"] = rgb[0]
+                    labelAttributes["ColorG"] = rgb[1]
+                    labelAttributes["ColorB"] = rgb[2]
+                    labelAttributes["DICOM.SegmentAlgorithmType"] = segment.get("SegmentAlgorithmType")
+                    labelAttributes["DICOM.SegmentAlgorithmName"] = segment.get("SegmentAlgorithmName")
+
+                    labelNode.labelAttributes.append(labelAttributes)
+
+                segmentLabelNodes.append(labelNode)
+
+            loadable = types.SimpleNamespace(name=display_name)
+            segmentationNode = importer._initializeSegmentation(loadable)
+
+            for labelNode in segmentLabelNodes:
+                importer._importSegmentAndRemoveLabel(labelNode, segmentationNode)
+
+            return True
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
     def openSegmentation(self, files: list[str]):
-        self.importSegmentations(files)
+        self.loadSegmentations(files)
 
 #
 # MHubRunnerTest
