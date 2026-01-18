@@ -1784,8 +1784,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             import json
 
             # read json file
-            with open(output_file) as f:
-                data = json.load(f)
+            try:
+                with open(output_file) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.exception("Failed to load JSON output file: %s", output_file)
+                slicer.util.errorDisplay(f"Failed to load JSON output file:\n{output_file}\n\n{exc}")
+                return
 
             # flatten nested json into dot-notation keys (array items in square brackets)
             def flatten_json(y):
@@ -1817,10 +1822,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             import csv
 
             # read csv file
-            with open(output_file) as f:
-                reader = csv.reader(f)
-                csv_header = next(reader)
-                csv_data = list(reader)
+            try:
+                with open(output_file) as f:
+                    reader = csv.reader(f)
+                    csv_header = next(reader)
+                    csv_data = list(reader)
+            except (OSError, csv.Error, StopIteration) as exc:
+                logger.exception("Failed to load CSV output file: %s", output_file)
+                slicer.util.errorDisplay(f"Failed to load CSV output file:\n{output_file}\n\n{exc}")
+                return
 
             # create table
             self.logic.renderTableData(tableNode, csv_header, csv_data)
