@@ -283,6 +283,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Create logic class. Logic implements all computations that should be possible to run
         # in batch mode, without a graphical user interface.
         self.logic = MHubRunnerLogic()
+        settings = qt.QSettings()
 
         # Connections
 
@@ -323,7 +324,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
-        settings = qt.QSettings()
         saved_level = settings.value("MHubRunner/LogLevel", "INFO")
         if saved_level not in ["ERROR", "WARNING", "INFO", "DEBUG"]:
             saved_level = "INFO"
@@ -336,7 +336,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmbOutputHandling.clear()
             for label, value in self._OUTPUT_HANDLING_OPTIONS:
                 self.ui.cmbOutputHandling.addItem(label, value)
-            settings = qt.QSettings()
             saved_mode = settings.value("MHubRunner/OutputHandling", "load_import")
             index = self.ui.cmbOutputHandling.findData(saved_mode)
             if index < 0:
@@ -344,7 +343,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmbOutputHandling.setCurrentIndex(index)
             self.ui.cmbOutputHandling.connect('currentIndexChanged(int)', self.onOutputHandlingChanged)
         if hasattr(self.ui, "chkShowCompletionNotification"):
-            settings = qt.QSettings()
             show_notification = self._coerceBool(
                 settings.value("MHubRunner/ShowCompletionNotification", True),
                 default=True,
@@ -352,7 +350,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.chkShowCompletionNotification.checked = show_notification
             self.ui.chkShowCompletionNotification.connect('toggled(bool)', self.onShowCompletionNotificationChanged)
         if hasattr(self.ui, "chkOpenOutputPanelOnComplete"):
-            settings = qt.QSettings()
             open_panel = self._coerceBool(
                 settings.value("MHubRunner/OpenOutputPanelOnComplete", True),
                 default=True,
@@ -360,7 +357,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.chkOpenOutputPanelOnComplete.checked = open_panel
             self.ui.chkOpenOutputPanelOnComplete.connect('toggled(bool)', self.onOpenOutputPanelOnCompleteChanged)
         if hasattr(self.ui, "chkOpenRunFolderOnComplete"):
-            settings = qt.QSettings()
             open_run_folder = self._coerceBool(
                 settings.value("MHubRunner/OpenRunFolderOnComplete", False),
                 default=False,
@@ -388,7 +384,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
 
         # executable paths
-        settings = qt.QSettings()
         docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
         self._syncDockerExecutablePath(docker_exec)
         if docker_exec:
