@@ -3252,12 +3252,15 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 categoryContextName = "Segmentation category and type - DICOM master list"
 
             anatomicContextName = display_name
-            try:
+            if hasattr(terminologiesLogic, "LoadRegionContextFromSegmentDescriptorFile"):
                 if not terminologiesLogic.LoadRegionContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
                     anatomicContextName = "Anatomic codes - DICOM master list"
-            except AttributeError:
+            elif hasattr(terminologiesLogic, "LoadAnatomicContextFromSegmentDescriptorFile"):
                 if not terminologiesLogic.LoadAnatomicContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
                     anatomicContextName = "Anatomic codes - DICOM master list"
+            else:
+                logger.warning("Terminology context loader not available; using default context.")
+                anatomicContextName = "Anatomic codes - DICOM master list"
 
             segmentLabelNodes = []
             for segmentationId, segmentAttributes in enumerate(data.get("segmentAttributes", [])):
