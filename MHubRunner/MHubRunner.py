@@ -266,6 +266,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         self._loadSettingsUi()
+        self._setupSettingsSectionCollapse()
 
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
@@ -329,6 +330,43 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmbLogLevel.setCurrentText(saved_level)
         self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
         self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
+
+        # output behavior settings
+        if hasattr(self.ui, "cmbOutputHandling"):
+            self.ui.cmbOutputHandling.clear()
+            for label, value in self._OUTPUT_HANDLING_OPTIONS:
+                self.ui.cmbOutputHandling.addItem(label, value)
+            settings = qt.QSettings()
+            saved_mode = settings.value("MHubRunner/OutputHandling", "load_import")
+            index = self.ui.cmbOutputHandling.findData(saved_mode)
+            if index < 0:
+                index = 0
+            self.ui.cmbOutputHandling.setCurrentIndex(index)
+            self.ui.cmbOutputHandling.connect('currentIndexChanged(int)', self.onOutputHandlingChanged)
+        if hasattr(self.ui, "chkShowCompletionNotification"):
+            settings = qt.QSettings()
+            show_notification = self._coerceBool(
+                settings.value("MHubRunner/ShowCompletionNotification", True),
+                default=True,
+            )
+            self.ui.chkShowCompletionNotification.checked = show_notification
+            self.ui.chkShowCompletionNotification.connect('toggled(bool)', self.onShowCompletionNotificationChanged)
+        if hasattr(self.ui, "chkOpenOutputPanelOnComplete"):
+            settings = qt.QSettings()
+            open_panel = self._coerceBool(
+                settings.value("MHubRunner/OpenOutputPanelOnComplete", True),
+                default=True,
+            )
+            self.ui.chkOpenOutputPanelOnComplete.checked = open_panel
+            self.ui.chkOpenOutputPanelOnComplete.connect('toggled(bool)', self.onOpenOutputPanelOnCompleteChanged)
+        if hasattr(self.ui, "chkOpenRunFolderOnComplete"):
+            settings = qt.QSettings()
+            open_run_folder = self._coerceBool(
+                settings.value("MHubRunner/OpenRunFolderOnComplete", False),
+                default=False,
+            )
+            self.ui.chkOpenRunFolderOnComplete.checked = open_run_folder
+            self.ui.chkOpenRunFolderOnComplete.connect('toggled(bool)', self.onOpenRunFolderOnCompleteChanged)
 
         # model search
         self._modelSearchDebouncer = Debouncer(200, self._applyModelSearch, parent=uiWidget)
@@ -716,6 +754,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     _ICON_DISABLED_OPACITY = 0.2
     _ICON_TEXT_PREFIX = " "
+    _OUTPUT_HANDLING_OPTIONS = (
+        ("Load and import (DICOMSEG)", "load_import"),
+        ("Load only", "load_only"),
+        ("Import only (DICOMSEG)", "import_only"),
+        ("Do nothing", "none"),
+    )
 
     def _withIconLabel(self, text: str) -> str:
         if not text:
@@ -816,12 +860,35 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             setattr(self.ui, root_name, settings_widget)
         self._settingsWidget = settings_widget
 
+    def _setupSettingsSectionCollapse(self) -> None:
+        if getattr(self, "_settingsSectionSignalsWired", False):
+            return
+        self._settingsSectionSignalsWired = True
+        for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            widget.connect(
+                "toggled(bool)",
+                lambda checked, w=widget: self._closeOtherSettingsSections(w, checked),
+            )
+
+    def _closeOtherSettingsSections(self, opened_widget, _opened: bool) -> None:
+        if opened_widget is None or opened_widget.collapsed:
+            return
+        for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+            widget = getattr(self.ui, name, None)
+            if widget is None or widget is opened_widget:
+                continue
+            widget.collapsed = True
+
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
-        # for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
-        #     widget = getattr(self.ui, attr, None)
+        self._setupSettingsSectionCollapse()
+        # for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+        #     widget = getattr(self.ui, name, None)
         #     if widget is not None:
-        #         widget.collapsed = False
+        #         widget.collapsed = True
         if self._settingsDialog is None:
             self._closeStaleSettingsDialogs()
             dialog = qt.QDialog(slicer.util.mainWindow())
@@ -874,6 +941,70 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         settings = qt.QSettings()
         settings.setValue("MHubRunner/LogLevel", level_name)
         self.updateSettingsSummary()
+
+    def _coerceBool(self, value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def onOutputHandlingChanged(self, index: int) -> None:
+        if not hasattr(self.ui, "cmbOutputHandling"):
+            return
+        value = self.ui.cmbOutputHandling.itemData(index)
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OutputHandling", value or "load_import")
+
+    def onShowCompletionNotificationChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/ShowCompletionNotification", bool(checked))
+
+    def onOpenOutputPanelOnCompleteChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OpenOutputPanelOnComplete", bool(checked))
+
+    def onOpenRunFolderOnCompleteChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OpenRunFolderOnComplete", bool(checked))
+
+    def _getOutputHandlingMode(self) -> str:
+        value = None
+        if hasattr(self.ui, "cmbOutputHandling"):
+            index = self.ui.cmbOutputHandling.currentIndex
+            value = self.ui.cmbOutputHandling.itemData(index)
+        if value is None:
+            settings = qt.QSettings()
+            value = settings.value("MHubRunner/OutputHandling", "load_import")
+        value = str(value) if value is not None else "load_import"
+        if value not in {"load_import", "load_only", "import_only", "none"}:
+            return "load_import"
+        return value
+
+    def _getShowCompletionNotification(self) -> bool:
+        if hasattr(self.ui, "chkShowCompletionNotification"):
+            return bool(self.ui.chkShowCompletionNotification.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/ShowCompletionNotification", True), default=True)
+
+    def _getOpenOutputPanelOnComplete(self) -> bool:
+        if hasattr(self.ui, "chkOpenOutputPanelOnComplete"):
+            return bool(self.ui.chkOpenOutputPanelOnComplete.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/OpenOutputPanelOnComplete", True), default=True)
+
+    def _getOpenRunFolderOnComplete(self) -> bool:
+        if hasattr(self.ui, "chkOpenRunFolderOnComplete"):
+            return bool(self.ui.chkOpenRunFolderOnComplete.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/OpenRunFolderOnComplete", False), default=False)
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
@@ -1626,10 +1757,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updateOpenOutputFileButton()
 
     def onOpenOutputFile(self) -> None:
-        assert self.logic is not None
         output_file = self._getSelectedOutputFile()
         if not output_file or not self._isSupportedOutputFile(output_file):
             return
+        self._loadOutputFile(output_file)
+
+    def _loadOutputFile(self, output_file: str) -> None:
+        assert self.logic is not None
         logger.debug("Opening output file: %s", output_file)
 
         # create table node
@@ -1692,6 +1826,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         elif output_file.endswith(".seg.dcm"):
             self.logic.importSegmentations([output_file])
+
+    def _loadTabularOutputsFromRun(self, output_dir: str) -> None:
+        assert self.logic is not None
+        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv"])
+        if not output_files:
+            return
+        json_files = [path for path in output_files if path.endswith(".json")]
+        csv_files = [path for path in output_files if path.endswith(".csv")]
+        selected = json_files[0] if json_files else csv_files[0]
+        self._loadOutputFile(selected)
+
+    def _openOutputFolder(self, output_dir: str) -> None:
+        if not output_dir:
+            return
+        url = qt.QUrl.fromLocalFile(output_dir)
+        qt.QDesktopServices.openUrl(url)
 
     def _getSelectedOutputFile(self) -> str | None:
         selected = self.ui.lstOutputFiles.currentItem()
@@ -1849,28 +1999,38 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
                 # ---------------------- process model results
 
+                output_handling = self._getOutputHandlingMode()
                 if 'Segmentation' in model.categories:
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    if input_is_dicom:
+                    if output_handling in ("load_import", "import_only") and input_is_dicom:
                         self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-                    self.logic.importSegmentations(dsegfiles)
+                    if output_handling in ("load_import", "load_only"):
+                        self.logic.importSegmentations(dsegfiles)
 
-                if 'Prediction' in model.categories:
-                    self.updateOutputRunDirectories(open_latest=True)
+                if output_handling in ("load_import", "load_only"):
+                    self._loadTabularOutputsFromRun(output_dir)
+
+                open_panel = self._getOpenOutputPanelOnComplete()
+                self.updateOutputRunDirectories(open_latest=open_panel)
+                if open_panel:
                     self.ui.outputCollapsibleButton.collapsed = False
+
+                if self._getOpenRunFolderOnComplete():
+                    self._openOutputFolder(output_dir)
 
                 # ---------------------- Message Box
 
-                msg = qt.QMessageBox()
-                msg.setIcon(qt.QMessageBox.Information if returncode == 0 else qt.QMessageBox.Warning)
-                msg.setWindowTitle(f"Terminated {model.label}")
-                text = f"Running {model.label} (mhubai/{model.name}:latest) finished with return code {returncode}."
-                text += "\nProcess timed out." if timedout else ""
-                text += "\nProcess was killed." if killed else ""
-                msg.setText(text)
-                msg.setDetailedText(stdout)
-                msg.addButton(qt.QMessageBox.Ok)
-                msg.exec()
+                if self._getShowCompletionNotification():
+                    msg = qt.QMessageBox()
+                    msg.setIcon(qt.QMessageBox.Information if returncode == 0 else qt.QMessageBox.Warning)
+                    msg.setWindowTitle(f"Terminated {model.label}")
+                    text = f"Running {model.label} (mhubai/{model.name}:latest) finished with return code {returncode}."
+                    text += "\nProcess timed out." if timedout else ""
+                    text += "\nProcess was killed." if killed else ""
+                    msg.setText(text)
+                    msg.setDetailedText(stdout)
+                    msg.addButton(qt.QMessageBox.Ok)
+                    msg.exec()
 
                 # ---------------------- Update UI
 
