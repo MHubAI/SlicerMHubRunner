@@ -266,6 +266,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.layout.addWidget(uiWidget)
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         self._loadSettingsUi()
+        self._setupSettingsSectionCollapse()
 
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
@@ -282,6 +283,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Create logic class. Logic implements all computations that should be possible to run
         # in batch mode, without a graphical user interface.
         self.logic = MHubRunnerLogic()
+        settings = qt.QSettings()
 
         # Connections
 
@@ -294,7 +296,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cancelButton.connect('clicked(bool)', self.onCancelButton)
         self.ui.cmdKillObservedProcesses.connect('clicked(bool)', self.onKillObservedProcessesButton)
         self.ui.cmdBackendReload.connect('clicked(bool)', self.onDockerUpdate)
-        # self.ui.cmdTest.connect('clicked(bool)', self.importSegmentations)
+        # self.ui.cmdTest.connect('clicked(bool)', self.loadSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
         self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
@@ -322,13 +324,45 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
-        settings = qt.QSettings()
         saved_level = settings.value("MHubRunner/LogLevel", "INFO")
         if saved_level not in ["ERROR", "WARNING", "INFO", "DEBUG"]:
             saved_level = "INFO"
         self.ui.cmbLogLevel.setCurrentText(saved_level)
         self.ui.cmbLogLevel.connect('currentTextChanged(QString)', self.onLogLevelChanged)
         self.onLogLevelChanged(self.ui.cmbLogLevel.currentText)
+
+        # output behavior settings
+        if hasattr(self.ui, "cmbOutputHandling"):
+            self.ui.cmbOutputHandling.clear()
+            for label, value in self._OUTPUT_HANDLING_OPTIONS:
+                self.ui.cmbOutputHandling.addItem(label, value)
+            saved_mode = settings.value("MHubRunner/OutputHandling", "load_import")
+            index = self.ui.cmbOutputHandling.findData(saved_mode)
+            if index < 0:
+                index = 0
+            self.ui.cmbOutputHandling.setCurrentIndex(index)
+            self.ui.cmbOutputHandling.connect('currentIndexChanged(int)', self.onOutputHandlingChanged)
+        if hasattr(self.ui, "chkShowCompletionNotification"):
+            show_notification = self._coerceBool(
+                settings.value("MHubRunner/ShowCompletionNotification", True),
+                default=True,
+            )
+            self.ui.chkShowCompletionNotification.checked = show_notification
+            self.ui.chkShowCompletionNotification.connect('toggled(bool)', self.onShowCompletionNotificationChanged)
+        if hasattr(self.ui, "chkOpenOutputPanelOnComplete"):
+            open_panel = self._coerceBool(
+                settings.value("MHubRunner/OpenOutputPanelOnComplete", True),
+                default=True,
+            )
+            self.ui.chkOpenOutputPanelOnComplete.checked = open_panel
+            self.ui.chkOpenOutputPanelOnComplete.connect('toggled(bool)', self.onOpenOutputPanelOnCompleteChanged)
+        if hasattr(self.ui, "chkOpenRunFolderOnComplete"):
+            open_run_folder = self._coerceBool(
+                settings.value("MHubRunner/OpenRunFolderOnComplete", False),
+                default=False,
+            )
+            self.ui.chkOpenRunFolderOnComplete.checked = open_run_folder
+            self.ui.chkOpenRunFolderOnComplete.connect('toggled(bool)', self.onOpenRunFolderOnCompleteChanged)
 
         # model search
         self._modelSearchDebouncer = Debouncer(200, self._applyModelSearch, parent=uiWidget)
@@ -350,7 +384,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
 
         # executable paths
-        settings = qt.QSettings()
         docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
         self._syncDockerExecutablePath(docker_exec)
         if docker_exec:
@@ -716,6 +749,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     _ICON_DISABLED_OPACITY = 0.2
     _ICON_TEXT_PREFIX = " "
+    _SETTINGS_SECTION_WIDGET_NAMES = (
+        "ctkCollapsibleButton",
+        "CollapsibleButton",
+        "advancedCollapsibleButton",
+        "logCollapsibleButton",
+    )
+    _OUTPUT_HANDLING_OPTIONS = (
+        ("Load and import (DICOMSEG)", "load_import"),
+        ("Load only", "load_only"),
+        ("Import only (DICOMSEG)", "import_only"),
+        ("Do nothing", "none"),
+    )
 
     def _withIconLabel(self, text: str) -> str:
         if not text:
@@ -816,12 +861,35 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             setattr(self.ui, root_name, settings_widget)
         self._settingsWidget = settings_widget
 
+    def _setupSettingsSectionCollapse(self) -> None:
+        if getattr(self, "_settingsSectionSignalsWired", False):
+            return
+        self._settingsSectionSignalsWired = True
+        for name in self._SETTINGS_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            widget.connect(
+                "toggled(bool)",
+                lambda _, w=widget: self._closeOtherSettingsSections(w),
+            )
+
+    def _closeOtherSettingsSections(self, opened_widget) -> None:
+        if opened_widget is None or opened_widget.collapsed:
+            return
+        for name in self._SETTINGS_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None or widget is opened_widget:
+                continue
+            widget.collapsed = True
+
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
-        # for attr in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton"):
-        #     widget = getattr(self.ui, attr, None)
+        self._setupSettingsSectionCollapse()
+        # for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
+        #     widget = getattr(self.ui, name, None)
         #     if widget is not None:
-        #         widget.collapsed = False
+        #         widget.collapsed = True
         if self._settingsDialog is None:
             self._closeStaleSettingsDialogs()
             dialog = qt.QDialog(slicer.util.mainWindow())
@@ -874,6 +942,70 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         settings = qt.QSettings()
         settings.setValue("MHubRunner/LogLevel", level_name)
         self.updateSettingsSummary()
+
+    def _coerceBool(self, value, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+        return default
+
+    def onOutputHandlingChanged(self, index: int) -> None:
+        if not hasattr(self.ui, "cmbOutputHandling"):
+            return
+        value = self.ui.cmbOutputHandling.itemData(index)
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OutputHandling", value or "load_import")
+
+    def onShowCompletionNotificationChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/ShowCompletionNotification", bool(checked))
+
+    def onOpenOutputPanelOnCompleteChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OpenOutputPanelOnComplete", bool(checked))
+
+    def onOpenRunFolderOnCompleteChanged(self, checked: bool) -> None:
+        settings = qt.QSettings()
+        settings.setValue("MHubRunner/OpenRunFolderOnComplete", bool(checked))
+
+    def _getOutputHandlingMode(self) -> str:
+        value = None
+        if hasattr(self.ui, "cmbOutputHandling"):
+            index = self.ui.cmbOutputHandling.currentIndex
+            value = self.ui.cmbOutputHandling.itemData(index)
+        if value is None:
+            settings = qt.QSettings()
+            value = settings.value("MHubRunner/OutputHandling", "load_import")
+        value = str(value)
+        if value not in {"load_import", "load_only", "import_only", "none"}:
+            return "load_import"
+        return value
+
+    def _getShowCompletionNotification(self) -> bool:
+        if hasattr(self.ui, "chkShowCompletionNotification"):
+            return bool(self.ui.chkShowCompletionNotification.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/ShowCompletionNotification", True), default=True)
+
+    def _getOpenOutputPanelOnComplete(self) -> bool:
+        if hasattr(self.ui, "chkOpenOutputPanelOnComplete"):
+            return bool(self.ui.chkOpenOutputPanelOnComplete.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/OpenOutputPanelOnComplete", True), default=True)
+
+    def _getOpenRunFolderOnComplete(self) -> bool:
+        if hasattr(self.ui, "chkOpenRunFolderOnComplete"):
+            return bool(self.ui.chkOpenRunFolderOnComplete.checked)
+        settings = qt.QSettings()
+        return self._coerceBool(settings.value("MHubRunner/OpenRunFolderOnComplete", False), default=False)
 
     def _checkCanApply(self, caller=None, event=None) -> None:
 
@@ -1626,10 +1758,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updateOpenOutputFileButton()
 
     def onOpenOutputFile(self) -> None:
-        assert self.logic is not None
         output_file = self._getSelectedOutputFile()
         if not output_file or not self._isSupportedOutputFile(output_file):
             return
+        self._loadOutputFile(output_file)
+
+    def _loadOutputFile(self, output_file: str) -> None:
+        assert self.logic is not None
         logger.debug("Opening output file: %s", output_file)
 
         # create table node
@@ -1649,8 +1784,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             import json
 
             # read json file
-            with open(output_file) as f:
-                data = json.load(f)
+            try:
+                with open(output_file) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.exception("Failed to load JSON output file: %s", output_file)
+                slicer.util.errorDisplay(f"Failed to load JSON output file:\n{output_file}\n\n{exc}")
+                return
 
             # flatten nested json into dot-notation keys (array items in square brackets)
             def flatten_json(y):
@@ -1682,16 +1822,41 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             import csv
 
             # read csv file
-            with open(output_file) as f:
-                reader = csv.reader(f)
-                csv_header = next(reader)
-                csv_data = list(reader)
+            try:
+                with open(output_file) as f:
+                    reader = csv.reader(f)
+                    csv_header = next(reader)
+                    csv_data = list(reader)
+            except (OSError, csv.Error, StopIteration) as exc:
+                logger.exception("Failed to load CSV output file: %s", output_file)
+                slicer.util.errorDisplay(f"Failed to load CSV output file:\n{output_file}\n\n{exc}")
+                return
 
             # create table
             self.logic.renderTableData(tableNode, csv_header, csv_data)
 
         elif output_file.endswith(".seg.dcm"):
-            self.logic.importSegmentations([output_file])
+            self.logic.loadSegmentations([output_file])
+
+    def _loadTabularOutputsFromRun(self, output_dir: str) -> None:
+        assert self.logic is not None
+        output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv"])
+        if not output_files:
+            return
+        json_files = [path for path in output_files if path.endswith(".json")]
+        csv_files = [path for path in output_files if path.endswith(".csv")]
+        selected = json_files[0] if json_files else csv_files[0]
+        logger.info("Loading tabular output file: %s", selected)
+        try:
+            self._loadOutputFile(selected)
+        except Exception:
+            logger.exception("Failed to load tabular output file: %s", selected)
+
+    def _openOutputFolder(self, output_dir: str) -> None:
+        if not output_dir:
+            return
+        url = qt.QUrl.fromLocalFile(output_dir)
+        qt.QDesktopServices.openUrl(url)
 
     def _getSelectedOutputFile(self) -> str | None:
         selected = self.ui.lstOutputFiles.currentItem()
@@ -1753,7 +1918,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # local_dir = "/Users/lenny/Projects/SlicerMHubIntegration/SlicerMHubRunner/return_data"
         # dsegfiles = self.logic.scanDirectoryForFilesWithExtension(local_dir)
         # self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-        # self.logic.importSegmentations(dsegfiles)
+        # self.logic.loadSegmentations(dsegfiles)
         # return
 
         ###### TEST (works)
@@ -1849,28 +2014,38 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
                 # ---------------------- process model results
 
+                output_handling = self._getOutputHandlingMode()
                 if 'Segmentation' in model.categories:
                     dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    if input_is_dicom:
+                    if output_handling in ("load_import", "import_only") and input_is_dicom:
                         self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-                    self.logic.importSegmentations(dsegfiles)
+                    if output_handling in ("load_import", "load_only"):
+                        self.logic.loadSegmentations(dsegfiles)
 
-                if 'Prediction' in model.categories:
-                    self.updateOutputRunDirectories(open_latest=True)
+                if output_handling in ("load_import", "load_only"):
+                    self._loadTabularOutputsFromRun(output_dir)
+
+                open_panel = self._getOpenOutputPanelOnComplete()
+                self.updateOutputRunDirectories(open_latest=open_panel)
+                if open_panel:
                     self.ui.outputCollapsibleButton.collapsed = False
+
+                if self._getOpenRunFolderOnComplete():
+                    self._openOutputFolder(output_dir)
 
                 # ---------------------- Message Box
 
-                msg = qt.QMessageBox()
-                msg.setIcon(qt.QMessageBox.Information if returncode == 0 else qt.QMessageBox.Warning)
-                msg.setWindowTitle(f"Terminated {model.label}")
-                text = f"Running {model.label} (mhubai/{model.name}:latest) finished with return code {returncode}."
-                text += "\nProcess timed out." if timedout else ""
-                text += "\nProcess was killed." if killed else ""
-                msg.setText(text)
-                msg.setDetailedText(stdout)
-                msg.addButton(qt.QMessageBox.Ok)
-                msg.exec()
+                if self._getShowCompletionNotification():
+                    msg = qt.QMessageBox()
+                    msg.setIcon(qt.QMessageBox.Information if returncode == 0 else qt.QMessageBox.Warning)
+                    msg.setWindowTitle(f"Terminated {model.label}")
+                    text = f"Running {model.label} (mhubai/{model.name}:latest) finished with return code {returncode}."
+                    text += "\nProcess timed out." if timedout else ""
+                    text += "\nProcess was killed." if killed else ""
+                    msg.setText(text)
+                    msg.setDetailedText(stdout)
+                    msg.addButton(qt.QMessageBox.Ok)
+                    msg.exec()
 
                 # ---------------------- Update UI
 
@@ -2990,7 +3165,19 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             for file in files:
                 os.remove(file)
 
-    def importSegmentations(self, files: list[str]):
+    def loadSegmentations(self, files: list[str]):
+        loaded_any, loaded_paths = self._load_segmentation_from_database(files)
+        for file in files:
+            if os.path.abspath(file) in loaded_paths:
+                continue
+            logger.debug("Loading segmentation without database: %s", file)
+            if self._load_segmentation_manually(file):
+                loaded_any = True
+
+        if not loaded_any:
+            logger.warning("No segmentations loaded for files: %s", files)
+
+    def _load_segmentation_from_database(self, files: list[str]) -> tuple[bool, set[str]]:
         import DICOMSegmentationPlugin
 
         # create importer
@@ -3003,16 +3190,153 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
         # import files
         loaded_any = False
+        loaded_paths: set[str] = set()
         for loadable in loadables:
             if importer.load(loadable):
                 loaded_any = True
+                if loadable.files:
+                    loaded_paths.add(os.path.abspath(loadable.files[0]))
+        if loaded_paths:
+            logger.debug("Loaded segmentations from database: %s", sorted(loaded_paths))
+        return loaded_any, loaded_paths
 
-        if not loaded_any:
-            logger.warning("No segmentations loaded for files: %s", files)
+    def _load_segmentation_manually(self, seg_file: str) -> bool:
+        import DICOMSegmentationPlugin
+        import glob
+        import json
+        import shutil
+        import types
+
+        if not os.path.exists(seg_file):
+            logger.error("Segmentation file not found: %s", seg_file)
+            return False
+
+        try:
+            segimage2itkimage = slicer.modules.segimage2itkimage
+        except AttributeError:
+            logger.error("segimage2itkimage CLI module is not available; cannot load %s", seg_file)
+            return False
+
+        importer = DICOMSegmentationPlugin.DICOMSegmentationPluginClass()
+
+        temp_dir = slicer.util.tempDirectory()
+        try:
+            parameters = {
+                "inputSEGFileName": seg_file,
+                "outputDirName": temp_dir,
+                "mergeSegments": True,
+            }
+            cliNode = slicer.cli.run(segimage2itkimage, None, parameters, wait_for_completion=True)
+            if cliNode.GetStatusString() != "Completed":
+                logger.error("SEG2NRRD did not complete successfully for %s", seg_file)
+                return False
+
+            metaFileName = os.path.join(temp_dir, "meta.json")
+            if not os.path.exists(metaFileName):
+                logger.error("Missing meta.json for DICOM SEG: %s", seg_file)
+                return False
+
+            with open(metaFileName) as metaFile:
+                data = json.load(metaFile)
+
+            numberOfSegmentations = len(glob.glob(os.path.join(temp_dir, "*.nrrd")))
+            if numberOfSegmentations != len(data.get("segmentAttributes", [])):
+                logger.error("Loading failed for %s: inconsistent segment count", seg_file)
+                return False
+
+            terminologiesLogic = slicer.modules.terminologies.logic()
+            display_name = os.path.splitext(os.path.basename(seg_file))[0]
+
+            categoryContextName = display_name
+            if not terminologiesLogic.LoadTerminologyFromSegmentDescriptorFile(categoryContextName, metaFileName):
+                categoryContextName = "Segmentation category and type - DICOM master list"
+
+            anatomicContextName = display_name
+            if hasattr(terminologiesLogic, "LoadRegionContextFromSegmentDescriptorFile"):
+                if not terminologiesLogic.LoadRegionContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
+                    anatomicContextName = "Anatomic codes - DICOM master list"
+            elif hasattr(terminologiesLogic, "LoadAnatomicContextFromSegmentDescriptorFile"):
+                if not terminologiesLogic.LoadAnatomicContextFromSegmentDescriptorFile(anatomicContextName, metaFileName):
+                    anatomicContextName = "Anatomic codes - DICOM master list"
+            else:
+                logger.warning("Terminology context loader not available; using default context.")
+                anatomicContextName = "Anatomic codes - DICOM master list"
+
+            segmentLabelNodes = []
+            for segmentationId, segmentAttributes in enumerate(data.get("segmentAttributes", [])):
+                labelFileName = os.path.join(temp_dir, f"{segmentationId + 1}.nrrd")
+                labelNode = slicer.util.loadLabelVolume(labelFileName, {"singleFile": True})
+                if not labelNode:
+                    logger.error("Failed to load label volume: %s", labelFileName)
+                    return False
+                labelNode.labelAttributes = []
+
+                for segment in segmentAttributes:
+                    rgb255 = segment.get("recommendedDisplayRGBValue")
+                    if rgb255:
+                        rgb = [float(c) / 255.0 for c in rgb255]
+                    else:
+                        rgb = (150.0, 150.0, 0.0)
+
+                    categoryCode, categoryCodingScheme, categoryCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyCategoryCodeSequence")
+                    typeCode, typeCodingScheme, typeCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeCodeSequence")
+                    typeModCode, typeModCodingScheme, typeModCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "SegmentedPropertyTypeModifierCodeSequence")
+                    regionCode, regionCodingScheme, regionCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "AnatomicRegionSequence")
+                    regionModCode, regionModCodingScheme, regionModCodeMeaning = \
+                        importer.getValuesFromCodeSequence(segment, "AnatomicRegionModifierSequence")
+
+                    segmentTerminologyTag = terminologiesLogic.SerializeTerminologyEntry(
+                        categoryContextName,
+                        categoryCode, categoryCodingScheme, categoryCodeMeaning,
+                        typeCode, typeCodingScheme, typeCodeMeaning,
+                        typeModCode, typeModCodingScheme, typeModCodeMeaning,
+                        anatomicContextName,
+                        regionCode, regionCodingScheme, regionCodeMeaning,
+                        regionModCode, regionModCodingScheme, regionModCodeMeaning,
+                    )
+
+                    if segment.get("SegmentLabel"):
+                        segmentName = segment["SegmentLabel"]
+                        segmentNameAutoGenerated = False
+                    elif segment.get("SegmentDescription"):
+                        segmentName = segment["SegmentDescription"]
+                        segmentNameAutoGenerated = False
+                    else:
+                        segmentName = typeCodeMeaning
+                        segmentNameAutoGenerated = True
+
+                    labelAttributes = {}
+                    labelAttributes["Name"] = segmentName
+                    labelAttributes["NameAutoGenerated"] = segmentNameAutoGenerated
+                    labelAttributes["Description"] = segment.get("SegmentDescription")
+                    labelAttributes["Terminology"] = segmentTerminologyTag
+                    labelAttributes["ColorR"] = rgb[0]
+                    labelAttributes["ColorG"] = rgb[1]
+                    labelAttributes["ColorB"] = rgb[2]
+                    labelAttributes["DICOM.SegmentAlgorithmType"] = segment.get("SegmentAlgorithmType")
+                    labelAttributes["DICOM.SegmentAlgorithmName"] = segment.get("SegmentAlgorithmName")
+
+                    labelNode.labelAttributes.append(labelAttributes)
+
+                segmentLabelNodes.append(labelNode)
+
+            loadable = types.SimpleNamespace(name=display_name)
+            segmentationNode = importer._initializeSegmentation(loadable)
+
+            for labelNode in segmentLabelNodes:
+                importer._importSegmentAndRemoveLabel(labelNode, segmentationNode)
+
+            return True
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
     def openSegmentation(self, files: list[str]):
-        self.importSegmentations(files)
+        self.loadSegmentations(files)
 
 #
 # MHubRunnerTest
