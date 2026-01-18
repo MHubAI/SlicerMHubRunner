@@ -1847,7 +1847,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         csv_files = [path for path in output_files if path.endswith(".csv")]
         selected = json_files[0] if json_files else csv_files[0]
         logger.info("Loading tabular output file: %s", selected)
-        self._loadOutputFile(selected)
+        try:
+            self._loadOutputFile(selected)
+        except Exception:
+            logger.exception("Failed to load tabular output file: %s", selected)
 
     def _openOutputFolder(self, output_dir: str) -> None:
         if not output_dir:
