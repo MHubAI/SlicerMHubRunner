@@ -865,10 +865,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 continue
             widget.connect(
                 "toggled(bool)",
-                lambda checked, w=widget: self._closeOtherSettingsSections(w, checked),
+                lambda _, w=widget: self._closeOtherSettingsSections(w),
             )
 
-    def _closeOtherSettingsSections(self, opened_widget, _opened: bool) -> None:
+    def _closeOtherSettingsSections(self, opened_widget) -> None:
         if opened_widget is None or opened_widget.collapsed:
             return
         for name in ("ctkCollapsibleButton", "CollapsibleButton", "advancedCollapsibleButton", "logCollapsibleButton"):
