@@ -8,6 +8,7 @@ from typing import Annotated, Any, Optional, List, Literal, Dict, Union
 from collections.abc import Callable
 from dataclasses import dataclass
 import tempfile
+import uuid
 from enum import Enum
 import re
 
@@ -28,6 +29,7 @@ import hashlib
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+_RUN_SESSION_ID = uuid.uuid4().hex
 
 class Debouncer(qt.QObject):
     def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
@@ -1739,6 +1741,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # get output files
         output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv", ".seg.dcm"])
+        output_files = [
+            path for path in output_files
+            if os.path.basename(path) != "mhubrunner-run.json"
+        ]
 
         # clear output list
         self.ui.lstOutputFiles.clear()
@@ -1758,10 +1764,28 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updateOpenOutputFileButton()
 
     def onOpenOutputFile(self) -> None:
+        assert self.logic is not None
         output_file = self._getSelectedOutputFile()
         if not output_file or not self._isSupportedOutputFile(output_file):
             return
-        self._loadOutputFile(output_file)
+        output_dir = self._getSelectedOutputDirectory()
+        try:
+            result = self.logic.loadStoredRun(
+                output_dir=output_dir,
+                selected_input_node=self.ui.inputSelector.currentNode(),
+            )
+        except Exception as exc:
+            logger.exception("Failed to load stored run: %s", output_dir)
+            slicer.util.errorDisplay(
+                f"Failed to load stored run:\n{output_dir}\n\n{exc}"
+            )
+            return
+        if result is None:
+            self._loadOutputFile(output_file)
+            return
+        annotation_warning = result.get("annotationWarning")
+        if annotation_warning:
+            slicer.util.warningDisplay(annotation_warning)
 
     def _loadOutputFile(self, output_file: str) -> None:
         assert self.logic is not None
@@ -1865,6 +1889,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         output_file = selected.data(qt.Qt.UserRole)
         return output_file or None
 
+    def _getSelectedOutputDirectory(self) -> str:
+        runs_dir = self.ui.pthRunsDirectory.currentPath
+        selected_run = self.ui.cmbSelectRunOutput.currentText
+        return os.path.join(runs_dir, selected_run)
+
     def _isSupportedOutputFile(self, output_file: str) -> bool:
         return output_file.endswith((".json", ".csv", ".seg.dcm"))
 
@@ -1929,6 +1958,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         #         print(item.text())
         # return
 
+        assert self.logic is not None
+
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
@@ -1940,13 +1971,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
         input_is_dicom = bool(instanceUIDs)
 
-        # create hash from instanceUIDs if available
-        if instanceUIDs:
-            hash = hashlib.sha256()
-            hash.update(instanceUIDs.encode('utf-8'))
-            instance_idh = hash.hexdigest()
-        else:
-            instance_idh = "non-dicom"
+        # create a stable hash from instance UIDs if available
+        instance_idh = self.logic.dicomInstanceUIDHash(node) if instanceUIDs else "non-dicom"
+        if not instanceUIDs:
             logger.debug("No DICOM instanceUIDs for node: %s", node.GetName() if node else None)
 
         # get selected model
@@ -1970,6 +1997,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             input_dir = os.path.join(tmp_dir, "input")
             output_dir = os.path.join(runs_dir, runid)
+            model_output_dir = os.path.join(output_dir, "outputs")
 
             # if input dir exists, remove it -> we always make sure to run on a fresh input dir (NOTE: parallel execution ofc wouldn't work like this)
             if os.path.exists(input_dir):
@@ -1978,6 +2006,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # create temp dir with input and output dir
             os.makedirs(input_dir, exist_ok=True)
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(model_output_dir, exist_ok=True)
+
+            self.logic.createRunManifest(
+                run_id=runid,
+                model=model,
+                input_node=node,
+                output_dir=output_dir,
+            )
 
             # get selected gpus
             # TODO: make gpus None
@@ -2014,6 +2050,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 assert self.logic is not None
 
                 # ---------------------- process model results
+
+                try:
+                    self.logic.finalizeRunManifest(
+                        output_dir=output_dir,
+                        returncode=returncode,
+                        timedout=timedout,
+                        killed=killed,
+                    )
+                except Exception:
+                    logger.exception("Failed to finalize run manifest: %s", output_dir)
 
                 output_handling = self._getOutputHandlingMode()
                 if returncode == 0 and not timedout and not killed:
@@ -2063,7 +2109,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 model=model,
                 gpus=gpus,
                 input_dir=input_dir,
-                output_dir=output_dir,
+                output_dir=model_output_dir,
                 onProgress=onProgress,
                 onStop=onStop
             )
@@ -2894,6 +2940,261 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # open csv in yellow table view node
         self.showTable(tableNode)
 
+    @staticmethod
+    def dicomInstanceUIDHash(node) -> str | None:
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs") if node else None
+        if not instance_uids:
+            return None
+        canonical_uids = "\n".join(sorted(instance_uids.split()))
+        return hashlib.sha256(canonical_uids.encode("utf-8")).hexdigest()
+
+    def _seriesInstanceUIDForNode(self, node) -> str | None:
+        if node is None:
+            return None
+        try:
+            subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+                slicer.mrmlScene
+            )
+            item_id = subject_hierarchy.GetItemByDataNode(node)
+            series_uid = subject_hierarchy.GetItemUID(item_id, "DICOM") if item_id else None
+            if series_uid:
+                return series_uid
+        except Exception:
+            logger.debug("Could not read DICOM series UID from subject hierarchy", exc_info=True)
+
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs")
+        if not instance_uids or not getattr(slicer, "dicomDatabase", None):
+            return None
+        first_instance_uid = instance_uids.split()[0]
+        try:
+            return slicer.dicomDatabase.instanceValue(first_instance_uid, "0020,000E") or None
+        except Exception:
+            logger.debug("Could not read DICOM series UID from database", exc_info=True)
+            return None
+
+    @staticmethod
+    def _nodeGeometryForManifest(node) -> dict:
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode") or node.GetImageData() is None:
+            raise ValueError("Run manifests require a scalar volume with image data.")
+        matrix = vtk.vtkMatrix4x4()
+        node.GetIJKToRASMatrix(matrix)
+        return {
+            "dimensions": [int(value) for value in node.GetImageData().GetDimensions()],
+            "ijkToRAS": [
+                [float(matrix.GetElement(row, column)) for column in range(4)]
+                for row in range(4)
+            ],
+        }
+
+    def createRunManifest(self, run_id: str, model: Model, input_node, output_dir: str) -> dict:
+        from MHubRunnerModelHandlers.run_manifest import new_run_manifest, write_run_manifest
+
+        instance_uid_hash = self.dicomInstanceUIDHash(input_node)
+        manifest = new_run_manifest(
+            run_id=run_id,
+            model_name=model.name,
+            model_label=model.label,
+            model_categories=list(model.categories),
+            image_name=f"mhubai/{model.name}:latest",
+            slicer_session_id=_RUN_SESSION_ID,
+            input_data={
+                "nodeId": input_node.GetID() if input_node else "",
+                "wasDicom": bool(instance_uid_hash),
+                "dicomSeriesInstanceUID": self._seriesInstanceUIDForNode(input_node),
+                "dicomInstanceUIDHash": instance_uid_hash,
+                "geometry": self._nodeGeometryForManifest(input_node),
+            },
+        )
+        write_run_manifest(output_dir, manifest)
+        return manifest
+
+    @staticmethod
+    def _relativeRunOutputPaths(output_dir: str) -> list[str]:
+        from MHubRunnerModelHandlers.run_manifest import MANIFEST_FILENAME
+
+        output_paths = []
+        for root, _, filenames in os.walk(output_dir):
+            for filename in filenames:
+                if filename == MANIFEST_FILENAME or filename.startswith(".mhubrunner-run-"):
+                    continue
+                absolute_path = os.path.join(root, filename)
+                output_paths.append(os.path.relpath(absolute_path, output_dir))
+        return sorted(output_paths)
+
+    def finalizeRunManifest(
+        self,
+        output_dir: str,
+        returncode: int,
+        timedout: bool,
+        killed: bool,
+    ) -> dict:
+        from MHubRunnerModelHandlers.run_manifest import finalize_run_manifest
+
+        return finalize_run_manifest(
+            output_dir,
+            return_code=returncode,
+            timed_out=timedout,
+            killed=killed,
+            output_paths=self._relativeRunOutputPaths(output_dir),
+        )
+
+    @staticmethod
+    def _storedGeometryMatchesNode(node, geometry: dict, tolerance: float = 1e-3) -> bool:
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode") or node.GetImageData() is None:
+            return False
+        try:
+            dimensions = tuple(int(value) for value in geometry["dimensions"])
+            stored_matrix = geometry["ijkToRAS"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if tuple(node.GetImageData().GetDimensions()) != dimensions:
+            return False
+        actual_matrix = vtk.vtkMatrix4x4()
+        node.GetIJKToRASMatrix(actual_matrix)
+        for row in range(4):
+            for column in range(4):
+                if abs(float(stored_matrix[row][column]) - actual_matrix.GetElement(row, column)) > tolerance:
+                    return False
+        return True
+
+    def _storedInputMatchesNode(self, node, manifest: dict) -> bool:
+        input_data = manifest["input"]
+        if not self._storedGeometryMatchesNode(node, input_data["geometry"]):
+            return False
+
+        if input_data["wasDicom"]:
+            stored_series_uid = input_data.get("dicomSeriesInstanceUID")
+            stored_instance_hash = input_data.get("dicomInstanceUIDHash")
+            if stored_series_uid and self._seriesInstanceUIDForNode(node) != stored_series_uid:
+                return False
+            if stored_instance_hash and self.dicomInstanceUIDHash(node) != stored_instance_hash:
+                return False
+            return bool(stored_series_uid or stored_instance_hash)
+
+        return (
+            manifest.get("slicerSessionId") == _RUN_SESSION_ID
+            and node.GetID() == input_data.get("nodeId")
+        )
+
+    def _resolveStoredRunInput(self, manifest: dict, selected_input_node=None):
+        input_data = manifest["input"]
+        if manifest.get("slicerSessionId") == _RUN_SESSION_ID:
+            node_id = input_data.get("nodeId")
+            node = slicer.mrmlScene.GetNodeByID(node_id) if node_id else None
+            if self._storedInputMatchesNode(node, manifest):
+                return node
+
+        if selected_input_node is not None and self._storedInputMatchesNode(selected_input_node, manifest):
+            return selected_input_node
+
+        if input_data["wasDicom"]:
+            for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+                if self._storedInputMatchesNode(node, manifest):
+                    return node
+
+            series_uid = input_data.get("dicomSeriesInstanceUID")
+            database = getattr(slicer, "dicomDatabase", None)
+            if series_uid and database is not None and database.isOpen:
+                try:
+                    if database.filesForSeries(series_uid):
+                        from DICOMLib.DICOMUtils import loadSeriesByUID
+
+                        loaded_node_ids = loadSeriesByUID([series_uid])
+                        for node_id in loaded_node_ids:
+                            node = slicer.mrmlScene.GetNodeByID(node_id)
+                            if self._storedInputMatchesNode(node, manifest):
+                                return node
+                except Exception:
+                    logger.exception("Failed to load stored input DICOM series %s", series_uid)
+        return None
+
+    @staticmethod
+    def _legacyModelNameFromRunDirectory(output_dir: str) -> str | None:
+        run_directory_name = os.path.basename(os.path.normpath(output_dir))
+        match = re.match(r"^\d{2}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}_(.+)$", run_directory_name)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _modelFromStoredMetadata(model_data: dict) -> Model:
+        return Model(
+            id=f"stored:{model_data['name']}",
+            name=model_data["name"],
+            label=model_data.get("label") or model_data["name"],
+            description="",
+            modalities=[],
+            categories=list(model_data.get("categories", [])),
+            roi=[],
+            cite="",
+            license_model="",
+            license_weights="",
+            commercial_use=False,
+            inputs=[],
+            inputs_compatibility=True,
+        )
+
+    def loadStoredRun(self, output_dir: str, selected_input_node=None) -> dict | None:
+        from MHubRunnerModelHandlers.run_manifest import MANIFEST_FILENAME, load_run_manifest
+
+        manifest_file = os.path.join(output_dir, MANIFEST_FILENAME)
+        if os.path.exists(manifest_file):
+            manifest = load_run_manifest(output_dir)
+            model = self._modelFromStoredMetadata(manifest["model"])
+            input_node = self._resolveStoredRunInput(manifest, selected_input_node)
+            input_is_dicom = bool(manifest["input"]["wasDicom"])
+        else:
+            model_name = self._legacyModelNameFromRunDirectory(output_dir)
+            if not model_name:
+                return None
+            model = self._modelFromStoredMetadata(
+                {"name": model_name, "label": model_name, "categories": []}
+            )
+            manifest = None
+            input_node = None
+            input_is_dicom = False
+
+        plan = self.processModelOutputs(
+            model=model,
+            input_node=input_node,
+            output_dir=output_dir,
+            input_is_dicom=input_is_dicom,
+            output_handling="load_only",
+        )
+        annotation_warning = None
+        if plan is not None and plan.markups and input_node is None:
+            if manifest is None:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but this legacy run has no input "
+                    "manifest. Annotations were skipped because the original input cannot be verified."
+                )
+            elif manifest["input"]["wasDicom"]:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but the original DICOM input could not "
+                    "be resolved and verified. Annotations were skipped."
+                )
+            else:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but this non-DICOM input is no longer "
+                    "available in the original Slicer session. Annotations were skipped."
+                )
+        elif plan is not None and plan.markups:
+            geometry_errors = [
+                self._validateMarkupImageGeometry(input_node, markup.image_geometry)
+                for markup in plan.markups
+            ]
+            geometry_errors = [error for error in geometry_errors if error]
+            if geometry_errors:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but annotations were skipped because "
+                    f"{geometry_errors[0]}."
+                )
+        return {
+            "manifest": manifest,
+            "model": model,
+            "inputNode": input_node,
+            "plan": plan,
+            "annotationWarning": annotation_warning,
+        }
+
     def processModelOutputs(
         self,
         model: Model,
@@ -3043,9 +3344,13 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         Switch to a layout where tables are visible and show the selected one.
         """
         logger.debug("Show table view")
-        currentLayout = slicer.app.layoutManager().layout
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            logger.debug("No layout manager is available; table node was created without changing layout.")
+            return
+        currentLayout = layout_manager.layout
         layoutWithTable = slicer.modules.tables.logic().GetLayoutWithTable(currentLayout)
-        slicer.app.layoutManager().setLayout(layoutWithTable)
+        layout_manager.setLayout(layoutWithTable)
         slicer.app.applicationLogic().GetSelectionNode().SetReferenceActiveTableID(table.GetID())
         slicer.app.applicationLogic().PropagateTableSelection()
 

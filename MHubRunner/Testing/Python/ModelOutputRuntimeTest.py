@@ -1,3 +1,6 @@
+import json
+import os
+import tempfile
 import unittest
 
 import slicer
@@ -5,6 +8,7 @@ import vtk
 
 from MHubRunner import MHubRunnerLogic, Model, ModelStatus
 from MHubRunnerModelHandlers import MarkupOutput, MarkupPoint
+from MHubRunnerModelHandlers.run_manifest import load_run_manifest, write_run_manifest
 
 
 class ModelOutputRuntimeTest(unittest.TestCase):
@@ -85,6 +89,100 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             source_file="mismatched-findings.json",
         )
         self.assertIsNone(logic._createMarkupFromOutput(model, volume, mismatch_markup))
+
+    def test_stored_run_resolves_same_session_input(self):
+        volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")
+        image = vtk.vtkImageData()
+        image.SetDimensions(2, 2, 2)
+        image.AllocateScalars(vtk.VTK_SHORT, 1)
+        volume.SetAndObserveImageData(image)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        ijk_to_ras.Identity()
+        ijk_to_ras.SetElement(0, 0, -1.0)
+        ijk_to_ras.SetElement(1, 1, -1.0)
+        volume.SetIJKToRASMatrix(ijk_to_ras)
+
+        model = Model(
+            id="test",
+            name="gc_grt123_lung_cancer",
+            label="GRT123",
+            description="",
+            modalities=["CT"],
+            categories=["Prediction"],
+            roi=[],
+            cite="",
+            license_model="MIT",
+            license_weights="MIT",
+            commercial_use=True,
+            inputs=["Chest CT"],
+            inputs_compatibility=True,
+            status=ModelStatus.PULLED,
+        )
+        result_payload = {
+            "lungcad": {
+                "revision": "test",
+                "name": "grt123",
+                "datetimeofexecution": "08/22/2026 12:00:00",
+                "coordinatesystem": "World",
+                "computationtimeinseconds": 1.0,
+            },
+            "imageinfo": {
+                "dimensions": [2, 2, 2],
+                "voxelsize": [1.0, 1.0, 1.0],
+                "origin": [0.0, 0.0, 0.0],
+                "orientation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            },
+            "findings": [
+                {
+                    "id": 0,
+                    "x": 1.0,
+                    "y": 1.0,
+                    "z": 1.0,
+                    "probability": 0.5,
+                    "cancerprobability": 0.25,
+                }
+            ],
+            "cancerinfo": {
+                "casecancerprobability": 0.25,
+                "referencenoduleids": [0],
+            },
+        }
+
+        logic = MHubRunnerLogic()
+        with tempfile.TemporaryDirectory() as output_directory:
+            result_path = os.path.join(
+                output_directory, "gc_grt123_lung_cancer_findings.json"
+            )
+            with open(result_path, "w", encoding="utf-8") as stream:
+                json.dump(result_payload, stream)
+            logic.createRunManifest(
+                run_id="26.08.22-12.00.00_gc_grt123_lung_cancer",
+                model=model,
+                input_node=volume,
+                output_dir=output_directory,
+            )
+            logic.finalizeRunManifest(output_directory, 0, False, False)
+
+            loaded = logic.loadStoredRun(output_directory)
+            self.assertIs(loaded["inputNode"], volume)
+            self.assertIsNone(loaded["annotationWarning"])
+            self.assertEqual(len(loaded["plan"].tables), 2)
+            self.assertEqual(len(loaded["plan"].markups), 1)
+
+            manifest = load_run_manifest(output_directory)
+            manifest["slicerSessionId"] = "different-session"
+            write_run_manifest(output_directory, manifest)
+            loaded_without_input = logic.loadStoredRun(output_directory)
+            self.assertIsNone(loaded_without_input["inputNode"])
+            self.assertIn("non-DICOM input", loaded_without_input["annotationWarning"])
+
+        self.assertEqual(
+            logic._legacyModelNameFromRunDirectory(
+                "/tmp/26.08.22-12.00.00_gc_grt123_lung_cancer"
+            ),
+            "gc_grt123_lung_cancer",
+        )
+        self.assertIsNone(logic._legacyModelNameFromRunDirectory("/tmp/unrecognized"))
 
 
 if __name__ == "__main__":

@@ -30,3 +30,11 @@ warning, not guessed annotations.
 
 Output values must be transcribed as supplied. A handler must not invent
 clinical categories, thresholds, anatomical labels, or recommendations.
+
+Each new run stores a versioned `mhubrunner-run.json` beside the model outputs.
+The manifest records the exact handler key, technical input identity, geometry,
+status, and relative output paths. It intentionally omits patient names, patient
+IDs, and source filenames. The Output pane uses this manifest to resolve and
+verify the original input before allowing spatial annotations. Legacy runs can
+still use model-specific tables, but cannot create annotations without a
+verifiable input association.

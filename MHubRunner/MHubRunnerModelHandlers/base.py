@@ -81,6 +81,8 @@ class ModelHandler:
         matches = []
         for root, _, files in os.walk(output_directory):
             for filename in files:
+                if filename == "mhubrunner-run.json":
+                    continue
                 if filename.lower().endswith(suffixes):
                     matches.append(os.path.join(root, filename))
         return sorted(matches)

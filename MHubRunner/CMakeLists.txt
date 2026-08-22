@@ -8,6 +8,7 @@ set(MODULE_PYTHON_SCRIPTS
   MHubRunnerModelHandlers/base.py
   MHubRunnerModelHandlers/gc_grt123_lung_cancer.py
   MHubRunnerModelHandlers/registry.py
+  MHubRunnerModelHandlers/run_manifest.py
   )
 
 set(MODULE_PYTHON_RESOURCES
