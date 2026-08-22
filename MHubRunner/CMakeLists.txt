@@ -4,6 +4,10 @@ set(MODULE_NAME MHubRunner)
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
+  MHubRunnerModelHandlers/__init__.py
+  MHubRunnerModelHandlers/base.py
+  MHubRunnerModelHandlers/gc_grt123_lung_cancer.py
+  MHubRunnerModelHandlers/registry.py
   )
 
 set(MODULE_PYTHON_RESOURCES

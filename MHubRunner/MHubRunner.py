@@ -1994,10 +1994,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             modality = None
             if hasattr(self.ui, "cmbInputModality"):
                 modality = self.ui.cmbInputModality.currentText
-            self.logic.copy_node(
-                self.ui.inputSelector.currentNode(),
-                input_dir,
-                modality=modality
+            self.logic.prepareModelInputs(
+                model=model,
+                selected_node=self.ui.inputSelector.currentNode(),
+                input_dir=input_dir,
+                modality=modality,
             )
 
             # clear logs
@@ -2015,15 +2016,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 # ---------------------- process model results
 
                 output_handling = self._getOutputHandlingMode()
-                if 'Segmentation' in model.categories:
-                    dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    if output_handling in ("load_import", "import_only") and input_is_dicom:
-                        self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-                    if output_handling in ("load_import", "load_only"):
-                        self.logic.loadSegmentations(dsegfiles)
-
-                if output_handling in ("load_import", "load_only"):
-                    self._loadTabularOutputsFromRun(output_dir)
+                if returncode == 0 and not timedout and not killed:
+                    try:
+                        self.logic.processModelOutputs(
+                            model=model,
+                            input_node=node,
+                            output_dir=output_dir,
+                            input_is_dicom=input_is_dicom,
+                            output_handling=output_handling,
+                        )
+                    except Exception:
+                        logger.exception("Failed to process outputs for model %s", model.name)
+                        slicer.util.errorDisplay(
+                            f"The model completed, but its outputs could not be displayed.\n\n"
+                            f"The original files remain available in:\n{output_dir}"
+                        )
 
                 open_panel = self._getOpenOutputPanelOnComplete()
                 self.updateOutputRunDirectories(open_latest=open_panel)
@@ -2887,6 +2894,139 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # open csv in yellow table view node
         self.showTable(tableNode)
 
+    def processModelOutputs(
+        self,
+        model: Model,
+        input_node,
+        output_dir: str,
+        input_is_dicom: bool,
+        output_handling: str,
+    ):
+        """Resolve model outputs through an exact-model handler or the generic fallback."""
+        from MHubRunnerModelHandlers import ModelHandlerRegistry, OutputHandlerContext
+
+        if output_handling == "none":
+            return None
+
+        context = OutputHandlerContext(
+            model_name=model.name,
+            model_label=model.label,
+            model_categories=list(model.categories),
+            output_directory=output_dir,
+        )
+        handler = ModelHandlerRegistry().handler_for(model.name)
+        logger.info("Processing %s outputs with %s", model.name, type(handler).__name__)
+        plan = handler.build_output_plan(context)
+
+        for warning in plan.warnings:
+            logger.warning("%s", warning)
+
+        if output_handling in ("load_import", "import_only"):
+            if input_is_dicom and plan.segmentation_files:
+                self.addFilesToDatabase(plan.segmentation_files, operation="copy")
+            elif plan.segmentation_files and not input_is_dicom:
+                logger.info("DICOM SEG import skipped because the input was not in the DICOM database.")
+
+        if output_handling not in ("load_import", "load_only"):
+            return plan
+
+        if plan.segmentation_files:
+            self.loadSegmentations(plan.segmentation_files)
+
+        for table in plan.tables:
+            table_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", table.name)
+            table_node.SetAttribute("MHubRunner.ModelName", model.name)
+            table_node.SetAttribute("MHubRunner.SourceFile", table.source_file)
+            self.renderTableData(table_node, table.columns, table.rows)
+
+        for markup in plan.markups:
+            self._createMarkupFromOutput(model, input_node, markup)
+        return plan
+
+    def _createMarkupFromOutput(self, model: Model, input_node, markup):
+        """Create local-RAS fiducials only when reported LPS image geometry matches the input."""
+        geometry_error = self._validateMarkupImageGeometry(input_node, markup.image_geometry)
+        if geometry_error:
+            logger.warning(
+                "Finding annotations from %s were not created: %s",
+                markup.source_file,
+                geometry_error,
+            )
+            return None
+
+        markups_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsFiducialNode", markup.name
+        )
+        markups_node.CreateDefaultDisplayNodes()
+        markups_node.SetAttribute("MHubRunner.ModelName", model.name)
+        markups_node.SetAttribute("MHubRunner.SourceFile", markup.source_file)
+        if input_node is not None and input_node.GetTransformNodeID():
+            markups_node.SetAndObserveTransformNodeID(input_node.GetTransformNodeID())
+
+        for point in markup.points:
+            # The report coordinates are physical image coordinates (ITK/DICOM LPS).
+            # Slicer node coordinates are RAS, so invert the first two axes.
+            x_lps, y_lps, z_lps = point.position_lps
+            index = markups_node.AddControlPoint(vtk.vtkVector3d(-x_lps, -y_lps, z_lps))
+            markups_node.SetNthControlPointLabel(index, point.label)
+            if point.description:
+                markups_node.SetNthControlPointDescription(index, point.description)
+
+        display_node = markups_node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSelectedColor(1.0, 0.4, 0.0)
+            display_node.SetColor(1.0, 0.75, 0.0)
+        return markups_node
+
+    def _validateMarkupImageGeometry(self, input_node, image_geometry: dict) -> str | None:
+        if input_node is None or not input_node.IsA("vtkMRMLScalarVolumeNode"):
+            return "the run input is not an available scalar volume"
+        image_data = input_node.GetImageData()
+        if image_data is None:
+            return "the run input has no image data"
+
+        try:
+            dimensions = tuple(int(value) for value in image_geometry["dimensions"])
+            spacing = tuple(float(value) for value in image_geometry["voxelsize"])
+            origin = tuple(float(value) for value in image_geometry["origin"])
+            orientation = tuple(float(value) for value in image_geometry["orientation"])
+        except (KeyError, TypeError, ValueError):
+            return "the output does not contain valid image geometry"
+
+        if len(dimensions) != 3 or len(spacing) != 3 or len(origin) != 3 or len(orientation) != 9:
+            return "the output image geometry has unexpected dimensions"
+        if tuple(image_data.GetDimensions()) != dimensions:
+            return (
+                f"output dimensions {dimensions} do not match input dimensions "
+                f"{tuple(image_data.GetDimensions())}"
+            )
+
+        expected_ijk_to_lps = vtk.vtkMatrix4x4()
+        expected_ijk_to_lps.Identity()
+        for row in range(3):
+            for column in range(3):
+                expected_ijk_to_lps.SetElement(
+                    row, column, orientation[row * 3 + column] * spacing[column]
+                )
+            expected_ijk_to_lps.SetElement(row, 3, origin[row])
+
+        actual_ijk_to_ras = vtk.vtkMatrix4x4()
+        input_node.GetIJKToRASMatrix(actual_ijk_to_ras)
+        actual_ijk_to_lps = vtk.vtkMatrix4x4()
+        actual_ijk_to_lps.DeepCopy(actual_ijk_to_ras)
+        for column in range(4):
+            actual_ijk_to_lps.SetElement(0, column, -actual_ijk_to_ras.GetElement(0, column))
+            actual_ijk_to_lps.SetElement(1, column, -actual_ijk_to_ras.GetElement(1, column))
+
+        tolerance = 1e-3
+        for row in range(3):
+            for column in range(4):
+                expected = expected_ijk_to_lps.GetElement(row, column)
+                actual = actual_ijk_to_lps.GetElement(row, column)
+                if abs(expected - actual) > tolerance:
+                    return "the output image origin, spacing, or orientation does not match the run input"
+        return None
+
     def openFile(self, file_path: str) -> None:
         import subprocess
         import sys
@@ -2954,6 +3094,41 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     #             # let slicer breathe :D
     #             slicer.app.processEvents()
+
+    def prepareModelInputs(
+        self,
+        model: Model,
+        selected_node,
+        input_dir: str,
+        modality: str | None = None,
+    ):
+        """Resolve model inputs through the handler and materialize its safe input plan."""
+        from MHubRunnerModelHandlers import InputHandlerContext, ModelHandlerRegistry
+
+        handler = ModelHandlerRegistry().handler_for(model.name)
+        context = InputHandlerContext(
+            model_name=model.name,
+            selected_nodes=[selected_node],
+            selected_modality=modality,
+        )
+        plan = handler.resolve_inputs(context)
+        if not plan.items:
+            raise ValueError(f"The input handler for {model.name} returned no inputs.")
+
+        for item in plan.items:
+            relative_target = os.path.normpath(item.target_subdirectory or ".")
+            unsafe_target = (
+                os.path.isabs(relative_target)
+                or relative_target == ".."
+                or relative_target.startswith(".." + os.sep)
+            )
+            if unsafe_target:
+                raise ValueError(
+                    f"The input handler for {model.name} returned an unsafe target directory."
+                )
+            target_directory = os.path.join(input_dir, relative_target)
+            self.copy_node(item.node, target_directory, modality=item.modality)
+        return plan
 
     def copy_node(self, node, copy_dir: str, verbose: bool = True, modality: str | None = None):
         """
