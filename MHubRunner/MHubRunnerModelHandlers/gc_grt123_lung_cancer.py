@@ -65,6 +65,7 @@ class Grt123LungCancerHandler(ModelHandler):
                     ["Coordinate system", lungcad.get("coordinatesystem", "")],
                 ],
                 source_file=path,
+                identity="summary",
             )
         )
 
@@ -88,6 +89,8 @@ class Grt123LungCancerHandler(ModelHandler):
                 columns=finding_columns,
                 rows=finding_rows,
                 source_file=path,
+                identity="findings",
+                link_group="findings",
             )
         )
 
@@ -126,6 +129,8 @@ class Grt123LungCancerHandler(ModelHandler):
                     points=points,
                     image_geometry=image_info,
                     source_file=path,
+                    identity="findings",
+                    link_group="findings",
                 )
             )
         return plan

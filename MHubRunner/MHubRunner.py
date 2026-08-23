@@ -30,6 +30,12 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 _RUN_SESSION_ID = uuid.uuid4().hex
+_RUN_ID_ATTRIBUTE = "MHubRunner.RunId"
+_OUTPUT_IDENTITY_ATTRIBUTE = "MHubRunner.OutputIdentity"
+_LINK_GROUP_ATTRIBUTE = "MHubRunner.LinkGroup"
+_LINKED_MARKUP_ROLE = "MHubRunner.LinkedMarkup"
+_LINKED_TABLE_ROLE = "MHubRunner.LinkedTable"
+_INPUT_NODE_ROLE = "MHubRunner.Input"
 
 class Debouncer(qt.QObject):
     def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
@@ -321,7 +327,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
         self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
         if hasattr(self.ui, "cmdOpenOutputFile"):
-            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onOpenOutputFile)
+            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onLoadResults)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
 
@@ -1789,17 +1795,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.lstOutputFiles.addItem(item)
 
             item.setData(qt.Qt.UserRole, output_file)
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
 
     def onOutputFileSelect(self) -> None:
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
 
-    def onOpenOutputFile(self) -> None:
+    def onLoadResults(self) -> None:
         assert self.logic is not None
-        output_file = self._getSelectedOutputFile()
-        if not output_file or not self._isSupportedOutputFile(output_file):
-            return
         output_dir = self._getSelectedOutputDirectory()
+        if not os.path.isdir(output_dir):
+            return
         try:
             result = self.logic.loadStoredRun(
                 output_dir=output_dir,
@@ -1812,7 +1817,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             )
             return
         if result is None:
-            self._loadOutputFile(output_file)
+            output_file = self._getSelectedOutputFile()
+            if output_file is None and self.ui.lstOutputFiles.count:
+                output_file = self.ui.lstOutputFiles.item(0).data(qt.Qt.UserRole)
+            if output_file and self._isSupportedOutputFile(output_file):
+                self._loadOutputFile(output_file)
             return
         annotation_warning = result.get("annotationWarning")
         if annotation_warning:
@@ -1928,11 +1937,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _isSupportedOutputFile(self, output_file: str) -> bool:
         return output_file.endswith((".json", ".csv", ".seg.dcm"))
 
-    def _updateOpenOutputFileButton(self) -> None:
+    def _updateLoadResultsButton(self) -> None:
         if not hasattr(self.ui, "cmdOpenOutputFile"):
             return
-        output_file = self._getSelectedOutputFile()
-        enabled = bool(output_file) and self._isSupportedOutputFile(output_file)
+        enabled = any(
+            self._isSupportedOutputFile(self.ui.lstOutputFiles.item(index).data(qt.Qt.UserRole))
+            for index in range(self.ui.lstOutputFiles.count)
+        )
         self.ui.cmdOpenOutputFile.enabled = enabled
         icon_name = "hi_show" if enabled else "hi_noshow"
         opacity = 1.0 if enabled else self._ICON_DISABLED_OPACITY
@@ -3189,6 +3200,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             output_dir=output_dir,
             input_is_dicom=input_is_dicom,
             output_handling="load_only",
+            run_id=manifest["runId"] if manifest is not None else os.path.basename(output_dir),
         )
         annotation_warning = None
         if plan is not None and plan.markups and input_node is None:
@@ -3233,6 +3245,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         output_dir: str,
         input_is_dicom: bool,
         output_handling: str,
+        run_id: str | None = None,
     ):
         """Resolve model outputs through an exact-model handler or the generic fallback."""
         from MHubRunnerModelHandlers import ModelHandlerRegistry, OutputHandlerContext
@@ -3249,6 +3262,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         handler = ModelHandlerRegistry().handler_for(model.name)
         logger.info("Processing %s outputs with %s", model.name, type(handler).__name__)
         plan = handler.build_output_plan(context)
+        run_id = run_id or os.path.basename(os.path.normpath(output_dir))
 
         for warning in plan.warnings:
             logger.warning("%s", warning)
@@ -3262,23 +3276,194 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if output_handling not in ("load_import", "load_only"):
             return plan
 
-        if plan.segmentation_files:
-            self.loadSegmentations(plan.segmentation_files)
+        run_folder_item_id = self._getOrCreateRunFolder(run_id, model)
 
+        table_nodes_by_link: dict[str, list[Any]] = {}
         for table in plan.tables:
-            table_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", table.name)
-            table_node.SetAttribute("MHubRunner.ModelName", model.name)
-            table_node.SetAttribute("MHubRunner.SourceFile", table.source_file)
+            identity = self._plannedOutputIdentity(
+                "table", table.source_file, table.identity, output_dir
+            )
+            table_node = self._findOutputNode("vtkMRMLTableNode", run_id, identity)
+            if table_node is None:
+                table_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", table.name)
+            table_node.SetName(table.name)
+            self._setOutputNodeMetadata(
+                table_node,
+                model=model,
+                run_id=run_id,
+                output_identity=identity,
+                source_file=table.source_file,
+                link_group=table.link_group,
+                input_node=input_node,
+            )
             self.renderTableData(table_node, table.columns, table.rows)
+            self._moveNodeToRunFolder(table_node, run_folder_item_id)
+            if table.link_group:
+                table_nodes_by_link.setdefault(table.link_group, []).append(table_node)
 
+        markup_nodes_by_link: dict[str, list[Any]] = {}
         for markup in plan.markups:
-            self._createMarkupFromOutput(model, input_node, markup)
+            identity = self._plannedOutputIdentity(
+                "markup", markup.source_file, markup.identity, output_dir
+            )
+            markup_node = self._createMarkupFromOutput(
+                model,
+                input_node,
+                markup,
+                run_id=run_id,
+                output_identity=identity,
+                run_folder_item_id=run_folder_item_id,
+            )
+            if markup_node is not None and markup.link_group:
+                markup_nodes_by_link.setdefault(markup.link_group, []).append(markup_node)
+
+        for link_group in set(table_nodes_by_link).intersection(markup_nodes_by_link):
+            table_node = table_nodes_by_link[link_group][0]
+            markup_node = markup_nodes_by_link[link_group][0]
+            table_node.SetNodeReferenceID(_LINKED_MARKUP_ROLE, markup_node.GetID())
+            markup_node.SetNodeReferenceID(_LINKED_TABLE_ROLE, table_node.GetID())
+
+        for segmentation_file in plan.segmentation_files:
+            identity = self._plannedOutputIdentity(
+                "segmentation", segmentation_file, "", output_dir
+            )
+            existing_nodes = self._findOutputNodes(
+                "vtkMRMLSegmentationNode", run_id, identity
+            )
+            if existing_nodes:
+                for segmentation_node in existing_nodes:
+                    self._setOutputNodeMetadata(
+                        segmentation_node,
+                        model=model,
+                        run_id=run_id,
+                        output_identity=identity,
+                        source_file=segmentation_file,
+                        input_node=input_node,
+                    )
+                    self._moveNodeToRunFolder(segmentation_node, run_folder_item_id)
+                continue
+
+            existing_ids = {
+                node.GetID()
+                for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+            }
+            self.loadSegmentations([segmentation_file])
+            new_nodes = [
+                node
+                for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+                if node.GetID() not in existing_ids
+            ]
+            for segmentation_node in new_nodes:
+                self._setOutputNodeMetadata(
+                    segmentation_node,
+                    model=model,
+                    run_id=run_id,
+                    output_identity=identity,
+                    source_file=segmentation_file,
+                    input_node=input_node,
+                )
+                self._moveNodeToRunFolder(segmentation_node, run_folder_item_id)
         return plan
 
-    def _createMarkupFromOutput(self, model: Model, input_node, markup):
+    @staticmethod
+    def _plannedOutputIdentity(
+        output_kind: str,
+        source_file: str,
+        semantic_identity: str,
+        output_dir: str,
+    ) -> str:
+        relative_source = os.path.relpath(
+            os.path.abspath(source_file), os.path.abspath(output_dir)
+        ).replace(os.sep, "/")
+        if relative_source == ".." or relative_source.startswith("../"):
+            relative_source = os.path.basename(source_file)
+        parts = [output_kind, relative_source]
+        if semantic_identity:
+            parts.append(semantic_identity)
+        return ":".join(parts)
+
+    @staticmethod
+    def _findOutputNodes(node_class: str, run_id: str, output_identity: str) -> list[Any]:
+        return [
+            node
+            for node in slicer.util.getNodesByClass(node_class)
+            if node.GetAttribute(_RUN_ID_ATTRIBUTE) == run_id
+            and node.GetAttribute(_OUTPUT_IDENTITY_ATTRIBUTE) == output_identity
+        ]
+
+    def _findOutputNode(self, node_class: str, run_id: str, output_identity: str):
+        nodes = self._findOutputNodes(node_class, run_id, output_identity)
+        return nodes[0] if nodes else None
+
+    @staticmethod
+    def _setOutputNodeMetadata(
+        node,
+        *,
+        model: Model,
+        run_id: str,
+        output_identity: str,
+        source_file: str,
+        link_group: str = "",
+        input_node=None,
+    ) -> None:
+        node.SetAttribute("MHubRunner.ModelName", model.name)
+        node.SetAttribute("MHubRunner.SourceFile", source_file)
+        node.SetAttribute(_RUN_ID_ATTRIBUTE, run_id)
+        node.SetAttribute(_OUTPUT_IDENTITY_ATTRIBUTE, output_identity)
+        node.SetAttribute(_LINK_GROUP_ATTRIBUTE, link_group or None)
+        node.SetNodeReferenceID(
+            _INPUT_NODE_ROLE,
+            input_node.GetID() if input_node is not None else None,
+        )
+
+    @staticmethod
+    def _getOrCreateRunFolder(run_id: str, model: Model) -> int:
+        subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+            slicer.mrmlScene
+        )
+        scene_item_id = subject_hierarchy.GetSceneItemID()
+        item_ids = vtk.vtkIdList()
+        subject_hierarchy.GetItemChildren(scene_item_id, item_ids, True)
+        for index in range(item_ids.GetNumberOfIds()):
+            item_id = item_ids.GetId(index)
+            if subject_hierarchy.GetItemAttribute(item_id, _RUN_ID_ATTRIBUTE) == run_id:
+                return item_id
+
+        folder_name = f"MHubRunner - {model.label} - {run_id}"
+        folder_item_id = subject_hierarchy.CreateFolderItem(scene_item_id, folder_name)
+        subject_hierarchy.SetItemAttribute(folder_item_id, _RUN_ID_ATTRIBUTE, run_id)
+        subject_hierarchy.SetItemAttribute(folder_item_id, "MHubRunner.ModelName", model.name)
+        return folder_item_id
+
+    @staticmethod
+    def _moveNodeToRunFolder(node, folder_item_id: int) -> None:
+        subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+            slicer.mrmlScene
+        )
+        item_id = subject_hierarchy.GetItemByDataNode(node)
+        if item_id:
+            subject_hierarchy.SetItemParent(item_id, folder_item_id)
+
+    def _createMarkupFromOutput(
+        self,
+        model: Model,
+        input_node,
+        markup,
+        run_id: str = "",
+        output_identity: str = "",
+        run_folder_item_id: int | None = None,
+    ):
         """Create local-RAS fiducials only when reported LPS image geometry matches the input."""
+        output_identity = output_identity or self._plannedOutputIdentity(
+            "markup", markup.source_file, markup.identity, os.path.dirname(markup.source_file)
+        )
+        markups_node = self._findOutputNode(
+            "vtkMRMLMarkupsFiducialNode", run_id, output_identity
+        )
         geometry_error = self._validateMarkupImageGeometry(input_node, markup.image_geometry)
         if geometry_error:
+            if markups_node is not None:
+                markups_node.RemoveAllControlPoints()
             logger.warning(
                 "Finding annotations from %s were not created: %s",
                 markup.source_file,
@@ -3286,14 +3471,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             )
             return None
 
-        markups_node = slicer.mrmlScene.AddNewNodeByClass(
-            "vtkMRMLMarkupsFiducialNode", markup.name
-        )
+        if markups_node is None:
+            markups_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", markup.name
+            )
         markups_node.CreateDefaultDisplayNodes()
-        markups_node.SetAttribute("MHubRunner.ModelName", model.name)
-        markups_node.SetAttribute("MHubRunner.SourceFile", markup.source_file)
-        if input_node is not None and input_node.GetTransformNodeID():
-            markups_node.SetAndObserveTransformNodeID(input_node.GetTransformNodeID())
+        markups_node.SetName(markup.name)
+        markups_node.RemoveAllControlPoints()
+        self._setOutputNodeMetadata(
+            markups_node,
+            model=model,
+            run_id=run_id,
+            output_identity=output_identity,
+            source_file=markup.source_file,
+            link_group=markup.link_group,
+            input_node=input_node,
+        )
+        markups_node.SetAndObserveTransformNodeID(
+            input_node.GetTransformNodeID() if input_node is not None else None
+        )
 
         for point in markup.points:
             # The report coordinates are physical image coordinates (ITK/DICOM LPS).
@@ -3308,6 +3504,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if display_node is not None:
             display_node.SetSelectedColor(1.0, 0.4, 0.0)
             display_node.SetColor(1.0, 0.75, 0.0)
+        if run_folder_item_id is not None:
+            self._moveNodeToRunFolder(markups_node, run_folder_item_id)
         return markups_node
 
     def _validateMarkupImageGeometry(self, input_node, image_geometry: dict) -> str | None:

@@ -191,7 +191,7 @@
            <item>
             <widget class="QPushButton" name="cmdOpenOutputFile">
              <property name="text">
-              <string>Open File</string>
+              <string>Load Results</string>
              </property>
              <property name="styleSheet">
               <string>padding: 3px 8px;</string>

@@ -38,6 +38,8 @@ class TableOutput:
     columns: list[str]
     rows: list[list[Any]]
     source_file: str
+    identity: str = ""
+    link_group: str = ""
 
 
 @dataclass
@@ -53,6 +55,8 @@ class MarkupOutput:
     points: list[MarkupPoint]
     image_geometry: dict[str, Any]
     source_file: str
+    identity: str = ""
+    link_group: str = ""
 
 
 @dataclass

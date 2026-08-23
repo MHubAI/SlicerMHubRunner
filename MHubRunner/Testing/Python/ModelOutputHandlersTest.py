@@ -63,7 +63,11 @@ class ModelOutputHandlersTest(unittest.TestCase):
         self.assertEqual(len(plan.tables), 2)
         self.assertEqual(plan.tables[0].rows[0], ["Case cancer probability", 0.8809547424316406])
         self.assertEqual(plan.tables[1].rows[0][0], 0)
+        self.assertEqual(plan.tables[1].identity, "findings")
+        self.assertEqual(plan.tables[1].link_group, "findings")
         self.assertEqual(len(plan.markups), 1)
+        self.assertEqual(plan.markups[0].identity, "findings")
+        self.assertEqual(plan.markups[0].link_group, "findings")
         self.assertEqual(plan.markups[0].points[0].position_lps, (56.0, 86.300003, -112.0))
 
     def test_unknown_model_uses_generic_handler(self):

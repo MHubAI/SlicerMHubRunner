@@ -17,6 +17,10 @@ class ModelOutputRuntimeTest(unittest.TestCase):
     def setUp(self):
         slicer.mrmlScene.Clear()
 
+    @staticmethod
+    def _logic_without_dependency_setup():
+        return MHubRunnerLogic.__new__(MHubRunnerLogic)
+
     def test_extension_build_footer(self):
         label = qt.QLabel()
         widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
@@ -80,7 +84,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             status=ModelStatus.PULLED,
         )
 
-        logic = MHubRunnerLogic()
+        logic = self._logic_without_dependency_setup()
         markups_node = logic._createMarkupFromOutput(model, volume, markup)
 
         self.assertIsNotNone(markups_node)
@@ -160,7 +164,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             },
         }
 
-        logic = MHubRunnerLogic()
+        logic = self._logic_without_dependency_setup()
         with tempfile.TemporaryDirectory() as output_directory:
             result_path = os.path.join(
                 output_directory, "gc_grt123_lung_cancer_findings.json"
@@ -180,6 +184,47 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             self.assertIsNone(loaded["annotationWarning"])
             self.assertEqual(len(loaded["plan"].tables), 2)
             self.assertEqual(len(loaded["plan"].markups), 1)
+
+            tables = slicer.util.getNodesByClass("vtkMRMLTableNode")
+            markups = slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode")
+            self.assertEqual(len(tables), 2)
+            self.assertEqual(len(markups), 1)
+            findings_table = next(
+                node
+                for node in tables
+                if node.GetAttribute("MHubRunner.OutputIdentity").endswith(":findings")
+            )
+            findings_markup = markups[0]
+            self.assertEqual(
+                findings_table.GetNodeReferenceID("MHubRunner.LinkedMarkup"),
+                findings_markup.GetID(),
+            )
+            self.assertEqual(
+                findings_markup.GetNodeReferenceID("MHubRunner.LinkedTable"),
+                findings_table.GetID(),
+            )
+
+            subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+                slicer.mrmlScene
+            )
+            table_parent = subject_hierarchy.GetItemParent(
+                subject_hierarchy.GetItemByDataNode(findings_table)
+            )
+            markup_parent = subject_hierarchy.GetItemParent(
+                subject_hierarchy.GetItemByDataNode(findings_markup)
+            )
+            self.assertEqual(table_parent, markup_parent)
+            self.assertEqual(
+                subject_hierarchy.GetItemAttribute(table_parent, "MHubRunner.RunId"),
+                "26.08.22-12.00.00_gc_grt123_lung_cancer",
+            )
+
+            loaded_again = logic.loadStoredRun(output_directory)
+            self.assertIs(loaded_again["inputNode"], volume)
+            self.assertEqual(len(slicer.util.getNodesByClass("vtkMRMLTableNode")), 2)
+            self.assertEqual(
+                len(slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode")), 1
+            )
 
             manifest = load_run_manifest(output_directory)
             manifest["slicerSessionId"] = "different-session"

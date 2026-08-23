@@ -22,6 +22,12 @@ directly manipulate the MRML scene. Those operations remain owned by
 `MHubRunnerLogic` so output-handling settings and error behavior stay
 consistent across models.
 
+Give each planned table or markup a stable semantic `identity`. MHubRunner
+combines it with the output kind and relative source path so loading the same
+run updates its existing MRML node. Tables and markups that describe the same
+findings should also share a `link_group`; the materialized nodes then receive
+bidirectional MRML node references.
+
 Spatial outputs must state their source coordinate system. For physical LPS
 positions, include the reported image dimensions, voxel spacing, origin, and
 orientation. MHubRunner creates markups only after that geometry matches the
