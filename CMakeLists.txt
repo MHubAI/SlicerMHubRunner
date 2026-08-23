@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.16.3...3.19.7 FATAL_ERROR)
 
 project(MHubRunner)
 
+# Keep the user-facing extension version independent from the Git revision.
+# Release builds should remove the pre-release suffix when the matching tag is created.
+set(MHUBRUNNER_VERSION "2.4.0-dev")
+
 #-----------------------------------------------------------------------------
 # Extension meta-information
 set(EXTENSION_HOMEPAGE "https://mhub.ai/")

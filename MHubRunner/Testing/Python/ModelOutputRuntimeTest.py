@@ -2,11 +2,13 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 
+import qt
 import slicer
 import vtk
 
-from MHubRunner import MHubRunnerLogic, Model, ModelStatus
+from MHubRunner import MHubRunnerLogic, MHubRunnerWidget, Model, ModelStatus
 from MHubRunnerModelHandlers import MarkupOutput, MarkupPoint
 from MHubRunnerModelHandlers.run_manifest import load_run_manifest, write_run_manifest
 
@@ -14,6 +16,16 @@ from MHubRunnerModelHandlers.run_manifest import load_run_manifest, write_run_ma
 class ModelOutputRuntimeTest(unittest.TestCase):
     def setUp(self):
         slicer.mrmlScene.Clear()
+
+    def test_extension_build_footer(self):
+        label = qt.QLabel()
+        widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
+
+        MHubRunnerWidget._updateExtensionBuildInfo(widget)
+
+        self.assertTrue(label.text.startswith("MHubRunner 2.4.0-dev \u00b7 build "))
+        self.assertIn("Extension version: 2.4.0-dev", label.toolTip)
+        self.assertIn("Git revision:", label.toolTip)
 
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")

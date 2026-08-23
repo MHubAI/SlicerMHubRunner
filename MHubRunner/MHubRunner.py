@@ -273,6 +273,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
         self._applySummaryOpacity()
+        self._updateExtensionBuildInfo()
         self._applyMainButtonIcons()
         self._applyOutputButtonIcons()
         self._closeStaleSettingsDialogs()
@@ -848,6 +849,36 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         color.setAlpha(int(255 * opacity))
         palette.setColor(qt.QPalette.WindowText, color)
         self.ui.lblSetupSummary.setPalette(palette)
+
+    def _updateExtensionBuildInfo(self) -> None:
+        label = getattr(self.ui, "lblExtensionBuildInfo", None)
+        if label is None:
+            return
+
+        try:
+            from MHubRunnerBuildInfo import (
+                BUILD_REVISION,
+                BUILD_REVISION_SHORT,
+                EXTENSION_VERSION,
+            )
+        except ImportError:
+            # Direct source loading does not run CMake and therefore has no
+            # generated revision metadata.
+            EXTENSION_VERSION = "2.4.0-dev"
+            BUILD_REVISION = "unknown"
+            BUILD_REVISION_SHORT = "unknown"
+
+        label.text = f"MHubRunner {EXTENSION_VERSION} \u00b7 build {BUILD_REVISION_SHORT}"
+        label.toolTip = (
+            f"Extension version: {EXTENSION_VERSION}\n"
+            f"Git revision: {BUILD_REVISION}"
+        )
+
+        palette = label.palette
+        color = palette.color(qt.QPalette.WindowText)
+        color.setAlpha(int(255 * 0.55))
+        palette.setColor(qt.QPalette.WindowText, color)
+        label.setPalette(palette)
 
     def _loadSettingsUi(self) -> None:
         if self._settingsWidget is not None:
