@@ -713,7 +713,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmdOpenOutputFile.setIcon(self._themeIcon("hi_show"))
         self.ui.cmdOpenOutputFile.setIconSize(icon_size)
         self._setButtonTextWithIcon(self.ui.cmdOpenOutputFile, self.ui.cmdOpenOutputFile.text)
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
 
     def _updateMainButtonIcons(self) -> None:
         icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
