@@ -3028,16 +3028,54 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             ],
         }
 
-    def createRunManifest(self, run_id: str, model: Model, input_node, output_dir: str) -> dict:
+    def getDockerImageDigest(self, image_name: str) -> str:
+        import subprocess
+
+        docker_executable = self.getDockerExecutable()
+        if not docker_executable:
+            raise RuntimeError("Docker is unavailable; the model image digest cannot be recorded.")
+
+        try:
+            result = subprocess.run(
+                [docker_executable, "image", "inspect", "--format", "{{.Id}}", image_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=self._build_subprocess_env(docker_executable),
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"Cannot inspect the local model image {image_name!r} to record its digest."
+            ) from exc
+
+        image_digest = result.stdout.strip()
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_digest):
+            raise RuntimeError(
+                f"Docker returned an invalid image digest for {image_name!r}: {image_digest!r}."
+            )
+        return image_digest.lower()
+
+    def createRunManifest(
+        self,
+        run_id: str,
+        model: Model,
+        input_node,
+        output_dir: str,
+        image_digest: str | None = None,
+    ) -> dict:
         from MHubRunnerModelHandlers.run_manifest import new_run_manifest, write_run_manifest
 
         instance_uid_hash = self.dicomInstanceUIDHash(input_node)
+        image_name = f"mhubai/{model.name}:latest"
+        image_digest = image_digest or self.getDockerImageDigest(image_name)
         manifest = new_run_manifest(
             run_id=run_id,
             model_name=model.name,
             model_label=model.label,
             model_categories=list(model.categories),
-            image_name=f"mhubai/{model.name}:latest",
+            image_name=image_name,
+            image_digest=image_digest,
             slicer_session_id=_RUN_SESSION_ID,
             input_data={
                 "nodeId": input_node.GetID() if input_node else "",

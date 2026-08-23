@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,7 @@ def new_run_manifest(
     model_label: str,
     model_categories: list[str],
     image_name: str,
+    image_digest: str,
     input_data: dict[str, Any],
     slicer_session_id: str,
     model_output_directory: str = "outputs",
@@ -42,6 +44,7 @@ def new_run_manifest(
             "label": model_label,
             "categories": list(model_categories),
             "image": image_name,
+            "imageDigest": image_digest,
         },
         "input": dict(input_data),
         "status": {
@@ -84,6 +87,9 @@ def validate_run_manifest(manifest: Any) -> dict[str, Any]:
     for field in ("name", "label", "image"):
         if not isinstance(model.get(field), str) or not model[field]:
             raise RunManifestError(f"Run manifest model field {field!r} is invalid.")
+    image_digest = model.get("imageDigest")
+    if image_digest is not None and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_digest):
+        raise RunManifestError("Run manifest model imageDigest must be a SHA-256 digest.")
     if not isinstance(model.get("categories"), list) or not all(
         isinstance(value, str) for value in model["categories"]
     ):

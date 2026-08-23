@@ -21,6 +21,7 @@ class RunManifestTest(unittest.TestCase):
             model_label="CT Lung cancer risk prediction",
             model_categories=["Prediction"],
             image_name="mhubai/gc_grt123_lung_cancer:latest",
+            image_digest="sha256:" + "a" * 64,
             slicer_session_id="test-session",
             input_data={
                 "nodeId": "vtkMRMLScalarVolumeNode1",
@@ -46,6 +47,7 @@ class RunManifestTest(unittest.TestCase):
             loaded = load_run_manifest(output_directory)
             self.assertEqual(loaded["status"]["state"], "running")
             self.assertEqual(loaded["modelOutputDirectory"], "outputs")
+            self.assertEqual(loaded["model"]["imageDigest"], "sha256:" + "a" * 64)
             self.assertNotIn("nodeName", loaded["input"])
 
             finalized = finalize_run_manifest(
@@ -72,6 +74,13 @@ class RunManifestTest(unittest.TestCase):
     def test_parent_output_path_is_rejected(self):
         manifest = self._manifest()
         manifest["outputs"] = [os.path.join("..", "outside.json")]
+        with tempfile.TemporaryDirectory() as output_directory:
+            with self.assertRaises(RunManifestError):
+                write_run_manifest(output_directory, manifest)
+
+    def test_invalid_image_digest_is_rejected(self):
+        manifest = self._manifest()
+        manifest["model"]["imageDigest"] = "latest"
         with tempfile.TemporaryDirectory() as output_directory:
             with self.assertRaises(RunManifestError):
                 write_run_manifest(output_directory, manifest)

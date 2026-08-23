@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import qt
 import slicer
@@ -30,6 +31,28 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertTrue(label.text.startswith("MHubRunner 2.4.0-dev \u00b7 build "))
         self.assertIn("Extension version: 2.4.0-dev", label.toolTip)
         self.assertIn("Git revision:", label.toolTip)
+
+    def test_docker_image_digest_is_read_from_local_image(self):
+        logic = self._logic_without_dependency_setup()
+        logic._executables = {"docker": "/mock/docker"}
+        expected_digest = "sha256:" + "a" * 64
+
+        with patch("subprocess.run") as run:
+            run.return_value = SimpleNamespace(stdout="sha256:" + "A" * 64)
+            digest = logic.getDockerImageDigest("mhubai/example:latest")
+
+        self.assertEqual(digest, expected_digest)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/mock/docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{.Id}}",
+                "mhubai/example:latest",
+            ],
+        )
 
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")
@@ -176,6 +199,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
                 model=model,
                 input_node=volume,
                 output_dir=output_directory,
+                image_digest="sha256:" + "a" * 64,
             )
             logic.finalizeRunManifest(output_directory, 0, False, False)
 
