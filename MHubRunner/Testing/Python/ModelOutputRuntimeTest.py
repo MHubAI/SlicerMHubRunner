@@ -257,6 +257,49 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             )
             self.assertIs(unpositioned_markup, findings_markup)
             self.assertIsNone(unpositioned_point_index)
+            linked_table, linked_row = MHubRunnerWidget._linkedTableRowForMarkupPoint(
+                findings_markup, 0
+            )
+            self.assertIs(linked_table, findings_table)
+            self.assertEqual(linked_row, 0)
+            out_of_range_table, out_of_range_row = (
+                MHubRunnerWidget._linkedTableRowForMarkupPoint(findings_markup, 1)
+            )
+            self.assertIs(out_of_range_table, findings_table)
+            self.assertIsNone(out_of_range_row)
+
+            widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
+            widget._linkedMarkupDisplayObservers = {}
+            widget._pendingLinkedTableSelection = None
+            widget._syncingResultSelection = False
+            table_view = slicer.qMRMLTableView()
+            table_view.setMRMLScene(slicer.mrmlScene)
+            table_view.setMRMLTableNode(findings_table)
+            widget._resultTableView = table_view
+            widget._resultTableSelectionModel = table_view.selectionModel()
+            widget._connectResultTableView = lambda: None
+            widget._refreshLinkedMarkupDisplayObservers()
+            display_node = findings_markup.GetDisplayNode()
+            display_node.SetActiveComponent(
+                slicer.vtkMRMLMarkupsDisplayNode.ComponentControlPoint, 0
+            )
+            display_node.InvokeEvent(
+                slicer.vtkMRMLMarkupsDisplayNode.JumpToPointEvent
+            )
+            self.assertEqual(
+                widget._pendingLinkedTableSelection,
+                (findings_table.GetID(), 0),
+            )
+            self.assertEqual(
+                slicer.app.applicationLogic().GetSelectionNode().GetActiveTableID(),
+                findings_table.GetID(),
+            )
+            widget._applyPendingLinkedTableSelection()
+            self.assertEqual(
+                {index.row() for index in table_view.selectedIndexes()},
+                {0},
+            )
+            widget._disconnectLinkedMarkupDisplayObservers()
 
             subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
                 slicer.mrmlScene

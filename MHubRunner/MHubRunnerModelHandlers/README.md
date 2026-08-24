@@ -28,11 +28,12 @@ run updates its existing MRML node. Tables and markups that describe the same
 findings should also share a `link_group`; the materialized nodes then receive
 bidirectional MRML node references.
 
-For interactive table-to-markup navigation, provide one stable `row_keys` entry
-per table row and assign the matching `key` to each spatial `MarkupPoint`.
-Findings without a valid spatial position keep their table row key but do not
-produce a markup point, so row selection cannot accidentally jump to a different
-finding.
+For interactive table/markup navigation, provide one stable `row_keys` entry per
+table row and assign the matching `key` to each spatial `MarkupPoint`. Selecting
+a table row selects its point, double-clicking also jumps the slice views, and
+clicking a point selects and scrolls to its table row. Findings without a valid
+spatial position keep their table row key but do not produce a markup point, so
+row selection cannot accidentally jump to a different finding.
 
 Spatial outputs must state their source coordinate system. For physical LPS
 positions, include the reported image dimensions, voxel spacing, origin, and

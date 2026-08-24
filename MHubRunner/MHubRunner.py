@@ -268,6 +268,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._resultSelectionNode = None
         self._resultTableView = None
         self._resultTableSelectionModel = None
+        self._linkedMarkupDisplayObservers = {}
+        self._pendingLinkedTableSelection = None
+        self._syncingResultSelection = False
 
     def setup(self) -> None:
         """
@@ -348,6 +351,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 vtk.vtkCommand.ModifiedEvent,
                 self._onResultSelectionNodeModified,
             )
+        self._scheduleResultInteractionRefresh()
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
@@ -471,6 +475,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         Called when the application closes and the module widget is destroyed.
         """
         self._disconnectResultTableView()
+        self._disconnectLinkedMarkupDisplayObservers()
         if self._resultLayoutManager is not None:
             try:
                 self._resultLayoutManager.layoutChanged.disconnect(self._onResultLayoutChanged)
@@ -1852,16 +1857,20 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         annotation_warning = result.get("annotationWarning")
         if annotation_warning:
             slicer.util.warningDisplay(annotation_warning)
-        self._scheduleResultTableInteractionRefresh()
+        self._scheduleResultInteractionRefresh()
 
-    def _scheduleResultTableInteractionRefresh(self) -> None:
-        qt.QTimer.singleShot(0, self._connectResultTableView)
+    def _scheduleResultInteractionRefresh(self) -> None:
+        qt.QTimer.singleShot(0, self._refreshResultInteractions)
+
+    def _refreshResultInteractions(self) -> None:
+        self._connectResultTableView()
+        self._refreshLinkedMarkupDisplayObservers()
 
     def _onResultLayoutChanged(self, *_args) -> None:
-        self._scheduleResultTableInteractionRefresh()
+        self._scheduleResultInteractionRefresh()
 
     def _onResultSelectionNodeModified(self, *_args) -> None:
-        self._scheduleResultTableInteractionRefresh()
+        self._scheduleResultInteractionRefresh()
 
     def _disconnectResultTableView(self) -> None:
         if self._resultTableSelectionModel is not None:
@@ -1902,6 +1911,50 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selection_model.selectionChanged.connect(self._onLinkedTableSelectionChanged)
         table_view.doubleClicked.connect(self._onLinkedTableDoubleClicked)
 
+    def _disconnectLinkedMarkupDisplayObservers(self) -> None:
+        for display_node, observer_tag in self._linkedMarkupDisplayObservers.values():
+            try:
+                display_node.RemoveObserver(observer_tag)
+            except RuntimeError:
+                pass
+        self._linkedMarkupDisplayObservers = {}
+
+    def _refreshLinkedMarkupDisplayObservers(self) -> None:
+        linked_display_nodes = {}
+        for markup_node in slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode"):
+            if not markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE):
+                continue
+            if not self._stringListNodeAttribute(
+                markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE
+            ):
+                continue
+            display_node = markup_node.GetDisplayNode()
+            if display_node is not None and display_node.GetID():
+                linked_display_nodes[display_node.GetID()] = display_node
+
+        for display_node_id, (display_node, observer_tag) in list(
+            self._linkedMarkupDisplayObservers.items()
+        ):
+            if linked_display_nodes.get(display_node_id) is display_node:
+                continue
+            try:
+                display_node.RemoveObserver(observer_tag)
+            except RuntimeError:
+                pass
+            del self._linkedMarkupDisplayObservers[display_node_id]
+
+        for display_node_id, display_node in linked_display_nodes.items():
+            if display_node_id in self._linkedMarkupDisplayObservers:
+                continue
+            observer_tag = display_node.AddObserver(
+                slicer.vtkMRMLMarkupsDisplayNode.JumpToPointEvent,
+                self._onLinkedMarkupJumpToPoint,
+            )
+            self._linkedMarkupDisplayObservers[display_node_id] = (
+                display_node,
+                observer_tag,
+            )
+
     @staticmethod
     def _stringListNodeAttribute(node, attribute_name: str) -> list[str]:
         encoded = node.GetAttribute(attribute_name) if node is not None else None
@@ -1936,6 +1989,29 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return markup_node, None
         return markup_node, point_index
 
+    @classmethod
+    def _linkedTableRowForMarkupPoint(cls, markup_node, point_index: int):
+        if markup_node is None or point_index < 0:
+            return None, None
+        table_node_id = markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE)
+        table_node = slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
+        if table_node is None or not table_node.IsA("vtkMRMLTableNode"):
+            return None, None
+
+        point_keys = cls._stringListNodeAttribute(
+            markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE
+        )
+        row_keys = cls._stringListNodeAttribute(table_node, _ROW_KEYS_ATTRIBUTE)
+        if point_index >= len(point_keys):
+            return table_node, None
+        try:
+            row = row_keys.index(point_keys[point_index])
+        except ValueError:
+            return table_node, None
+        if row >= table_node.GetNumberOfRows():
+            return table_node, None
+        return table_node, row
+
     @staticmethod
     def _selectMarkupControlPoint(markup_node, point_index: int | None) -> None:
         if markup_node is None:
@@ -1950,14 +2026,20 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         return slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
 
     def _activateLinkedTableRow(self, row: int, navigate: bool) -> None:
+        if self._syncingResultSelection:
+            return
         markup_node, point_index = self._linkedMarkupPointForTableRow(
             self._activeTableNode(), row
         )
-        self._selectMarkupControlPoint(markup_node, point_index)
-        if navigate and markup_node is not None and point_index is not None:
-            slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(
-                markup_node.GetID(), point_index, True
-            )
+        self._syncingResultSelection = True
+        try:
+            self._selectMarkupControlPoint(markup_node, point_index)
+            if navigate and markup_node is not None and point_index is not None:
+                slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(
+                    markup_node.GetID(), point_index, True
+                )
+        finally:
+            self._syncingResultSelection = False
 
     def _onLinkedTableSelectionChanged(self, *_args) -> None:
         if self._resultTableView is None:
@@ -1969,6 +2051,61 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def _onLinkedTableDoubleClicked(self, model_index) -> None:
         if model_index is not None and model_index.isValid():
             self._activateLinkedTableRow(model_index.row(), navigate=True)
+
+    def _onLinkedMarkupJumpToPoint(self, display_node, _event) -> None:
+        if self._syncingResultSelection:
+            return
+        if (
+            display_node.GetActiveComponentType()
+            != slicer.vtkMRMLMarkupsDisplayNode.ComponentControlPoint
+        ):
+            return
+        markup_node = display_node.GetDisplayableNode()
+        point_index = display_node.GetActiveControlPoint()
+        table_node, row = self._linkedTableRowForMarkupPoint(markup_node, point_index)
+        if table_node is None or row is None:
+            return
+
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        if selection_node is None:
+            return
+        if selection_node.GetActiveTableID() != table_node.GetID():
+            selection_node.SetReferenceActiveTableID(table_node.GetID())
+            slicer.app.applicationLogic().PropagateTableSelection()
+
+        self._pendingLinkedTableSelection = (table_node.GetID(), row)
+        qt.QTimer.singleShot(0, self._applyPendingLinkedTableSelection)
+
+    def _applyPendingLinkedTableSelection(self) -> None:
+        pending_selection = self._pendingLinkedTableSelection
+        self._pendingLinkedTableSelection = None
+        if pending_selection is None:
+            return
+        table_node_id, row = pending_selection
+        active_table_node = self._activeTableNode()
+        if active_table_node is None or active_table_node.GetID() != table_node_id:
+            return
+
+        self._connectResultTableView()
+        if self._resultTableView is None or self._resultTableSelectionModel is None:
+            return
+        table_model = self._resultTableView.model()
+        if table_model is None or row >= table_model.rowCount():
+            return
+        model_index = table_model.index(row, 0)
+        if not model_index.isValid():
+            return
+
+        self._syncingResultSelection = True
+        try:
+            selection_flags = (
+                qt.QItemSelectionModel.ClearAndSelect | qt.QItemSelectionModel.Rows
+            )
+            self._resultTableSelectionModel.select(model_index, selection_flags)
+            self._resultTableView.setCurrentIndex(model_index)
+            self._resultTableView.scrollTo(model_index)
+        finally:
+            self._syncingResultSelection = False
 
     def _loadOutputFile(self, output_file: str) -> None:
         assert self.logic is not None
@@ -2256,7 +2393,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                             input_is_dicom=input_is_dicom,
                             output_handling=output_handling,
                         )
-                        self._scheduleResultTableInteractionRefresh()
+                        self._scheduleResultInteractionRefresh()
                     except Exception:
                         logger.exception("Failed to process outputs for model %s", model.name)
                         slicer.util.errorDisplay(
