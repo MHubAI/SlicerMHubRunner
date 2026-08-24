@@ -422,11 +422,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if hasattr(self.ui, "inputSelector"):
             self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
 
-        # executable paths
-        docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
+        # Validate a saved Docker path and replace stale values through automatic discovery.
+        configured_docker_exec = settings.value("MHubRunner/DockerExecutable", "") or ""
+        if configured_docker_exec:
+            self.logic._executables["docker"] = configured_docker_exec
+        docker_exec = self.logic.getDockerExecutable()
         self._syncDockerExecutablePath(docker_exec)
         if docker_exec:
             self.logic._executables["docker"] = docker_exec
+            settings.setValue("MHubRunner/DockerExecutable", docker_exec)
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         if hasattr(self.ui, "pthDockerExecutableSetup"):
             self.ui.pthDockerExecutableSetup.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
@@ -676,13 +680,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _dockerExecutableAvailable(self) -> bool:
         path = self._getDockerExecutablePath()
-        if path and os.path.exists(path):
-            return True
+
+        # Require a configured manual path to resolve to a runnable executable.
         try:
             import shutil
-            return shutil.which("docker") is not None
+            if path:
+                return shutil.which(path) is not None
         except Exception:
             return False
+
+        # Use full automatic discovery when no manual path is configured.
+        return self.logic.getDockerExecutable(refresh=True) is not None
 
     def showDockerSetupScreen(self, force: bool = False) -> None:
         if self._dockerSetupDismissed and not force:
@@ -849,18 +857,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         docker_exec = self._getDockerExecutablePath()
         docker_exec = docker_exec or ""
         docker_status = "Docker unavailable"
-        if docker_exec and os.path.exists(docker_exec):
-            docker_status = f"Docker available at {docker_exec}"
-        else:
-            try:
-                import shutil
-                docker_path = shutil.which("docker")
-            except Exception:
-                docker_path = None
-            if docker_path:
-                docker_status = f"Docker available at {docker_path}"
-            elif docker_exec:
-                docker_status = f"Docker not found at {docker_exec}"
+
+        # Resolve the configured path before reporting Docker as available.
+        try:
+            import shutil
+            docker_path = shutil.which(docker_exec) if docker_exec else shutil.which("docker")
+        except Exception:
+            docker_path = None
+
+        # Describe either the resolved executable or the invalid configured path.
+        if docker_path:
+            docker_status = f"Docker available at {docker_path}"
+        elif docker_exec:
+            docker_status = f"Docker not found at {docker_exec}"
 
         summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
         self.ui.lblSetupSummary.text = summary_line
@@ -3128,37 +3137,64 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def getDockerExecutable(self, refresh: bool = False) -> str | None:
         import platform
-        import subprocess
+        import shutil
 
-        if not refresh and "docker" in self._executables and self._executables["docker"]:
-            return self._executables["docker"]
+        # Reuse a cached manual or detected path only while it remains executable.
+        cached_executable = self._executables.get("docker")
+        if not refresh and cached_executable:
+            resolved_cached = shutil.which(cached_executable)
+            if resolved_cached:
+                self._executables["docker"] = resolved_cached
+                return resolved_cached
+            self._executables.pop("docker", None)
+            logger.warning("Configured Docker executable is unavailable: %s", cached_executable)
 
-        # get operation system
+        # Prefer the executable exposed through PATH on every supported platform.
+        docker_executable = shutil.which("docker")
+
+        # Build platform-specific fallbacks for Docker Desktop and standard CLI installs.
         ops = platform.system()
-
-        # find docker executable (windows, any linux, mac)
-        docker_executable = None
+        fallback_candidates: list[str] = []
         if ops == "Windows":
-            docker_executable = r"C:\Program Files\Docker\Docker"
+            program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+            program_w6432 = os.environ.get("ProgramW6432", program_files)
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            fallback_candidates = [
+                os.path.join(program_files, "Docker", "Docker", "resources", "bin", "docker.exe"),
+                os.path.join(program_w6432, "Docker", "Docker", "resources", "bin", "docker.exe"),
+            ]
+            if local_app_data:
+                fallback_candidates.append(
+                    os.path.join(local_app_data, "Docker", "resources", "bin", "docker.exe")
+                )
         elif ops == "Darwin":
-            docker_executable = "/usr/local/bin/docker"
+            fallback_candidates = [
+                "/usr/local/bin/docker",
+                "/opt/homebrew/bin/docker",
+                "/Applications/Docker.app/Contents/Resources/bin/docker",
+            ]
         elif ops == "Linux":
-            try:
-                docker_executable = subprocess.run(["which", "docker"], capture_output=True).stdout.decode('utf-8').strip('\n')
-            except Exception as e:
-                pass
+            fallback_candidates = ["/usr/bin/docker", "/usr/local/bin/docker"]
+
+        # Use the first runnable fallback when Docker is not present on PATH.
+        if not docker_executable:
+            for candidate in dict.fromkeys(fallback_candidates):
+                resolved_candidate = shutil.which(candidate)
+                if resolved_candidate:
+                    docker_executable = resolved_candidate
+                    break
 
         logger.debug("Docker executable: %s", docker_executable)
 
-        # error
-        if docker_executable is None or docker_executable == "":
+        # Report failed discovery without caching an invalid path.
+        if not docker_executable:
             logger.warning("Docker executable not found.")
 
-        # cache
+        # Cache the validated executable for subsequent Docker operations.
         if docker_executable:
             self._executables["docker"] = docker_executable
 
-        # deliver
+        # Return the resolved executable or None when Docker is unavailable.
         return docker_executable
 
     def getDockerInformation(self) -> DockerInformation:

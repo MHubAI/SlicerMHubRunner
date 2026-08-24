@@ -19,7 +19,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         slicer.mrmlScene.Clear()
 
     @staticmethod
-    def _logic_without_dependency_setup():
+    def _logic_without_initialization():
         return MHubRunnerLogic.__new__(MHubRunnerLogic)
 
     def test_extension_build_footer(self):
@@ -94,11 +94,12 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         slicer.app.processEvents()
 
     def test_docker_image_digest_is_read_from_local_image(self):
-        logic = self._logic_without_dependency_setup()
+        logic = self._logic_without_initialization()
         logic._executables = {"docker": "/mock/docker"}
         expected_digest = "sha256:" + "a" * 64
 
-        with patch("subprocess.run") as run:
+        # Treat the mock Docker path as executable before inspecting the image digest.
+        with patch("shutil.which", return_value="/mock/docker"), patch("subprocess.run") as run:
             run.return_value = SimpleNamespace(stdout="sha256:" + "A" * 64)
             digest = logic.getDockerImageDigest("mhubai/example:latest")
 
@@ -114,6 +115,86 @@ class ModelOutputRuntimeTest(unittest.TestCase):
                 "mhubai/example:latest",
             ],
         )
+
+    def test_docker_detection_uses_path_on_linux(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {}
+
+        # Simulate a Linux installation where Docker is available through PATH.
+        with patch("platform.system", return_value="Linux"), patch(
+            "shutil.which", return_value="/usr/bin/docker"
+        ) as which:
+            executable = logic.getDockerExecutable()
+
+        self.assertEqual(executable, "/usr/bin/docker")
+        which.assert_called_once_with("docker")
+
+    def test_docker_detection_uses_macos_desktop_fallback(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {}
+        docker_desktop_path = "/Applications/Docker.app/Contents/Resources/bin/docker"
+
+        # Simulate Docker Desktop being absent from PATH but present in its application bundle.
+        def resolve_macos_executable(candidate):
+            return docker_desktop_path if candidate == docker_desktop_path else None
+
+        with patch("platform.system", return_value="Darwin"), patch(
+            "shutil.which", side_effect=resolve_macos_executable
+        ):
+            executable = logic.getDockerExecutable()
+
+        self.assertEqual(executable, docker_desktop_path)
+
+    def test_docker_detection_uses_windows_desktop_executable(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {}
+        docker_desktop_path = os.path.join(
+            r"C:\Program Files", "Docker", "Docker", "resources", "bin", "docker.exe"
+        )
+
+        # Simulate Docker Desktop being absent from PATH but installed in Program Files.
+        def resolve_windows_executable(candidate):
+            return docker_desktop_path if candidate == docker_desktop_path else None
+
+        with patch.dict(os.environ, {"ProgramFiles": r"C:\Program Files"}, clear=False), patch(
+            "platform.system", return_value="Windows"
+        ), patch("shutil.which", side_effect=resolve_windows_executable):
+            executable = logic.getDockerExecutable()
+
+        self.assertEqual(executable, docker_desktop_path)
+
+    def test_docker_detection_replaces_invalid_cached_path(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {"docker": "/obsolete/docker-directory"}
+
+        # Reject the stale configured value and fall back to the executable on PATH.
+        def resolve_executable(candidate):
+            return "/usr/local/bin/docker" if candidate == "docker" else None
+
+        with patch("platform.system", return_value="Darwin"), patch(
+            "shutil.which", side_effect=resolve_executable
+        ):
+            executable = logic.getDockerExecutable()
+
+        self.assertEqual(executable, "/usr/local/bin/docker")
+        self.assertEqual(logic._executables["docker"], "/usr/local/bin/docker")
+
+    def test_docker_information_checks_resolved_executable_version(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {"docker": "/resolved/docker"}
+
+        # Simulate a validated Docker CLI responding to the version check.
+        with patch("shutil.which", return_value="/resolved/docker"), patch(
+            "subprocess.run"
+        ) as run:
+            run.return_value = SimpleNamespace(stdout=b"Docker version 27.0.0\n")
+            information = logic.getDockerInformation()
+
+        self.assertTrue(information.available)
+        self.assertEqual(information.version, "Docker version 27.0.0\n")
+        self.assertEqual(run.call_args.args[0], ["/resolved/docker", "--version"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 5)
+        self.assertTrue(run.call_args.kwargs["check"])
 
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")
@@ -168,7 +249,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             status=ModelStatus.PULLED,
         )
 
-        logic = self._logic_without_dependency_setup()
+        logic = self._logic_without_initialization()
         markups_node = logic._createMarkupFromOutput(model, volume, markup)
 
         self.assertIsNotNone(markups_node)
@@ -256,7 +337,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             },
         }
 
-        logic = self._logic_without_dependency_setup()
+        logic = self._logic_without_initialization()
         with tempfile.TemporaryDirectory() as output_directory:
             result_path = os.path.join(
                 output_directory, "gc_grt123_lung_cancer_findings.json"
