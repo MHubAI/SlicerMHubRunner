@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import sys
 import threading
@@ -8,6 +9,7 @@ from typing import Annotated, Any, Optional, List, Literal, Dict, Union
 from collections.abc import Callable
 from dataclasses import dataclass
 import tempfile
+import uuid
 from enum import Enum
 import re
 
@@ -28,6 +30,15 @@ import hashlib
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+_RUN_SESSION_ID = uuid.uuid4().hex
+_RUN_ID_ATTRIBUTE = "MHubRunner.RunId"
+_OUTPUT_IDENTITY_ATTRIBUTE = "MHubRunner.OutputIdentity"
+_LINK_GROUP_ATTRIBUTE = "MHubRunner.LinkGroup"
+_LINKED_MARKUP_ROLE = "MHubRunner.LinkedMarkup"
+_LINKED_TABLE_ROLE = "MHubRunner.LinkedTable"
+_INPUT_NODE_ROLE = "MHubRunner.Input"
+_ROW_KEYS_ATTRIBUTE = "MHubRunner.RowKeys"
+_CONTROL_POINT_KEYS_ATTRIBUTE = "MHubRunner.ControlPointKeys"
 
 class Debouncer(qt.QObject):
     def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
@@ -254,6 +265,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._dockerSetupDismissed = False
         self._syncingDockerPath = False
 
+        # Track the current table view because Slicer replaces its Qt model as layouts change.
+        self._resultLayoutManager = None
+        self._resultSelectionNode = None
+        self._resultTableView = None
+        self._resultTableSelectionModel = None
+
+        # Track landmark-click observers and deferred table selections for reverse navigation.
+        self._linkedMarkupDisplayObservers = {}
+        self._pendingLinkedTableSelection = None
+
+        # Prevent programmatic table and landmark selections from feeding back into each other.
+        self._syncingResultSelection = False
+
     def setup(self) -> None:
         """
         Called when the user opens the module the first time and the widget is initialized.
@@ -267,10 +291,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         self._loadSettingsUi()
         self._setupSettingsSectionCollapse()
+        self._setupMainSectionCollapse()
 
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
         self._applySummaryOpacity()
+        self._updateExtensionBuildInfo()
         self._applyMainButtonIcons()
         self._applyOutputButtonIcons()
         self._closeStaleSettingsDialogs()
@@ -313,14 +339,36 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if hasattr(self.ui, "cmdShowDockerSetup"):
             self.ui.cmdShowDockerSetup.connect('clicked(bool)', self.showDockerSetupScreenFromSettings)
 
-        # output section
-        self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
+        # Restore the durable run location independently from temporary model input staging.
+        default_runs_directory = self._defaultRunsDirectory()
+        saved_runs_directory = settings.value(
+            "MHubRunner/RunsDirectory", default_runs_directory
+        ) or default_runs_directory
+        self.ui.pthRunsDirectory.currentPath = os.path.abspath(
+            os.path.expanduser(str(saved_runs_directory))
+        )
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
-        self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
+        self.ui.cmdRefreshRuns.connect('clicked(bool)', self.updateOutputRunDirectories)
         if hasattr(self.ui, "cmdOpenOutputFile"):
-            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onOpenOutputFile)
+            self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onLoadResults)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
+        self.ui.pthRunsDirectory.connect(
+            'currentPathChanged(QString)', self.onRunsDirectoryChanged
+        )
         self.updateOutputRunDirectories()
+
+        # Follow layout and active-table changes so result interaction hooks stay current.
+        self._resultLayoutManager = slicer.app.layoutManager()
+        if self._resultLayoutManager is not None:
+            self._resultLayoutManager.layoutChanged.connect(self._onResultLayoutChanged)
+        self._resultSelectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        if self._resultSelectionNode is not None:
+            self.addObserver(
+                self._resultSelectionNode,
+                vtk.vtkCommand.ModifiedEvent,
+                self._onResultSelectionNodeModified,
+            )
+        self._scheduleResultInteractionRefresh()
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
@@ -383,11 +431,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if hasattr(self.ui, "inputSelector"):
             self.ui.inputSelector.connect('currentNodeChanged(vtkMRMLNode*)', self.onInputNodeChanged)
 
-        # executable paths
-        docker_exec = settings.value("MHubRunner/DockerExecutable", self.logic.getDockerExecutable())
+        # Validate a saved Docker path and replace stale values through automatic discovery.
+        configured_docker_exec = settings.value("MHubRunner/DockerExecutable", "") or ""
+        if configured_docker_exec:
+            self.logic._executables["docker"] = configured_docker_exec
+        docker_exec = self.logic.getDockerExecutable()
         self._syncDockerExecutablePath(docker_exec)
         if docker_exec:
             self.logic._executables["docker"] = docker_exec
+            settings.setValue("MHubRunner/DockerExecutable", docker_exec)
         self.ui.pthDockerExecutable.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
         if hasattr(self.ui, "pthDockerExecutableSetup"):
             self.ui.pthDockerExecutableSetup.connect('currentPathChanged(QString)', self.onUpdateDockerExecutable)
@@ -428,22 +480,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
 
-        # print path
-        import sys
+        # Record the effective Python search path without invoking platform-specific shell tools.
         logger.debug("Python sys.path: %s", sys.path)
-
-        # run which python and which pip
-        import subprocess
-        logger.debug("which python3: %s", subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
-        # try the same with slicer.utils.consoleProcess
-        p = slicer.util.launchConsoleProcess(["which", "python3"])
-        logger.debug("slicer console which python3: %s", p.stdout.read())
 
     def cleanup(self) -> None:
         """
         Called when the application closes and the module widget is destroyed.
         """
+        # Detach result interaction callbacks before their Qt and VTK objects are destroyed.
+        self._disconnectResultTableView()
+        self._disconnectLinkedMarkupDisplayObservers()
+        if self._resultLayoutManager is not None:
+            try:
+                self._resultLayoutManager.layoutChanged.disconnect(self._onResultLayoutChanged)
+            except (RuntimeError, TypeError):
+                pass
+            self._resultLayoutManager = None
         self.removeObservers()
+        self._resultSelectionNode = None
 
     def enter(self) -> None:
         """
@@ -635,24 +689,34 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     def _dockerExecutableAvailable(self) -> bool:
         path = self._getDockerExecutablePath()
-        if path and os.path.exists(path):
-            return True
+
+        # Require a configured manual path to resolve to a runnable executable.
         try:
             import shutil
-            return shutil.which("docker") is not None
+            if path:
+                return shutil.which(path) is not None
         except Exception:
             return False
+
+        # Use full automatic discovery when no manual path is configured.
+        return self.logic.getDockerExecutable(refresh=True) is not None
 
     def showDockerSetupScreen(self, force: bool = False) -> None:
         if self._dockerSetupDismissed and not force:
             return
         self._updateDockerSetupLogo()
-        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "dockerSetupPanel"):
-            self.ui.stackedMain.setCurrentWidget(self.ui.dockerSetupPanel)
+        if hasattr(self.ui, "mainPanel") and hasattr(self.ui, "dockerSetupPanel"):
+            # Hide the workflow page so only the visible setup page contributes to layout size.
+            self.ui.mainPanel.hide()
+            self.ui.dockerSetupPanel.show()
+            self.ui.dockerSetupPanel.updateGeometry()
 
     def hideDockerSetupScreen(self) -> None:
-        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "mainPanel"):
-            self.ui.stackedMain.setCurrentWidget(self.ui.mainPanel)
+        if hasattr(self.ui, "mainPanel") and hasattr(self.ui, "dockerSetupPanel"):
+            # Hide the setup page so its larger size hint cannot constrain the workflow page.
+            self.ui.dockerSetupPanel.hide()
+            self.ui.mainPanel.show()
+            self.ui.mainPanel.updateGeometry()
 
     def dismissDockerSetupScreen(self, checked: bool = False) -> None:
         self._dockerSetupDismissed = True
@@ -704,7 +768,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmdOpenOutputFile.setIcon(self._themeIcon("hi_show"))
         self.ui.cmdOpenOutputFile.setIconSize(icon_size)
         self._setButtonTextWithIcon(self.ui.cmdOpenOutputFile, self.ui.cmdOpenOutputFile.text)
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
 
     def _updateMainButtonIcons(self) -> None:
         icon_size = getattr(self, "_mainButtonIconSize", qt.QSize(14, 14))
@@ -755,6 +819,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         "advancedCollapsibleButton",
         "logCollapsibleButton",
     )
+    _MAIN_SECTION_WIDGET_NAMES = (
+        "outputsCollapsibleButton",
+        "inputsCollapsibleButton",
+        "outputCollapsibleButton",
+    )
     _OUTPUT_HANDLING_OPTIONS = (
         ("Load and import (DICOMSEG)", "load_import"),
         ("Load only", "load_only"),
@@ -797,18 +866,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         docker_exec = self._getDockerExecutablePath()
         docker_exec = docker_exec or ""
         docker_status = "Docker unavailable"
-        if docker_exec and os.path.exists(docker_exec):
-            docker_status = f"Docker available at {docker_exec}"
-        else:
-            try:
-                import shutil
-                docker_path = shutil.which("docker")
-            except Exception:
-                docker_path = None
-            if docker_path:
-                docker_status = f"Docker available at {docker_path}"
-            elif docker_exec:
-                docker_status = f"Docker not found at {docker_exec}"
+
+        # Resolve the configured path before reporting Docker as available.
+        try:
+            import shutil
+            docker_path = shutil.which(docker_exec) if docker_exec else shutil.which("docker")
+        except Exception:
+            docker_path = None
+
+        # Describe either the resolved executable or the invalid configured path.
+        if docker_path:
+            docker_status = f"Docker available at {docker_path}"
+        elif docker_exec:
+            docker_status = f"Docker not found at {docker_exec}"
 
         summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
         self.ui.lblSetupSummary.text = summary_line
@@ -847,6 +917,37 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         palette.setColor(qt.QPalette.WindowText, color)
         self.ui.lblSetupSummary.setPalette(palette)
 
+    def _updateExtensionBuildInfo(self) -> None:
+        label = getattr(self.ui, "lblExtensionBuildInfo", None)
+        if label is None:
+            return
+
+        try:
+            from MHubRunnerBuildInfo import (
+                BUILD_REVISION,
+                BUILD_REVISION_SHORT,
+                EXTENSION_VERSION,
+            )
+        except ImportError:
+            # Direct source loading has no CMake-generated version or revision metadata.
+            EXTENSION_VERSION = None
+            BUILD_REVISION = "unknown"
+            BUILD_REVISION_SHORT = "unknown"
+
+        # Render a version-neutral development label when the generated module is unavailable.
+        version_text = EXTENSION_VERSION or "development source"
+        label.text = f"MHubRunner {version_text} \u00b7 build {BUILD_REVISION_SHORT}"
+        label.toolTip = (
+            f"Extension version: {version_text}\n"
+            f"Git revision: {BUILD_REVISION}"
+        )
+
+        palette = label.palette
+        color = palette.color(qt.QPalette.WindowText)
+        color.setAlpha(int(255 * 0.55))
+        palette.setColor(qt.QPalette.WindowText, color)
+        label.setPalette(palette)
+
     def _loadSettingsUi(self) -> None:
         if self._settingsWidget is not None:
             return
@@ -882,6 +983,39 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if widget is None or widget is opened_widget:
                 continue
             widget.collapsed = True
+
+    def _setupMainSectionCollapse(self) -> None:
+        # Keep one workflow section open so large tables cannot push actions below Data Probe.
+        if getattr(self, "_mainSectionSignalsWired", False):
+            return
+        self._mainSectionSignalsWired = True
+        for name in self._MAIN_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            widget.connect(
+                "toggled(bool)",
+                lambda _, opened_widget=widget: self._closeOtherMainSections(
+                    opened_widget
+                ),
+            )
+
+    def _closeOtherMainSections(self, opened_widget) -> None:
+        # Collapse the other workflow sections whenever the user expands one section.
+        if opened_widget is None or opened_widget.collapsed:
+            return
+        for name in self._MAIN_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None or widget is opened_widget:
+                continue
+            widget.collapsed = True
+
+    def _expandMainSection(self, section_widget) -> None:
+        # Apply the same exclusive-section behavior to programmatic workflow transitions.
+        if section_widget is None:
+            return
+        section_widget.collapsed = False
+        self._closeOtherMainSections(section_widget)
 
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
@@ -963,6 +1097,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         value = self.ui.cmbOutputHandling.itemData(index)
         settings = qt.QSettings()
         settings.setValue("MHubRunner/OutputHandling", value or "load_import")
+
+    @staticmethod
+    def _defaultRunsDirectory() -> str:
+        # Keep completed runs in the operating system's persistent application-data location.
+        application_data = qt.QStandardPaths.writableLocation(
+            qt.QStandardPaths.AppLocalDataLocation
+        )
+        if not application_data:
+            application_data = os.path.dirname(qt.QSettings().fileName())
+        return os.path.join(str(application_data), "MHubRunner", "runs")
+
+    def onRunsDirectoryChanged(self, path: str) -> None:
+        # Persist a user-selected run root and immediately refresh its available runs.
+        if not path:
+            return
+        normalized_path = os.path.abspath(os.path.expanduser(str(path)))
+        qt.QSettings().setValue("MHubRunner/RunsDirectory", normalized_path)
+        self.updateOutputRunDirectories()
 
     def onShowCompletionNotificationChanged(self, checked: bool) -> None:
         settings = qt.QSettings()
@@ -1474,6 +1626,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
+        # Advance to input selection after the user chooses a supported model.
+        if model is not None and model.inputs_compatibility:
+            self._expandMainSection(self.ui.inputsCollapsibleButton)
+
         # update apply button
         self._checkCanApply()
 
@@ -1702,7 +1858,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get run directories, ordered by creation date
         run_dirs = []
         for d in os.scandir(runs_dir):
-            if not d.is_dir() or d.name.startswith("."):
+            if d.is_symlink() or not d.is_dir() or d.name.startswith("."):
                 continue
             run_dirs.append(d)
         run_dirs.sort(key=lambda d: d.stat().st_ctime, reverse=True)
@@ -1739,6 +1895,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         # get output files
         output_files = self.logic.scanDirectoryForFilesWithExtension(output_dir, extension=[".json", ".csv", ".seg.dcm"])
+        output_files = [
+            path for path in output_files
+            if os.path.basename(path) != "mhubrunner-run.json"
+        ]
 
         # clear output list
         self.ui.lstOutputFiles.clear()
@@ -1748,20 +1908,330 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update list
         for output_file in output_files:
             item = qt.QListWidgetItem()
-            item.setText(os.path.relpath(output_file, output_dir))
+            item.setText(self._relativeOutputDisplayPath(output_file, output_dir))
             self.ui.lstOutputFiles.addItem(item)
 
             item.setData(qt.Qt.UserRole, output_file)
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
+
+    @staticmethod
+    def _relativeOutputDisplayPath(output_file: str, output_dir: str) -> str:
+        # Compare resolved paths so aliases such as macOS /tmp and /private/tmp display correctly.
+        return os.path.relpath(os.path.realpath(output_file), os.path.realpath(output_dir))
 
     def onOutputFileSelect(self) -> None:
-        self._updateOpenOutputFileButton()
+        self._updateLoadResultsButton()
 
-    def onOpenOutputFile(self) -> None:
-        output_file = self._getSelectedOutputFile()
-        if not output_file or not self._isSupportedOutputFile(output_file):
+    def onLoadResults(self) -> None:
+        assert self.logic is not None
+        output_dir = self._getSelectedOutputDirectory()
+        if not os.path.isdir(output_dir):
             return
-        self._loadOutputFile(output_file)
+        try:
+            result = self.logic.loadStoredRun(
+                output_dir=output_dir,
+                selected_input_node=self.ui.inputSelector.currentNode(),
+            )
+        except Exception as exc:
+            logger.exception("Failed to load stored run: %s", output_dir)
+            slicer.util.errorDisplay(
+                f"Failed to load stored run:\n{output_dir}\n\n{exc}"
+            )
+            return
+        if result is None:
+            output_file = self._getSelectedOutputFile()
+            if output_file is None and self.ui.lstOutputFiles.count:
+                output_file = self.ui.lstOutputFiles.item(0).data(qt.Qt.UserRole)
+            if output_file and self._isSupportedOutputFile(output_file):
+                self._loadOutputFile(output_file)
+            return
+        annotation_warning = result.get("annotationWarning")
+        if annotation_warning:
+            slicer.util.warningDisplay(annotation_warning)
+        self._scheduleResultInteractionRefresh()
+
+    def _scheduleResultInteractionRefresh(self) -> None:
+        # Wait for Slicer to finish replacing layout widgets and their selection models.
+        qt.QTimer.singleShot(0, self._refreshResultInteractions)
+
+    def _refreshResultInteractions(self) -> None:
+        # Refresh both directions of table/landmark interaction from the current scene state.
+        self._connectResultTableView()
+        self._refreshLinkedMarkupDisplayObservers()
+
+    def _onResultLayoutChanged(self, *_args) -> None:
+        self._scheduleResultInteractionRefresh()
+
+    def _onResultSelectionNodeModified(self, *_args) -> None:
+        self._scheduleResultInteractionRefresh()
+
+    def _disconnectResultTableView(self) -> None:
+        # Disconnect row-selection handling from the previous table selection model.
+        if self._resultTableSelectionModel is not None:
+            try:
+                self._resultTableSelectionModel.selectionChanged.disconnect(
+                    self._onLinkedTableSelectionChanged
+                )
+            except (RuntimeError, TypeError):
+                pass
+        # Disconnect double-click navigation from the previous table view.
+        if self._resultTableView is not None:
+            try:
+                self._resultTableView.doubleClicked.disconnect(
+                    self._onLinkedTableDoubleClicked
+                )
+            except (RuntimeError, TypeError):
+                pass
+        # Release replaced Qt objects after all their signals have been disconnected.
+        self._resultTableSelectionModel = None
+        self._resultTableView = None
+
+    def _connectResultTableView(self) -> None:
+        # Resolve the table view and selection model currently owned by the active layout.
+        layout_manager = slicer.app.layoutManager()
+        table_widget = layout_manager.tableWidget(0) if layout_manager is not None else None
+        table_view = table_widget.tableView() if table_widget is not None else None
+        selection_model = table_view.selectionModel() if table_view is not None else None
+        # Keep existing connections when Slicer has not replaced either Qt object.
+        if (
+            table_view is self._resultTableView
+            and selection_model is self._resultTableSelectionModel
+        ):
+            return
+
+        # Replace stale connections, or stop when the active layout contains no table.
+        self._disconnectResultTableView()
+        if table_view is None or selection_model is None:
+            return
+
+        # Subscribe to row selection and double-click navigation on the current view.
+        self._resultTableView = table_view
+        self._resultTableSelectionModel = selection_model
+        table_view.setSelectionBehavior(qt.QTableView.SelectRows)
+        selection_model.selectionChanged.connect(self._onLinkedTableSelectionChanged)
+        table_view.doubleClicked.connect(self._onLinkedTableDoubleClicked)
+
+    def _disconnectLinkedMarkupDisplayObservers(self) -> None:
+        # Remove all landmark-click observers retained by this widget.
+        for display_node, observer_tag in self._linkedMarkupDisplayObservers.values():
+            try:
+                display_node.RemoveObserver(observer_tag)
+            except RuntimeError:
+                pass
+        self._linkedMarkupDisplayObservers = {}
+
+    def _refreshLinkedMarkupDisplayObservers(self) -> None:
+        # Discover displayed fiducials that have stable point keys and a linked table.
+        linked_display_nodes = {}
+        for markup_node in slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode"):
+            if not markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE):
+                continue
+            if not self._stringListNodeAttribute(
+                markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE
+            ):
+                continue
+            display_node = markup_node.GetDisplayNode()
+            if display_node is not None and display_node.GetID():
+                linked_display_nodes[display_node.GetID()] = display_node
+
+        # Remove observers for display nodes that disappeared or were replaced in the scene.
+        for display_node_id, (display_node, observer_tag) in list(
+            self._linkedMarkupDisplayObservers.items()
+        ):
+            if linked_display_nodes.get(display_node_id) is display_node:
+                continue
+            try:
+                display_node.RemoveObserver(observer_tag)
+            except RuntimeError:
+                pass
+            del self._linkedMarkupDisplayObservers[display_node_id]
+
+        # Observe Slicer's explicit landmark-click event on newly discovered display nodes.
+        for display_node_id, display_node in linked_display_nodes.items():
+            if display_node_id in self._linkedMarkupDisplayObservers:
+                continue
+            observer_tag = display_node.AddObserver(
+                slicer.vtkMRMLMarkupsDisplayNode.JumpToPointEvent,
+                self._onLinkedMarkupJumpToPoint,
+            )
+            self._linkedMarkupDisplayObservers[display_node_id] = (
+                display_node,
+                observer_tag,
+            )
+
+    @staticmethod
+    def _stringListNodeAttribute(node, attribute_name: str) -> list[str]:
+        # Decode a JSON string-list attribute while treating malformed metadata as unavailable.
+        encoded = node.GetAttribute(attribute_name) if node is not None else None
+        if not encoded:
+            return []
+        try:
+            values = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            return []
+        return values
+
+    @classmethod
+    def _linkedMarkupPointForTableRow(cls, table_node, row: int):
+        # Follow the table's MRML reference to its linked fiducial node.
+        if table_node is None or row < 0:
+            return None, None
+        markup_node_id = table_node.GetNodeReferenceID(_LINKED_MARKUP_ROLE)
+        markup_node = slicer.mrmlScene.GetNodeByID(markup_node_id) if markup_node_id else None
+        if markup_node is None or not markup_node.IsA("vtkMRMLMarkupsFiducialNode"):
+            return None, None
+
+        # Resolve the row to a control point by stable finding key rather than list position.
+        row_keys = cls._stringListNodeAttribute(table_node, _ROW_KEYS_ATTRIBUTE)
+        point_keys = cls._stringListNodeAttribute(markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE)
+        if row >= len(row_keys):
+            return markup_node, None
+        try:
+            point_index = point_keys.index(row_keys[row])
+        except ValueError:
+            return markup_node, None
+        if point_index >= markup_node.GetNumberOfControlPoints():
+            return markup_node, None
+        return markup_node, point_index
+
+    @classmethod
+    def _linkedTableRowForMarkupPoint(cls, markup_node, point_index: int):
+        # Follow the fiducial node's MRML reference to its linked result table.
+        if markup_node is None or point_index < 0:
+            return None, None
+        table_node_id = markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE)
+        table_node = slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
+        if table_node is None or not table_node.IsA("vtkMRMLTableNode"):
+            return None, None
+
+        # Resolve the control point to a row by the same stable finding key.
+        point_keys = cls._stringListNodeAttribute(
+            markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE
+        )
+        row_keys = cls._stringListNodeAttribute(table_node, _ROW_KEYS_ATTRIBUTE)
+        if point_index >= len(point_keys):
+            return table_node, None
+        try:
+            row = row_keys.index(point_keys[point_index])
+        except ValueError:
+            return table_node, None
+        if row >= table_node.GetNumberOfRows():
+            return table_node, None
+        return table_node, row
+
+    @staticmethod
+    def _selectMarkupControlPoint(markup_node, point_index: int | None) -> None:
+        # Select exactly one corresponding landmark, or clear selection when none exists.
+        if markup_node is None:
+            return
+        for index in range(markup_node.GetNumberOfControlPoints()):
+            markup_node.SetNthControlPointSelected(index, index == point_index)
+
+    @staticmethod
+    def _activeTableNode():
+        # Resolve the table currently presented by Slicer's application selection node.
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        table_node_id = selection_node.GetActiveTableID() if selection_node is not None else None
+        return slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
+
+    def _activateLinkedTableRow(self, row: int, navigate: bool) -> None:
+        # Ignore callbacks caused by the inverse landmark-to-table synchronization.
+        if self._syncingResultSelection:
+            return
+
+        # Resolve the selected table row before entering the synchronization guard.
+        markup_node, point_index = self._linkedMarkupPointForTableRow(
+            self._activeTableNode(), row
+        )
+
+        # Select the landmark and optionally center slice views without triggering feedback.
+        self._syncingResultSelection = True
+        try:
+            self._selectMarkupControlPoint(markup_node, point_index)
+            if navigate and markup_node is not None and point_index is not None:
+                slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(
+                    markup_node.GetID(), point_index, True
+                )
+        finally:
+            self._syncingResultSelection = False
+
+    def _onLinkedTableSelectionChanged(self, *_args) -> None:
+        # Mirror the first selected table row to its linked landmark.
+        if self._resultTableView is None:
+            return
+        selected_indexes = self._resultTableView.selectedIndexes()
+        if selected_indexes:
+            self._activateLinkedTableRow(selected_indexes[0].row(), navigate=False)
+
+    def _onLinkedTableDoubleClicked(self, model_index) -> None:
+        # Treat a double-click as selection plus slice navigation to the landmark.
+        if model_index is not None and model_index.isValid():
+            self._activateLinkedTableRow(model_index.row(), navigate=True)
+
+    def _onLinkedMarkupJumpToPoint(self, display_node, _event) -> None:
+        # Ignore programmatic synchronization and non-control-point markup clicks.
+        if self._syncingResultSelection:
+            return
+        if (
+            display_node.GetActiveComponentType()
+            != slicer.vtkMRMLMarkupsDisplayNode.ComponentControlPoint
+        ):
+            return
+        # Resolve the clicked landmark to the corresponding table row.
+        markup_node = display_node.GetDisplayableNode()
+        point_index = display_node.GetActiveControlPoint()
+        table_node, row = self._linkedTableRowForMarkupPoint(markup_node, point_index)
+        if table_node is None or row is None:
+            return
+
+        # Make the linked table active so the visible table view presents the correct data.
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        if selection_node is None:
+            return
+        if selection_node.GetActiveTableID() != table_node.GetID():
+            selection_node.SetReferenceActiveTableID(table_node.GetID())
+            slicer.app.applicationLogic().PropagateTableSelection()
+
+        # Defer row selection until Slicer has propagated any active-table model change.
+        self._pendingLinkedTableSelection = (table_node.GetID(), row)
+        qt.QTimer.singleShot(0, self._applyPendingLinkedTableSelection)
+
+    def _applyPendingLinkedTableSelection(self) -> None:
+        # Consume the latest pending selection so older clicks cannot run afterward.
+        pending_selection = self._pendingLinkedTableSelection
+        self._pendingLinkedTableSelection = None
+        if pending_selection is None:
+            return
+        table_node_id, row = pending_selection
+        # Discard the request if another table became active before the timer fired.
+        active_table_node = self._activeTableNode()
+        if active_table_node is None or active_table_node.GetID() != table_node_id:
+            return
+
+        # Resolve the refreshed table model and validate that the target row still exists.
+        self._connectResultTableView()
+        if self._resultTableView is None or self._resultTableSelectionModel is None:
+            return
+        table_model = self._resultTableView.model()
+        if table_model is None or row >= table_model.rowCount():
+            return
+        model_index = table_model.index(row, 0)
+        if not model_index.isValid():
+            return
+
+        # Select and reveal the row while suppressing the forward synchronization callback.
+        self._syncingResultSelection = True
+        try:
+            selection_flags = (
+                qt.QItemSelectionModel.ClearAndSelect | qt.QItemSelectionModel.Rows
+            )
+            self._resultTableSelectionModel.select(model_index, selection_flags)
+            self._resultTableView.setCurrentIndex(model_index)
+            self._resultTableView.scrollTo(model_index)
+        finally:
+            self._syncingResultSelection = False
 
     def _loadOutputFile(self, output_file: str) -> None:
         assert self.logic is not None
@@ -1865,14 +2335,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         output_file = selected.data(qt.Qt.UserRole)
         return output_file or None
 
+    def _getSelectedOutputDirectory(self) -> str:
+        runs_dir = self.ui.pthRunsDirectory.currentPath
+        selected_run = self.ui.cmbSelectRunOutput.currentText
+        return os.path.join(runs_dir, selected_run)
+
     def _isSupportedOutputFile(self, output_file: str) -> bool:
         return output_file.endswith((".json", ".csv", ".seg.dcm"))
 
-    def _updateOpenOutputFileButton(self) -> None:
+    def _updateLoadResultsButton(self) -> None:
         if not hasattr(self.ui, "cmdOpenOutputFile"):
             return
-        output_file = self._getSelectedOutputFile()
-        enabled = bool(output_file) and self._isSupportedOutputFile(output_file)
+        enabled = any(
+            self._isSupportedOutputFile(self.ui.lstOutputFiles.item(index).data(qt.Qt.UserRole))
+            for index in range(self.ui.lstOutputFiles.count)
+        )
         self.ui.cmdOpenOutputFile.enabled = enabled
         icon_name = "hi_show" if enabled else "hi_noshow"
         opacity = 1.0 if enabled else self._ICON_DISABLED_OPACITY
@@ -1929,25 +2406,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         #         print(item.text())
         # return
 
+        assert self.logic is not None
+
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
         self._updateMainButtonIcons()
 
         ###### TEST (for caching on host)
-        # get InstanceUIDs (only available for nodes loaded through the dicom module)
+        # Resolve DICOM identity consistently from either instance or series metadata.
         node = self.ui.inputSelector.currentNode()
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
-        input_is_dicom = bool(instanceUIDs)
-
-        # create hash from instanceUIDs if available
-        if instanceUIDs:
-            hash = hashlib.sha256()
-            hash.update(instanceUIDs.encode('utf-8'))
-            instance_idh = hash.hexdigest()
-        else:
-            instance_idh = "non-dicom"
-            logger.debug("No DICOM instanceUIDs for node: %s", node.GetName() if node else None)
+        dicom_identity = self.logic.dicomInputIdentity(node)
+        input_is_dicom = dicom_identity["wasDicom"]
+        instance_idh = dicom_identity["dicomInstanceUIDHash"] or "non-dicom"
+        if not input_is_dicom:
+            logger.debug("No DICOM identity for node: %s", node.GetName() if node else None)
 
         # get selected model
         model = self.getModelFromTableSelection()
@@ -1965,11 +2438,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # TODO: create temp directory for slicer-mhub under $HOME/.slicer-mhub ??
             #tmp_dir = "/Users/lenny/Projects/SlicerMHubIntegration/SlicerMHubRunner/return_data"
-            tmp_dir = "/tmp/mhub_slicer_extension"
+            # Use the platform temporary directory only for disposable model input staging.
+            tmp_dir = os.path.join(tempfile.gettempdir(), "mhub_slicer_extension")
             runs_dir = self.ui.pthRunsDirectory.currentPath
 
             input_dir = os.path.join(tmp_dir, "input")
             output_dir = os.path.join(runs_dir, runid)
+            model_output_dir = os.path.join(output_dir, "outputs")
 
             # if input dir exists, remove it -> we always make sure to run on a fresh input dir (NOTE: parallel execution ofc wouldn't work like this)
             if os.path.exists(input_dir):
@@ -1978,6 +2453,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # create temp dir with input and output dir
             os.makedirs(input_dir, exist_ok=True)
             os.makedirs(output_dir, exist_ok=True)
+            os.makedirs(model_output_dir, exist_ok=True)
+
+            self.logic.createRunManifest(
+                run_id=runid,
+                model=model,
+                input_node=node,
+                output_dir=output_dir,
+            )
 
             # get selected gpus
             # TODO: make gpus None
@@ -1994,10 +2477,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             modality = None
             if hasattr(self.ui, "cmbInputModality"):
                 modality = self.ui.cmbInputModality.currentText
-            self.logic.copy_node(
-                self.ui.inputSelector.currentNode(),
-                input_dir,
-                modality=modality
+            self.logic.prepareModelInputs(
+                model=model,
+                selected_node=self.ui.inputSelector.currentNode(),
+                input_dir=input_dir,
+                modality=modality,
             )
 
             # clear logs
@@ -2014,21 +2498,38 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
                 # ---------------------- process model results
 
-                output_handling = self._getOutputHandlingMode()
-                if 'Segmentation' in model.categories:
-                    dsegfiles = self.logic.scanDirectoryForFilesWithExtension(output_dir)
-                    if output_handling in ("load_import", "import_only") and input_is_dicom:
-                        self.logic.addFilesToDatabase(dsegfiles, operation="copy")
-                    if output_handling in ("load_import", "load_only"):
-                        self.logic.loadSegmentations(dsegfiles)
+                try:
+                    self.logic.finalizeRunManifest(
+                        output_dir=output_dir,
+                        returncode=returncode,
+                        timedout=timedout,
+                        killed=killed,
+                    )
+                except Exception:
+                    logger.exception("Failed to finalize run manifest: %s", output_dir)
 
-                if output_handling in ("load_import", "load_only"):
-                    self._loadTabularOutputsFromRun(output_dir)
+                output_handling = self._getOutputHandlingMode()
+                if returncode == 0 and not timedout and not killed:
+                    try:
+                        self.logic.processModelOutputs(
+                            model=model,
+                            input_node=node,
+                            output_dir=output_dir,
+                            input_is_dicom=input_is_dicom,
+                            output_handling=output_handling,
+                        )
+                        self._scheduleResultInteractionRefresh()
+                    except Exception:
+                        logger.exception("Failed to process outputs for model %s", model.name)
+                        slicer.util.errorDisplay(
+                            f"The model completed, but its outputs could not be displayed.\n\n"
+                            f"The original files remain available in:\n{output_dir}"
+                        )
 
                 open_panel = self._getOpenOutputPanelOnComplete()
                 self.updateOutputRunDirectories(open_latest=open_panel)
                 if open_panel:
-                    self.ui.outputCollapsibleButton.collapsed = False
+                    self._expandMainSection(self.ui.outputCollapsibleButton)
 
                 if self._getOpenRunFolderOnComplete():
                     self._openOutputFolder(output_dir)
@@ -2056,7 +2557,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 model=model,
                 gpus=gpus,
                 input_dir=input_dir,
-                output_dir=output_dir,
+                output_dir=model_output_dir,
                 onProgress=onProgress,
                 onStop=onStop
             )
@@ -2514,7 +3015,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         Called when the logic class is instantiated. Can be used for initializing member variables.
         """
         ScriptedLoadableModuleLogic.__init__(self)
-        self.setupPythonRequirements()
         self._executables: dict[str, str] = {}
         # self.hosts: List[str] = []
         # self.hostInfo: Dict[str, HostInformation] = {}
@@ -2524,22 +3024,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def getParameterNode(self):
         return MHubRunnerParameterNode(super().getParameterNode())
-
-    def setupPythonRequirements(self, upgrade=False):
-
-        # install sshconf python package
-        try:
-          import sshconf
-        except ModuleNotFoundError as e:
-           #self.log('sshconf is required. Installing...')
-           slicer.util.pip_install('sshconf')
-
-        # install paramiko python package
-        try:
-            import paramiko
-        except ModuleNotFoundError as e:
-            #self.log('paramiko is required. Installing...')
-            slicer.util.pip_install('paramiko')
 
     def _build_subprocess_env(self, executable_path: str | None = None) -> dict[str, str]:
         env = os.environ.copy()
@@ -2685,37 +3169,64 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def getDockerExecutable(self, refresh: bool = False) -> str | None:
         import platform
-        import subprocess
+        import shutil
 
-        if not refresh and "docker" in self._executables and self._executables["docker"]:
-            return self._executables["docker"]
+        # Reuse a cached manual or detected path only while it remains executable.
+        cached_executable = self._executables.get("docker")
+        if not refresh and cached_executable:
+            resolved_cached = shutil.which(cached_executable)
+            if resolved_cached:
+                self._executables["docker"] = resolved_cached
+                return resolved_cached
+            self._executables.pop("docker", None)
+            logger.warning("Configured Docker executable is unavailable: %s", cached_executable)
 
-        # get operation system
+        # Prefer the executable exposed through PATH on every supported platform.
+        docker_executable = shutil.which("docker")
+
+        # Build platform-specific fallbacks for Docker Desktop and standard CLI installs.
         ops = platform.system()
-
-        # find docker executable (windows, any linux, mac)
-        docker_executable = None
+        fallback_candidates: list[str] = []
         if ops == "Windows":
-            docker_executable = r"C:\Program Files\Docker\Docker"
+            program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+            program_w6432 = os.environ.get("ProgramW6432", program_files)
+            local_app_data = os.environ.get("LOCALAPPDATA", "")
+            fallback_candidates = [
+                os.path.join(program_files, "Docker", "Docker", "resources", "bin", "docker.exe"),
+                os.path.join(program_w6432, "Docker", "Docker", "resources", "bin", "docker.exe"),
+            ]
+            if local_app_data:
+                fallback_candidates.append(
+                    os.path.join(local_app_data, "Docker", "resources", "bin", "docker.exe")
+                )
         elif ops == "Darwin":
-            docker_executable = "/usr/local/bin/docker"
+            fallback_candidates = [
+                "/usr/local/bin/docker",
+                "/opt/homebrew/bin/docker",
+                "/Applications/Docker.app/Contents/Resources/bin/docker",
+            ]
         elif ops == "Linux":
-            try:
-                docker_executable = subprocess.run(["which", "docker"], capture_output=True).stdout.decode('utf-8').strip('\n')
-            except Exception as e:
-                pass
+            fallback_candidates = ["/usr/bin/docker", "/usr/local/bin/docker"]
+
+        # Use the first runnable fallback when Docker is not present on PATH.
+        if not docker_executable:
+            for candidate in dict.fromkeys(fallback_candidates):
+                resolved_candidate = shutil.which(candidate)
+                if resolved_candidate:
+                    docker_executable = resolved_candidate
+                    break
 
         logger.debug("Docker executable: %s", docker_executable)
 
-        # error
-        if docker_executable is None or docker_executable == "":
+        # Report failed discovery without caching an invalid path.
+        if not docker_executable:
             logger.warning("Docker executable not found.")
 
-        # cache
+        # Cache the validated executable for subsequent Docker operations.
         if docker_executable:
             self._executables["docker"] = docker_executable
 
-        # deliver
+        # Return the resolved executable or None when Docker is unavailable.
         return docker_executable
 
     def getDockerInformation(self) -> DockerInformation:
@@ -2789,11 +3300,10 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         return images
 
     def get_node_paths(self, node) -> list[str]:
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
-        if instanceUIDs:
-            instanceUIDs = instanceUIDs.split()
-            files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
-            return [f for f in files if f]
+        # Prefer original DICOM files resolved from either instance or series identity.
+        dicom_files = self.dicomFilesForNode(node)
+        if dicom_files:
+            return dicom_files
 
         storageNode = node.GetStorageNode() if node else None
         if storageNode is not None:
@@ -2802,6 +3312,27 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 return [file_path]
 
         raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
+
+    def dicomFilesForNode(self, node) -> list[str]:
+        # Resolve instance-level DICOM files when the node retains SOP Instance UIDs.
+        database = getattr(slicer, "dicomDatabase", None)
+        if node is None or database is None or not database.isOpen:
+            return []
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs")
+        if instance_uids:
+            files = [database.fileForInstance(uid) for uid in instance_uids.split()]
+            files = [path for path in files if path]
+            if files:
+                return files
+
+        # Fall back to all database files for the Series Instance UID.
+        series_uid = self._seriesInstanceUIDForNode(node)
+        if series_uid:
+            try:
+                return [path for path in database.filesForSeries(series_uid) if path]
+            except Exception:
+                logger.debug("Could not resolve DICOM files for series %s", series_uid, exc_info=True)
+        return []
 
     def _normalize_modality(self, modality: str | None) -> str:
         if not modality:
@@ -2887,6 +3418,697 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # open csv in yellow table view node
         self.showTable(tableNode)
 
+    @staticmethod
+    def dicomInstanceUIDHash(node) -> str | None:
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs") if node else None
+        if not instance_uids:
+            return None
+        canonical_uids = "\n".join(sorted(instance_uids.split()))
+        return hashlib.sha256(canonical_uids.encode("utf-8")).hexdigest()
+
+    def dicomInputIdentity(self, node) -> dict:
+        # Treat either durable DICOM identifier as evidence that the source was DICOM.
+        series_uid = self._seriesInstanceUIDForNode(node)
+        instance_uid_hash = self.dicomInstanceUIDHash(node)
+        return {
+            "wasDicom": bool(series_uid or instance_uid_hash),
+            "dicomSeriesInstanceUID": series_uid,
+            "dicomInstanceUIDHash": instance_uid_hash,
+        }
+
+    def _seriesInstanceUIDForNode(self, node) -> str | None:
+        if node is None:
+            return None
+        try:
+            subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+                slicer.mrmlScene
+            )
+            item_id = subject_hierarchy.GetItemByDataNode(node)
+            series_uid = subject_hierarchy.GetItemUID(item_id, "DICOM") if item_id else None
+            if series_uid:
+                return series_uid
+        except Exception:
+            logger.debug("Could not read DICOM series UID from subject hierarchy", exc_info=True)
+
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs")
+        if not instance_uids or not getattr(slicer, "dicomDatabase", None):
+            return None
+        first_instance_uid = instance_uids.split()[0]
+        try:
+            return slicer.dicomDatabase.instanceValue(first_instance_uid, "0020,000E") or None
+        except Exception:
+            logger.debug("Could not read DICOM series UID from database", exc_info=True)
+            return None
+
+    @staticmethod
+    def _nodeGeometryForManifest(node) -> dict:
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode") or node.GetImageData() is None:
+            raise ValueError("Run manifests require a scalar volume with image data.")
+        matrix = vtk.vtkMatrix4x4()
+        node.GetIJKToRASMatrix(matrix)
+        return {
+            "dimensions": [int(value) for value in node.GetImageData().GetDimensions()],
+            "ijkToRAS": [
+                [float(matrix.GetElement(row, column)) for column in range(4)]
+                for row in range(4)
+            ],
+        }
+
+    def getDockerImageDigest(self, image_name: str) -> str:
+        import subprocess
+
+        docker_executable = self.getDockerExecutable()
+        if not docker_executable:
+            raise RuntimeError("Docker is unavailable; the model image digest cannot be recorded.")
+
+        try:
+            result = subprocess.run(
+                [docker_executable, "image", "inspect", "--format", "{{.Id}}", image_name],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=self._build_subprocess_env(docker_executable),
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(
+                f"Cannot inspect the local model image {image_name!r} to record its digest."
+            ) from exc
+
+        image_digest = result.stdout.strip()
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", image_digest):
+            raise RuntimeError(
+                f"Docker returned an invalid image digest for {image_name!r}: {image_digest!r}."
+            )
+        return image_digest.lower()
+
+    def createRunManifest(
+        self,
+        run_id: str,
+        model: Model,
+        input_node,
+        output_dir: str,
+        image_digest: str | None = None,
+    ) -> dict:
+        from MHubRunnerModelHandlers.run_manifest import new_run_manifest, write_run_manifest
+
+        dicom_identity = self.dicomInputIdentity(input_node)
+        image_name = f"mhubai/{model.name}:latest"
+        image_digest = image_digest or self.getDockerImageDigest(image_name)
+        manifest = new_run_manifest(
+            run_id=run_id,
+            model_name=model.name,
+            model_label=model.label,
+            model_categories=list(model.categories),
+            image_name=image_name,
+            image_digest=image_digest,
+            slicer_session_id=_RUN_SESSION_ID,
+            input_data={
+                "nodeId": input_node.GetID() if input_node else "",
+                **dicom_identity,
+                "geometry": self._nodeGeometryForManifest(input_node),
+            },
+        )
+        write_run_manifest(output_dir, manifest)
+        return manifest
+
+    @staticmethod
+    def _relativeRunOutputPaths(output_dir: str) -> list[str]:
+        from MHubRunnerModelHandlers.run_manifest import MANIFEST_FILENAME
+
+        # Record only regular files physically contained by the run directory.
+        output_root = os.path.realpath(output_dir)
+        output_paths = []
+        for root, directories, filenames in os.walk(output_root, followlinks=False):
+            directories[:] = [
+                name for name in directories if not os.path.islink(os.path.join(root, name))
+            ]
+            for filename in filenames:
+                if filename == MANIFEST_FILENAME or filename.startswith(".mhubrunner-run-"):
+                    continue
+                absolute_path = os.path.join(root, filename)
+                if os.path.islink(absolute_path):
+                    continue
+                resolved_path = os.path.realpath(absolute_path)
+                try:
+                    path_is_inside_run = os.path.commonpath(
+                        [output_root, resolved_path]
+                    ) == output_root
+                except ValueError:
+                    path_is_inside_run = False
+                if not path_is_inside_run or not os.path.isfile(resolved_path):
+                    continue
+                relative_path = os.path.relpath(resolved_path, output_root).replace(os.sep, "/")
+                output_paths.append(relative_path)
+        return sorted(output_paths)
+
+    def finalizeRunManifest(
+        self,
+        output_dir: str,
+        returncode: int,
+        timedout: bool,
+        killed: bool,
+    ) -> dict:
+        from MHubRunnerModelHandlers.run_manifest import finalize_run_manifest
+
+        return finalize_run_manifest(
+            output_dir,
+            return_code=returncode,
+            timed_out=timedout,
+            killed=killed,
+            output_paths=self._relativeRunOutputPaths(output_dir),
+        )
+
+    @staticmethod
+    def _storedGeometryMatchesNode(node, geometry: dict, tolerance: float = 1e-3) -> bool:
+        if node is None or not node.IsA("vtkMRMLScalarVolumeNode") or node.GetImageData() is None:
+            return False
+        try:
+            dimensions = tuple(int(value) for value in geometry["dimensions"])
+            stored_matrix = geometry["ijkToRAS"]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if tuple(node.GetImageData().GetDimensions()) != dimensions:
+            return False
+        actual_matrix = vtk.vtkMatrix4x4()
+        node.GetIJKToRASMatrix(actual_matrix)
+        for row in range(4):
+            for column in range(4):
+                if abs(float(stored_matrix[row][column]) - actual_matrix.GetElement(row, column)) > tolerance:
+                    return False
+        return True
+
+    def _storedInputMatchesNode(self, node, manifest: dict) -> bool:
+        input_data = manifest["input"]
+        if not self._storedGeometryMatchesNode(node, input_data["geometry"]):
+            return False
+
+        if input_data["wasDicom"]:
+            stored_series_uid = input_data.get("dicomSeriesInstanceUID")
+            stored_instance_hash = input_data.get("dicomInstanceUIDHash")
+            if stored_series_uid and self._seriesInstanceUIDForNode(node) != stored_series_uid:
+                return False
+            if stored_instance_hash and self.dicomInstanceUIDHash(node) != stored_instance_hash:
+                return False
+            return bool(stored_series_uid or stored_instance_hash)
+
+        return (
+            manifest.get("slicerSessionId") == _RUN_SESSION_ID
+            and node.GetID() == input_data.get("nodeId")
+        )
+
+    def _resolveStoredRunInput(self, manifest: dict, selected_input_node=None):
+        input_data = manifest["input"]
+        if manifest.get("slicerSessionId") == _RUN_SESSION_ID:
+            node_id = input_data.get("nodeId")
+            node = slicer.mrmlScene.GetNodeByID(node_id) if node_id else None
+            if self._storedInputMatchesNode(node, manifest):
+                return node
+
+        if selected_input_node is not None and self._storedInputMatchesNode(selected_input_node, manifest):
+            return selected_input_node
+
+        if input_data["wasDicom"]:
+            for node in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+                if self._storedInputMatchesNode(node, manifest):
+                    return node
+
+            series_uid = input_data.get("dicomSeriesInstanceUID")
+            database = getattr(slicer, "dicomDatabase", None)
+            if series_uid and database is not None and database.isOpen:
+                try:
+                    if database.filesForSeries(series_uid):
+                        from DICOMLib.DICOMUtils import loadSeriesByUID
+
+                        loaded_node_ids = loadSeriesByUID([series_uid])
+                        for node_id in loaded_node_ids:
+                            node = slicer.mrmlScene.GetNodeByID(node_id)
+                            if self._storedInputMatchesNode(node, manifest):
+                                return node
+                except Exception:
+                    logger.exception("Failed to load stored input DICOM series %s", series_uid)
+        return None
+
+    @staticmethod
+    def _legacyModelNameFromRunDirectory(output_dir: str) -> str | None:
+        run_directory_name = os.path.basename(os.path.normpath(output_dir))
+        match = re.match(r"^\d{2}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}_(.+)$", run_directory_name)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _modelFromStoredMetadata(model_data: dict) -> Model:
+        return Model(
+            id=f"stored:{model_data['name']}",
+            name=model_data["name"],
+            label=model_data.get("label") or model_data["name"],
+            description="",
+            modalities=[],
+            categories=list(model_data.get("categories", [])),
+            roi=[],
+            cite="",
+            license_model="",
+            license_weights="",
+            commercial_use=False,
+            inputs=[],
+            inputs_compatibility=True,
+        )
+
+    def loadStoredRun(self, output_dir: str, selected_input_node=None) -> dict | None:
+        from MHubRunnerModelHandlers.run_manifest import (
+            MANIFEST_FILENAME,
+            load_run_manifest,
+            resolve_manifest_output_files,
+        )
+
+        manifest_file = os.path.join(output_dir, MANIFEST_FILENAME)
+        if os.path.exists(manifest_file):
+            manifest = load_run_manifest(output_dir)
+            output_files = resolve_manifest_output_files(output_dir, manifest)
+            model = self._modelFromStoredMetadata(manifest["model"])
+            input_node = self._resolveStoredRunInput(manifest, selected_input_node)
+            input_is_dicom = bool(manifest["input"]["wasDicom"])
+        else:
+            model_name = self._legacyModelNameFromRunDirectory(output_dir)
+            if not model_name:
+                return None
+            model = self._modelFromStoredMetadata(
+                {"name": model_name, "label": model_name, "categories": []}
+            )
+            manifest = None
+            output_files = None
+            input_node = None
+            input_is_dicom = False
+
+        plan = self.processModelOutputs(
+            model=model,
+            input_node=input_node,
+            output_dir=output_dir,
+            input_is_dicom=input_is_dicom,
+            output_handling="load_only",
+            run_id=manifest["runId"] if manifest is not None else os.path.basename(output_dir),
+            output_files=output_files,
+        )
+        annotation_warning = None
+        if plan is not None and plan.markups and input_node is None:
+            if manifest is None:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but this legacy run has no input "
+                    "manifest. Annotations were skipped because the original input cannot be verified."
+                )
+            elif manifest["input"]["wasDicom"]:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but the original DICOM input could not "
+                    "be resolved and verified. Annotations were skipped."
+                )
+            else:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but this non-DICOM input is no longer "
+                    "available in the original Slicer session. Annotations were skipped."
+                )
+        elif plan is not None and plan.markups:
+            geometry_errors = [
+                self._validateMarkupImageGeometry(input_node, markup.image_geometry)
+                for markup in plan.markups
+            ]
+            geometry_errors = [error for error in geometry_errors if error]
+            if geometry_errors:
+                annotation_warning = (
+                    "The model-specific tables were loaded, but annotations were skipped because "
+                    f"{geometry_errors[0]}."
+                )
+        return {
+            "manifest": manifest,
+            "model": model,
+            "inputNode": input_node,
+            "plan": plan,
+            "annotationWarning": annotation_warning,
+        }
+
+    def processModelOutputs(
+        self,
+        model: Model,
+        input_node,
+        output_dir: str,
+        input_is_dicom: bool,
+        output_handling: str,
+        run_id: str | None = None,
+        output_files: list[str] | None = None,
+    ):
+        """Resolve model outputs through an exact-model handler or the generic fallback."""
+        from MHubRunnerModelHandlers import ModelHandlerRegistry, OutputHandlerContext
+
+        # Skip both import and visualization when output handling is disabled.
+        if output_handling == "none":
+            return None
+
+        # Ask the exact-model handler, or the generic fallback, for a declarative output plan.
+        context = OutputHandlerContext(
+            model_name=model.name,
+            model_label=model.label,
+            model_categories=list(model.categories),
+            output_directory=output_dir,
+            output_files=output_files,
+        )
+        handler = ModelHandlerRegistry().handler_for(model.name)
+        logger.info("Processing %s outputs with %s", model.name, type(handler).__name__)
+        plan = handler.build_output_plan(context)
+        run_id = run_id or os.path.basename(os.path.normpath(output_dir))
+
+        # Report handler warnings without changing or clinically interpreting their content.
+        for warning in plan.warnings:
+            logger.warning("%s", warning)
+
+        # Import DICOM SEG outputs only when the run input belongs to the DICOM database.
+        if output_handling in ("load_import", "import_only"):
+            if input_is_dicom and plan.segmentation_files:
+                self.addFilesToDatabase(plan.segmentation_files, operation="copy")
+            elif plan.segmentation_files and not input_is_dicom:
+                logger.info("DICOM SEG import skipped because the input was not in the DICOM database.")
+
+        # Return after import when the selected mode does not request scene visualization.
+        if output_handling not in ("load_import", "load_only"):
+            return plan
+
+        # Group every visualized output from this run under one Subject Hierarchy folder.
+        run_folder_item_id = self._getOrCreateRunFolder(run_id, model)
+
+        # Create or update planned tables and index them by their optional link group.
+        table_nodes_by_link: dict[str, list[Any]] = {}
+        for table in plan.tables:
+            identity = self._plannedOutputIdentity(
+                "table", table.source_file, table.identity, output_dir
+            )
+            table_node = self._findOutputNode("vtkMRMLTableNode", run_id, identity)
+            if table_node is None:
+                table_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLTableNode", table.name)
+            table_node.SetName(table.name)
+            self._setOutputNodeMetadata(
+                table_node,
+                model=model,
+                run_id=run_id,
+                output_identity=identity,
+                source_file=table.source_file,
+                link_group=table.link_group,
+                input_node=input_node,
+            )
+            # Persist only a complete, unique row-key mapping for interactive navigation.
+            row_keys = [str(key) for key in table.row_keys]
+            if row_keys and (
+                len(row_keys) != len(table.rows) or len(set(row_keys)) != len(row_keys)
+            ):
+                logger.warning(
+                    "Interactive row linking disabled for %s: row keys must be unique and match rows.",
+                    table.source_file,
+                )
+                row_keys = []
+            table_node.SetAttribute(
+                _ROW_KEYS_ATTRIBUTE,
+                json.dumps(row_keys) if row_keys else None,
+            )
+            self.renderTableData(table_node, table.columns, table.rows)
+            self._moveNodeToRunFolder(table_node, run_folder_item_id)
+            if table.link_group:
+                table_nodes_by_link.setdefault(table.link_group, []).append(table_node)
+
+        # Create geometry-validated markups and index them by the same link-group contract.
+        markup_nodes_by_link: dict[str, list[Any]] = {}
+        for markup in plan.markups:
+            identity = self._plannedOutputIdentity(
+                "markup", markup.source_file, markup.identity, output_dir
+            )
+            markup_node = self._createMarkupFromOutput(
+                model,
+                input_node,
+                markup,
+                run_id=run_id,
+                output_identity=identity,
+                run_folder_item_id=run_folder_item_id,
+            )
+            if markup_node is not None and markup.link_group:
+                markup_nodes_by_link.setdefault(markup.link_group, []).append(markup_node)
+
+        # Store bidirectional MRML references between the first table and markup in each group.
+        for link_group in set(table_nodes_by_link).intersection(markup_nodes_by_link):
+            table_node = table_nodes_by_link[link_group][0]
+            markup_node = markup_nodes_by_link[link_group][0]
+            table_node.SetNodeReferenceID(_LINKED_MARKUP_ROLE, markup_node.GetID())
+            markup_node.SetNodeReferenceID(_LINKED_TABLE_ROLE, table_node.GetID())
+
+        # Reuse existing segmentation nodes or load and tag newly created ones.
+        for segmentation_file in plan.segmentation_files:
+            identity = self._plannedOutputIdentity(
+                "segmentation", segmentation_file, "", output_dir
+            )
+            existing_nodes = self._findOutputNodes(
+                "vtkMRMLSegmentationNode", run_id, identity
+            )
+            if existing_nodes:
+                for segmentation_node in existing_nodes:
+                    self._setOutputNodeMetadata(
+                        segmentation_node,
+                        model=model,
+                        run_id=run_id,
+                        output_identity=identity,
+                        source_file=segmentation_file,
+                        input_node=input_node,
+                    )
+                    self._moveNodeToRunFolder(segmentation_node, run_folder_item_id)
+                continue
+
+            existing_ids = {
+                node.GetID()
+                for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+            }
+            self.loadSegmentations([segmentation_file])
+            new_nodes = [
+                node
+                for node in slicer.util.getNodesByClass("vtkMRMLSegmentationNode")
+                if node.GetID() not in existing_ids
+            ]
+            for segmentation_node in new_nodes:
+                self._setOutputNodeMetadata(
+                    segmentation_node,
+                    model=model,
+                    run_id=run_id,
+                    output_identity=identity,
+                    source_file=segmentation_file,
+                    input_node=input_node,
+                )
+                self._moveNodeToRunFolder(segmentation_node, run_folder_item_id)
+        return plan
+
+    @staticmethod
+    def _plannedOutputIdentity(
+        output_kind: str,
+        source_file: str,
+        semantic_identity: str,
+        output_dir: str,
+    ) -> str:
+        relative_source = os.path.relpath(
+            os.path.abspath(source_file), os.path.abspath(output_dir)
+        ).replace(os.sep, "/")
+        if relative_source == ".." or relative_source.startswith("../"):
+            relative_source = os.path.basename(source_file)
+        parts = [output_kind, relative_source]
+        if semantic_identity:
+            parts.append(semantic_identity)
+        return ":".join(parts)
+
+    @staticmethod
+    def _findOutputNodes(node_class: str, run_id: str, output_identity: str) -> list[Any]:
+        return [
+            node
+            for node in slicer.util.getNodesByClass(node_class)
+            if node.GetAttribute(_RUN_ID_ATTRIBUTE) == run_id
+            and node.GetAttribute(_OUTPUT_IDENTITY_ATTRIBUTE) == output_identity
+        ]
+
+    def _findOutputNode(self, node_class: str, run_id: str, output_identity: str):
+        nodes = self._findOutputNodes(node_class, run_id, output_identity)
+        return nodes[0] if nodes else None
+
+    @staticmethod
+    def _setOutputNodeMetadata(
+        node,
+        *,
+        model: Model,
+        run_id: str,
+        output_identity: str,
+        source_file: str,
+        link_group: str = "",
+        input_node=None,
+    ) -> None:
+        node.SetAttribute("MHubRunner.ModelName", model.name)
+        node.SetAttribute("MHubRunner.SourceFile", source_file)
+        node.SetAttribute(_RUN_ID_ATTRIBUTE, run_id)
+        node.SetAttribute(_OUTPUT_IDENTITY_ATTRIBUTE, output_identity)
+        node.SetAttribute(_LINK_GROUP_ATTRIBUTE, link_group or None)
+        node.SetNodeReferenceID(
+            _INPUT_NODE_ROLE,
+            input_node.GetID() if input_node is not None else None,
+        )
+
+    @staticmethod
+    def _getOrCreateRunFolder(run_id: str, model: Model) -> int:
+        subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+            slicer.mrmlScene
+        )
+        scene_item_id = subject_hierarchy.GetSceneItemID()
+        item_ids = vtk.vtkIdList()
+        subject_hierarchy.GetItemChildren(scene_item_id, item_ids, True)
+        for index in range(item_ids.GetNumberOfIds()):
+            item_id = item_ids.GetId(index)
+            if subject_hierarchy.GetItemAttribute(item_id, _RUN_ID_ATTRIBUTE) == run_id:
+                return item_id
+
+        folder_name = f"MHubRunner - {model.label} - {run_id}"
+        folder_item_id = subject_hierarchy.CreateFolderItem(scene_item_id, folder_name)
+        subject_hierarchy.SetItemAttribute(folder_item_id, _RUN_ID_ATTRIBUTE, run_id)
+        subject_hierarchy.SetItemAttribute(folder_item_id, "MHubRunner.ModelName", model.name)
+        return folder_item_id
+
+    @staticmethod
+    def _moveNodeToRunFolder(node, folder_item_id: int) -> None:
+        subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
+            slicer.mrmlScene
+        )
+        item_id = subject_hierarchy.GetItemByDataNode(node)
+        if item_id:
+            subject_hierarchy.SetItemParent(item_id, folder_item_id)
+
+    def _createMarkupFromOutput(
+        self,
+        model: Model,
+        input_node,
+        markup,
+        run_id: str = "",
+        output_identity: str = "",
+        run_folder_item_id: int | None = None,
+    ):
+        """Create local-RAS fiducials only when reported LPS image geometry matches the input."""
+        # Build the persistent identity used to reuse this markup on repeated result loading.
+        output_identity = output_identity or self._plannedOutputIdentity(
+            "markup", markup.source_file, markup.identity, os.path.dirname(markup.source_file)
+        )
+        markups_node = self._findOutputNode(
+            "vtkMRMLMarkupsFiducialNode", run_id, output_identity
+        )
+        # Refuse spatial annotations whose reported geometry cannot be verified against the input.
+        geometry_error = self._validateMarkupImageGeometry(input_node, markup.image_geometry)
+        if geometry_error:
+            if markups_node is not None:
+                markups_node.RemoveAllControlPoints()
+                markups_node.SetAttribute(_CONTROL_POINT_KEYS_ATTRIBUTE, None)
+            logger.warning(
+                "Finding annotations from %s were not created: %s",
+                markup.source_file,
+                geometry_error,
+            )
+            return None
+
+        # Create a new fiducial node only when this run output is not already in the scene.
+        if markups_node is None:
+            markups_node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLMarkupsFiducialNode", markup.name
+            )
+        markups_node.CreateDefaultDisplayNodes()
+        markups_node.SetName(markup.name)
+        markups_node.RemoveAllControlPoints()
+        self._setOutputNodeMetadata(
+            markups_node,
+            model=model,
+            run_id=run_id,
+            output_identity=output_identity,
+            source_file=markup.source_file,
+            link_group=markup.link_group,
+            input_node=input_node,
+        )
+        markups_node.SetAndObserveTransformNodeID(
+            input_node.GetTransformNodeID() if input_node is not None else None
+        )
+
+        # Convert verified physical LPS coordinates to Slicer RAS control points.
+        control_point_keys = []
+        for point in markup.points:
+            # The report coordinates are physical image coordinates (ITK/DICOM LPS).
+            # Slicer node coordinates are RAS, so invert the first two axes.
+            x_lps, y_lps, z_lps = point.position_lps
+            index = markups_node.AddControlPoint(vtk.vtkVector3d(-x_lps, -y_lps, z_lps))
+            markups_node.SetNthControlPointLabel(index, point.label)
+            if point.description:
+                markups_node.SetNthControlPointDescription(index, point.description)
+            control_point_keys.append(str(point.key) if point.key else f"point:{index}")
+
+        # Persist only unique point keys so reverse lookup cannot select the wrong finding.
+        if len(set(control_point_keys)) != len(control_point_keys):
+            logger.warning(
+                "Interactive point linking disabled for %s: control point keys must be unique.",
+                markup.source_file,
+            )
+            control_point_keys = []
+        markups_node.SetAttribute(
+            _CONTROL_POINT_KEYS_ATTRIBUTE,
+            json.dumps(control_point_keys) if control_point_keys else None,
+        )
+
+        # Apply finding colors and place the node inside the run's Subject Hierarchy folder.
+        display_node = markups_node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetSelectedColor(1.0, 0.4, 0.0)
+            display_node.SetColor(1.0, 0.75, 0.0)
+        if run_folder_item_id is not None:
+            self._moveNodeToRunFolder(markups_node, run_folder_item_id)
+        return markups_node
+
+    def _validateMarkupImageGeometry(self, input_node, image_geometry: dict) -> str | None:
+        if input_node is None or not input_node.IsA("vtkMRMLScalarVolumeNode"):
+            return "the run input is not an available scalar volume"
+        image_data = input_node.GetImageData()
+        if image_data is None:
+            return "the run input has no image data"
+
+        try:
+            dimensions = tuple(int(value) for value in image_geometry["dimensions"])
+            spacing = tuple(float(value) for value in image_geometry["voxelsize"])
+            origin = tuple(float(value) for value in image_geometry["origin"])
+            orientation = tuple(float(value) for value in image_geometry["orientation"])
+        except (KeyError, TypeError, ValueError):
+            return "the output does not contain valid image geometry"
+
+        if len(dimensions) != 3 or len(spacing) != 3 or len(origin) != 3 or len(orientation) != 9:
+            return "the output image geometry has unexpected dimensions"
+        if tuple(image_data.GetDimensions()) != dimensions:
+            return (
+                f"output dimensions {dimensions} do not match input dimensions "
+                f"{tuple(image_data.GetDimensions())}"
+            )
+
+        expected_ijk_to_lps = vtk.vtkMatrix4x4()
+        expected_ijk_to_lps.Identity()
+        for row in range(3):
+            for column in range(3):
+                expected_ijk_to_lps.SetElement(
+                    row, column, orientation[row * 3 + column] * spacing[column]
+                )
+            expected_ijk_to_lps.SetElement(row, 3, origin[row])
+
+        actual_ijk_to_ras = vtk.vtkMatrix4x4()
+        input_node.GetIJKToRASMatrix(actual_ijk_to_ras)
+        actual_ijk_to_lps = vtk.vtkMatrix4x4()
+        actual_ijk_to_lps.DeepCopy(actual_ijk_to_ras)
+        for column in range(4):
+            actual_ijk_to_lps.SetElement(0, column, -actual_ijk_to_ras.GetElement(0, column))
+            actual_ijk_to_lps.SetElement(1, column, -actual_ijk_to_ras.GetElement(1, column))
+
+        tolerance = 1e-3
+        for row in range(3):
+            for column in range(4):
+                expected = expected_ijk_to_lps.GetElement(row, column)
+                actual = actual_ijk_to_lps.GetElement(row, column)
+                if abs(expected - actual) > tolerance:
+                    return "the output image origin, spacing, or orientation does not match the run input"
+        return None
+
     def openFile(self, file_path: str) -> None:
         import subprocess
         import sys
@@ -2903,9 +4125,13 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         Switch to a layout where tables are visible and show the selected one.
         """
         logger.debug("Show table view")
-        currentLayout = slicer.app.layoutManager().layout
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            logger.debug("No layout manager is available; table node was created without changing layout.")
+            return
+        currentLayout = layout_manager.layout
         layoutWithTable = slicer.modules.tables.logic().GetLayoutWithTable(currentLayout)
-        slicer.app.layoutManager().setLayout(layoutWithTable)
+        layout_manager.setLayout(layoutWithTable)
         slicer.app.applicationLogic().GetSelectionNode().SetReferenceActiveTableID(table.GetID())
         slicer.app.applicationLogic().PropagateTableSelection()
 
@@ -2955,6 +4181,41 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
     #             # let slicer breathe :D
     #             slicer.app.processEvents()
 
+    def prepareModelInputs(
+        self,
+        model: Model,
+        selected_node,
+        input_dir: str,
+        modality: str | None = None,
+    ):
+        """Resolve model inputs through the handler and materialize its safe input plan."""
+        from MHubRunnerModelHandlers import InputHandlerContext, ModelHandlerRegistry
+
+        handler = ModelHandlerRegistry().handler_for(model.name)
+        context = InputHandlerContext(
+            model_name=model.name,
+            selected_nodes=[selected_node],
+            selected_modality=modality,
+        )
+        plan = handler.resolve_inputs(context)
+        if not plan.items:
+            raise ValueError(f"The input handler for {model.name} returned no inputs.")
+
+        for item in plan.items:
+            relative_target = os.path.normpath(item.target_subdirectory or ".")
+            unsafe_target = (
+                os.path.isabs(relative_target)
+                or relative_target == ".."
+                or relative_target.startswith(".." + os.sep)
+            )
+            if unsafe_target:
+                raise ValueError(
+                    f"The input handler for {model.name} returned an unsafe target directory."
+                )
+            target_directory = os.path.join(input_dir, relative_target)
+            self.copy_node(item.node, target_directory, modality=item.modality)
+        return plan
+
     def copy_node(self, node, copy_dir: str, verbose: bool = True, modality: str | None = None):
         """
         Copy all dicom files from a dicom image node to the specified location.
@@ -2964,9 +4225,9 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if node is None:
             raise ValueError("No input node selected.")
 
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
-        if instanceUIDs:
-            files = self.get_node_paths(node)
+        # Copy original DICOM files when either instance or series metadata resolves in the database.
+        files = self.dicomFilesForNode(node)
+        if files:
             if verbose:
                 logger.debug("Number of files: %s", len(files))
             if not os.path.exists(copy_dir):
@@ -3131,12 +4392,31 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """
         Find all files with the specified extension in the specified directory and its subdirectories.
         """
+        # Traverse only regular files physically contained by the requested directory.
         extension = extension if isinstance(extension, list) else [extension]
+        local_root = os.path.realpath(local_dir)
         seg_files = []
-        for root, _, files in os.walk(local_dir):
+        for root, directories, files in os.walk(local_root, followlinks=False):
+            directories[:] = [
+                name for name in directories if not os.path.islink(os.path.join(root, name))
+            ]
             for file in files:
-                if len(extension) == 0 or any(file.endswith(e) for e in extension):
-                    seg_files.append(os.path.join(root, file))
+                candidate = os.path.join(root, file)
+                if os.path.islink(candidate):
+                    continue
+                resolved_candidate = os.path.realpath(candidate)
+                try:
+                    candidate_is_inside_root = os.path.commonpath(
+                        [local_root, resolved_candidate]
+                    ) == local_root
+                except ValueError:
+                    candidate_is_inside_root = False
+                if (
+                    candidate_is_inside_root
+                    and os.path.isfile(resolved_candidate)
+                    and (len(extension) == 0 or any(file.endswith(e) for e in extension))
+                ):
+                    seg_files.append(resolved_candidate)
         return seg_files
 
     def addFilesToDatabase(self, files: list[str], operation: Literal["reference", "copy", "move"]) -> None:
@@ -3528,75 +4808,5 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def openSegmentation(self, files: list[str]):
         self.loadSegmentations(files)
-
-#
-# MHubRunnerTest
-#
-
-class MHubRunnerTest(ScriptedLoadableModuleTest):
-    """
-    This is the test case for your scripted module.
-    Uses ScriptedLoadableModuleTest base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    """
-
-    def setUp(self):
-        """ Do whatever is needed to reset the state - typically a scene clear will be enough.
-        """
-        slicer.mrmlScene.Clear()
-
-    def runTest(self):
-        """Run as few or as many tests as needed here.
-        """
-        self.setUp()
-        self.test_MHubRunner1()
-
-    def test_MHubRunner1(self):
-        """ Ideally you should have several levels of tests.  At the lowest level
-        tests should exercise the functionality of the logic with different inputs
-        (both valid and invalid).  At higher levels your tests should emulate the
-        way the user would interact with your code and confirm that it still works
-        the way you intended.
-        One of the most important features of the tests is that it should alert other
-        developers when their changes will have an impact on the behavior of your
-        module.  For example, if a developer removes a feature that you depend on,
-        your test should break so they know that the feature is needed.
-        """
-
-        self.delayDisplay("Starting the test")
-
-        # Get/create input data
-
-        import SampleData
-        registerSampleData()
-        inputVolume = SampleData.downloadSample('MHubRunner1')
-        self.delayDisplay('Loaded test data set')
-
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
-
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
-        logic = MHubRunnerLogic()
-
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
-
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay('Test passed')
-
-
 
 # TODO: get gpus and allow select-box passed to docker command

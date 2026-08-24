@@ -2,8 +2,41 @@
 set(MODULE_NAME MHubRunner)
 
 #-----------------------------------------------------------------------------
+# Build information
+set(MHUBRUNNER_BUILD_REVISION "unknown")
+set(MHUBRUNNER_BUILD_REVISION_SHORT "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    RESULT_VARIABLE _mhubrunner_git_result
+    OUTPUT_VARIABLE _mhubrunner_git_revision
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    )
+  if(_mhubrunner_git_result EQUAL 0 AND _mhubrunner_git_revision)
+    set(MHUBRUNNER_BUILD_REVISION "${_mhubrunner_git_revision}")
+    string(SUBSTRING "${MHUBRUNNER_BUILD_REVISION}" 0 12 MHUBRUNNER_BUILD_REVISION_SHORT)
+  endif()
+endif()
+
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/MHubRunnerBuildInfo.py.in
+  ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerBuildInfo.py
+  @ONLY
+  )
+
+#-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
+  ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerBuildInfo.py
+  MHubRunnerModelHandlers/__init__.py
+  MHubRunnerModelHandlers/base.py
+  MHubRunnerModelHandlers/handlers/__init__.py
+  MHubRunnerModelHandlers/handlers/gc_grt123_lung_cancer.py
+  MHubRunnerModelHandlers/registry.py
+  MHubRunnerModelHandlers/run_manifest.py
   )
 
 set(MODULE_PYTHON_RESOURCES
@@ -47,11 +80,6 @@ slicerMacroBuildScriptedModule(
 
 #-----------------------------------------------------------------------------
 if(BUILD_TESTING)
-
-  # Register the unittest subclass in the main script as a ctest.
-  # Note that the test will also be available at runtime.
-  slicer_add_python_unittest(SCRIPT ${MODULE_NAME}.py)
-
-  # Additional build-time testing
+  # Register the focused module tests maintained under Testing.
   add_subdirectory(Testing)
 endif()
