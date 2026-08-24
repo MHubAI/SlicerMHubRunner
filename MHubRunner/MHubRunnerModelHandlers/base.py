@@ -40,6 +40,7 @@ class TableOutput:
     source_file: str
     identity: str = ""
     link_group: str = ""
+    row_keys: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -47,6 +48,7 @@ class MarkupPoint:
     label: str
     position_lps: tuple[float, float, float]
     description: str = ""
+    key: str = ""
 
 
 @dataclass

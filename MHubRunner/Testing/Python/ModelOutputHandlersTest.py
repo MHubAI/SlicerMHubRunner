@@ -35,7 +35,15 @@ class ModelOutputHandlersTest(unittest.TestCase):
                     "z": -112.0,
                     "probability": 0.9999949932098389,
                     "cancerprobability": 0.8792480826377869,
-                }
+                },
+                {
+                    "id": 1,
+                    "x": None,
+                    "y": None,
+                    "z": None,
+                    "probability": 0.1,
+                    "cancerprobability": 0.05,
+                },
             ],
             "cancerinfo": {
                 "casecancerprobability": 0.8809547424316406,
@@ -65,9 +73,12 @@ class ModelOutputHandlersTest(unittest.TestCase):
         self.assertEqual(plan.tables[1].rows[0][0], 0)
         self.assertEqual(plan.tables[1].identity, "findings")
         self.assertEqual(plan.tables[1].link_group, "findings")
+        self.assertEqual(plan.tables[1].row_keys, ["finding:0", "finding:1"])
         self.assertEqual(len(plan.markups), 1)
         self.assertEqual(plan.markups[0].identity, "findings")
         self.assertEqual(plan.markups[0].link_group, "findings")
+        self.assertEqual(plan.markups[0].points[0].key, "finding:0")
+        self.assertEqual(len(plan.markups[0].points), 1)
         self.assertEqual(plan.markups[0].points[0].position_lps, (56.0, 86.300003, -112.0))
 
     def test_unknown_model_uses_generic_handler(self):

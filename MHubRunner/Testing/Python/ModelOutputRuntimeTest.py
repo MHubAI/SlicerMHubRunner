@@ -179,7 +179,15 @@ class ModelOutputRuntimeTest(unittest.TestCase):
                     "z": 1.0,
                     "probability": 0.5,
                     "cancerprobability": 0.25,
-                }
+                },
+                {
+                    "id": 1,
+                    "x": None,
+                    "y": None,
+                    "z": None,
+                    "probability": 0.1,
+                    "cancerprobability": 0.05,
+                },
             ],
             "cancerinfo": {
                 "casecancerprobability": 0.25,
@@ -227,6 +235,28 @@ class ModelOutputRuntimeTest(unittest.TestCase):
                 findings_markup.GetNodeReferenceID("MHubRunner.LinkedTable"),
                 findings_table.GetID(),
             )
+            self.assertEqual(
+                json.loads(findings_table.GetAttribute("MHubRunner.RowKeys")),
+                ["finding:0", "finding:1"],
+            )
+            self.assertEqual(
+                json.loads(findings_markup.GetAttribute("MHubRunner.ControlPointKeys")),
+                ["finding:0"],
+            )
+            linked_markup, linked_point_index = (
+                MHubRunnerWidget._linkedMarkupPointForTableRow(findings_table, 0)
+            )
+            self.assertIs(linked_markup, findings_markup)
+            self.assertEqual(linked_point_index, 0)
+            MHubRunnerWidget._selectMarkupControlPoint(
+                linked_markup, linked_point_index
+            )
+            self.assertTrue(findings_markup.GetNthControlPointSelected(0))
+            unpositioned_markup, unpositioned_point_index = (
+                MHubRunnerWidget._linkedMarkupPointForTableRow(findings_table, 1)
+            )
+            self.assertIs(unpositioned_markup, findings_markup)
+            self.assertIsNone(unpositioned_point_index)
 
             subject_hierarchy = slicer.vtkMRMLSubjectHierarchyNode.GetSubjectHierarchyNode(
                 slicer.mrmlScene

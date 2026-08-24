@@ -1,4 +1,5 @@
 import logging
+import json
 import os
 import sys
 import threading
@@ -36,6 +37,8 @@ _LINK_GROUP_ATTRIBUTE = "MHubRunner.LinkGroup"
 _LINKED_MARKUP_ROLE = "MHubRunner.LinkedMarkup"
 _LINKED_TABLE_ROLE = "MHubRunner.LinkedTable"
 _INPUT_NODE_ROLE = "MHubRunner.Input"
+_ROW_KEYS_ATTRIBUTE = "MHubRunner.RowKeys"
+_CONTROL_POINT_KEYS_ATTRIBUTE = "MHubRunner.ControlPointKeys"
 
 class Debouncer(qt.QObject):
     def __init__(self, interval_ms: int, callback: Callable[[], None], parent: qt.QObject | None = None) -> None:
@@ -261,6 +264,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._settingsWidget = None
         self._dockerSetupDismissed = False
         self._syncingDockerPath = False
+        self._resultLayoutManager = None
+        self._resultSelectionNode = None
+        self._resultTableView = None
+        self._resultTableSelectionModel = None
 
     def setup(self) -> None:
         """
@@ -330,6 +337,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onLoadResults)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
+
+        self._resultLayoutManager = slicer.app.layoutManager()
+        if self._resultLayoutManager is not None:
+            self._resultLayoutManager.layoutChanged.connect(self._onResultLayoutChanged)
+        self._resultSelectionNode = slicer.app.applicationLogic().GetSelectionNode()
+        if self._resultSelectionNode is not None:
+            self.addObserver(
+                self._resultSelectionNode,
+                vtk.vtkCommand.ModifiedEvent,
+                self._onResultSelectionNodeModified,
+            )
 
         # logging
         self.ui.cmbLogLevel.addItems(["ERROR", "WARNING", "INFO", "DEBUG"])
@@ -452,7 +470,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         Called when the application closes and the module widget is destroyed.
         """
+        self._disconnectResultTableView()
+        if self._resultLayoutManager is not None:
+            try:
+                self._resultLayoutManager.layoutChanged.disconnect(self._onResultLayoutChanged)
+            except (RuntimeError, TypeError):
+                pass
+            self._resultLayoutManager = None
         self.removeObservers()
+        self._resultSelectionNode = None
 
     def enter(self) -> None:
         """
@@ -1826,6 +1852,123 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         annotation_warning = result.get("annotationWarning")
         if annotation_warning:
             slicer.util.warningDisplay(annotation_warning)
+        self._scheduleResultTableInteractionRefresh()
+
+    def _scheduleResultTableInteractionRefresh(self) -> None:
+        qt.QTimer.singleShot(0, self._connectResultTableView)
+
+    def _onResultLayoutChanged(self, *_args) -> None:
+        self._scheduleResultTableInteractionRefresh()
+
+    def _onResultSelectionNodeModified(self, *_args) -> None:
+        self._scheduleResultTableInteractionRefresh()
+
+    def _disconnectResultTableView(self) -> None:
+        if self._resultTableSelectionModel is not None:
+            try:
+                self._resultTableSelectionModel.selectionChanged.disconnect(
+                    self._onLinkedTableSelectionChanged
+                )
+            except (RuntimeError, TypeError):
+                pass
+        if self._resultTableView is not None:
+            try:
+                self._resultTableView.doubleClicked.disconnect(
+                    self._onLinkedTableDoubleClicked
+                )
+            except (RuntimeError, TypeError):
+                pass
+        self._resultTableSelectionModel = None
+        self._resultTableView = None
+
+    def _connectResultTableView(self) -> None:
+        layout_manager = slicer.app.layoutManager()
+        table_widget = layout_manager.tableWidget(0) if layout_manager is not None else None
+        table_view = table_widget.tableView() if table_widget is not None else None
+        selection_model = table_view.selectionModel() if table_view is not None else None
+        if (
+            table_view is self._resultTableView
+            and selection_model is self._resultTableSelectionModel
+        ):
+            return
+
+        self._disconnectResultTableView()
+        if table_view is None or selection_model is None:
+            return
+
+        self._resultTableView = table_view
+        self._resultTableSelectionModel = selection_model
+        table_view.setSelectionBehavior(qt.QTableView.SelectRows)
+        selection_model.selectionChanged.connect(self._onLinkedTableSelectionChanged)
+        table_view.doubleClicked.connect(self._onLinkedTableDoubleClicked)
+
+    @staticmethod
+    def _stringListNodeAttribute(node, attribute_name: str) -> list[str]:
+        encoded = node.GetAttribute(attribute_name) if node is not None else None
+        if not encoded:
+            return []
+        try:
+            values = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+            return []
+        return values
+
+    @classmethod
+    def _linkedMarkupPointForTableRow(cls, table_node, row: int):
+        if table_node is None or row < 0:
+            return None, None
+        markup_node_id = table_node.GetNodeReferenceID(_LINKED_MARKUP_ROLE)
+        markup_node = slicer.mrmlScene.GetNodeByID(markup_node_id) if markup_node_id else None
+        if markup_node is None or not markup_node.IsA("vtkMRMLMarkupsFiducialNode"):
+            return None, None
+
+        row_keys = cls._stringListNodeAttribute(table_node, _ROW_KEYS_ATTRIBUTE)
+        point_keys = cls._stringListNodeAttribute(markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE)
+        if row >= len(row_keys):
+            return markup_node, None
+        try:
+            point_index = point_keys.index(row_keys[row])
+        except ValueError:
+            return markup_node, None
+        if point_index >= markup_node.GetNumberOfControlPoints():
+            return markup_node, None
+        return markup_node, point_index
+
+    @staticmethod
+    def _selectMarkupControlPoint(markup_node, point_index: int | None) -> None:
+        if markup_node is None:
+            return
+        for index in range(markup_node.GetNumberOfControlPoints()):
+            markup_node.SetNthControlPointSelected(index, index == point_index)
+
+    @staticmethod
+    def _activeTableNode():
+        selection_node = slicer.app.applicationLogic().GetSelectionNode()
+        table_node_id = selection_node.GetActiveTableID() if selection_node is not None else None
+        return slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
+
+    def _activateLinkedTableRow(self, row: int, navigate: bool) -> None:
+        markup_node, point_index = self._linkedMarkupPointForTableRow(
+            self._activeTableNode(), row
+        )
+        self._selectMarkupControlPoint(markup_node, point_index)
+        if navigate and markup_node is not None and point_index is not None:
+            slicer.modules.markups.logic().JumpSlicesToNthPointInMarkup(
+                markup_node.GetID(), point_index, True
+            )
+
+    def _onLinkedTableSelectionChanged(self, *_args) -> None:
+        if self._resultTableView is None:
+            return
+        selected_indexes = self._resultTableView.selectedIndexes()
+        if selected_indexes:
+            self._activateLinkedTableRow(selected_indexes[0].row(), navigate=False)
+
+    def _onLinkedTableDoubleClicked(self, model_index) -> None:
+        if model_index is not None and model_index.isValid():
+            self._activateLinkedTableRow(model_index.row(), navigate=True)
 
     def _loadOutputFile(self, output_file: str) -> None:
         assert self.logic is not None
@@ -2113,6 +2256,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                             input_is_dicom=input_is_dicom,
                             output_handling=output_handling,
                         )
+                        self._scheduleResultTableInteractionRefresh()
                     except Exception:
                         logger.exception("Failed to process outputs for model %s", model.name)
                         slicer.util.errorDisplay(
@@ -3334,6 +3478,19 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 link_group=table.link_group,
                 input_node=input_node,
             )
+            row_keys = [str(key) for key in table.row_keys]
+            if row_keys and (
+                len(row_keys) != len(table.rows) or len(set(row_keys)) != len(row_keys)
+            ):
+                logger.warning(
+                    "Interactive row linking disabled for %s: row keys must be unique and match rows.",
+                    table.source_file,
+                )
+                row_keys = []
+            table_node.SetAttribute(
+                _ROW_KEYS_ATTRIBUTE,
+                json.dumps(row_keys) if row_keys else None,
+            )
             self.renderTableData(table_node, table.columns, table.rows)
             self._moveNodeToRunFolder(table_node, run_folder_item_id)
             if table.link_group:
@@ -3502,6 +3659,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if geometry_error:
             if markups_node is not None:
                 markups_node.RemoveAllControlPoints()
+                markups_node.SetAttribute(_CONTROL_POINT_KEYS_ATTRIBUTE, None)
             logger.warning(
                 "Finding annotations from %s were not created: %s",
                 markup.source_file,
@@ -3529,6 +3687,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             input_node.GetTransformNodeID() if input_node is not None else None
         )
 
+        control_point_keys = []
         for point in markup.points:
             # The report coordinates are physical image coordinates (ITK/DICOM LPS).
             # Slicer node coordinates are RAS, so invert the first two axes.
@@ -3537,6 +3696,18 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             markups_node.SetNthControlPointLabel(index, point.label)
             if point.description:
                 markups_node.SetNthControlPointDescription(index, point.description)
+            control_point_keys.append(str(point.key) if point.key else f"point:{index}")
+
+        if len(set(control_point_keys)) != len(control_point_keys):
+            logger.warning(
+                "Interactive point linking disabled for %s: control point keys must be unique.",
+                markup.source_file,
+            )
+            control_point_keys = []
+        markups_node.SetAttribute(
+            _CONTROL_POINT_KEYS_ATTRIBUTE,
+            json.dumps(control_point_keys) if control_point_keys else None,
+        )
 
         display_node = markups_node.GetDisplayNode()
         if display_node is not None:

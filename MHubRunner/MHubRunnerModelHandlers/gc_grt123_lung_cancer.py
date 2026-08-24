@@ -45,6 +45,7 @@ class Grt123LungCancerHandler(ModelHandler):
         path = selected
 
         findings = payload["findings"]
+        finding_keys = self._finding_keys(findings)
         lungcad = payload["lungcad"]
         image_info = payload["imageinfo"]
         cancer_info = payload.get("cancerinfo", {})
@@ -91,6 +92,7 @@ class Grt123LungCancerHandler(ModelHandler):
                 source_file=path,
                 identity="findings",
                 link_group="findings",
+                row_keys=finding_keys,
             )
         )
 
@@ -103,7 +105,7 @@ class Grt123LungCancerHandler(ModelHandler):
             return plan
 
         points = []
-        for finding in findings:
+        for finding_index, finding in enumerate(findings):
             if not self._has_numeric_position(finding):
                 plan.warnings.append(
                     f"Finding {finding.get('id', '?')} has no valid world position and was not annotated."
@@ -119,6 +121,7 @@ class Grt123LungCancerHandler(ModelHandler):
                     label=f"Finding {finding_id}",
                     position_lps=(float(finding["x"]), float(finding["y"]), float(finding["z"])),
                     description=description,
+                    key=finding_keys[finding_index],
                 )
             )
 
@@ -157,6 +160,18 @@ class Grt123LungCancerHandler(ModelHandler):
             isinstance(finding.get(axis), (int, float)) and not isinstance(finding.get(axis), bool)
             for axis in ("x", "y", "z")
         )
+
+    @staticmethod
+    def _finding_keys(findings: list[dict[str, Any]]) -> list[str]:
+        occurrences: dict[str, int] = {}
+        keys = []
+        for index, finding in enumerate(findings):
+            finding_id = finding.get("id")
+            base_key = f"finding:{finding_id}" if finding_id is not None else f"row:{index}"
+            occurrence = occurrences.get(base_key, 0)
+            occurrences[base_key] = occurrence + 1
+            keys.append(base_key if occurrence == 0 else f"{base_key}#{occurrence + 1}")
+        return keys
 
     @staticmethod
     def _join(value: Any) -> str:
