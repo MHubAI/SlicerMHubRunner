@@ -264,12 +264,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._settingsWidget = None
         self._dockerSetupDismissed = False
         self._syncingDockerPath = False
+
+        # Track the current table view because Slicer replaces its Qt model as layouts change.
         self._resultLayoutManager = None
         self._resultSelectionNode = None
         self._resultTableView = None
         self._resultTableSelectionModel = None
+
+        # Track landmark-click observers and deferred table selections for reverse navigation.
         self._linkedMarkupDisplayObservers = {}
         self._pendingLinkedTableSelection = None
+
+        # Prevent programmatic table and landmark selections from feeding back into each other.
         self._syncingResultSelection = False
 
     def setup(self) -> None:
@@ -341,6 +347,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
         self.updateOutputRunDirectories()
 
+        # Follow layout and active-table changes so result interaction hooks stay current.
         self._resultLayoutManager = slicer.app.layoutManager()
         if self._resultLayoutManager is not None:
             self._resultLayoutManager.layoutChanged.connect(self._onResultLayoutChanged)
@@ -474,6 +481,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         """
         Called when the application closes and the module widget is destroyed.
         """
+        # Detach result interaction callbacks before their Qt and VTK objects are destroyed.
         self._disconnectResultTableView()
         self._disconnectLinkedMarkupDisplayObservers()
         if self._resultLayoutManager is not None:
@@ -1860,9 +1868,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._scheduleResultInteractionRefresh()
 
     def _scheduleResultInteractionRefresh(self) -> None:
+        # Wait for Slicer to finish replacing layout widgets and their selection models.
         qt.QTimer.singleShot(0, self._refreshResultInteractions)
 
     def _refreshResultInteractions(self) -> None:
+        # Refresh both directions of table/landmark interaction from the current scene state.
         self._connectResultTableView()
         self._refreshLinkedMarkupDisplayObservers()
 
@@ -1873,6 +1883,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._scheduleResultInteractionRefresh()
 
     def _disconnectResultTableView(self) -> None:
+        # Disconnect row-selection handling from the previous table selection model.
         if self._resultTableSelectionModel is not None:
             try:
                 self._resultTableSelectionModel.selectionChanged.disconnect(
@@ -1880,6 +1891,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 )
             except (RuntimeError, TypeError):
                 pass
+        # Disconnect double-click navigation from the previous table view.
         if self._resultTableView is not None:
             try:
                 self._resultTableView.doubleClicked.disconnect(
@@ -1887,24 +1899,29 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 )
             except (RuntimeError, TypeError):
                 pass
+        # Release replaced Qt objects after all their signals have been disconnected.
         self._resultTableSelectionModel = None
         self._resultTableView = None
 
     def _connectResultTableView(self) -> None:
+        # Resolve the table view and selection model currently owned by the active layout.
         layout_manager = slicer.app.layoutManager()
         table_widget = layout_manager.tableWidget(0) if layout_manager is not None else None
         table_view = table_widget.tableView() if table_widget is not None else None
         selection_model = table_view.selectionModel() if table_view is not None else None
+        # Keep existing connections when Slicer has not replaced either Qt object.
         if (
             table_view is self._resultTableView
             and selection_model is self._resultTableSelectionModel
         ):
             return
 
+        # Replace stale connections, or stop when the active layout contains no table.
         self._disconnectResultTableView()
         if table_view is None or selection_model is None:
             return
 
+        # Subscribe to row selection and double-click navigation on the current view.
         self._resultTableView = table_view
         self._resultTableSelectionModel = selection_model
         table_view.setSelectionBehavior(qt.QTableView.SelectRows)
@@ -1912,6 +1929,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         table_view.doubleClicked.connect(self._onLinkedTableDoubleClicked)
 
     def _disconnectLinkedMarkupDisplayObservers(self) -> None:
+        # Remove all landmark-click observers retained by this widget.
         for display_node, observer_tag in self._linkedMarkupDisplayObservers.values():
             try:
                 display_node.RemoveObserver(observer_tag)
@@ -1920,6 +1938,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._linkedMarkupDisplayObservers = {}
 
     def _refreshLinkedMarkupDisplayObservers(self) -> None:
+        # Discover displayed fiducials that have stable point keys and a linked table.
         linked_display_nodes = {}
         for markup_node in slicer.util.getNodesByClass("vtkMRMLMarkupsFiducialNode"):
             if not markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE):
@@ -1932,6 +1951,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if display_node is not None and display_node.GetID():
                 linked_display_nodes[display_node.GetID()] = display_node
 
+        # Remove observers for display nodes that disappeared or were replaced in the scene.
         for display_node_id, (display_node, observer_tag) in list(
             self._linkedMarkupDisplayObservers.items()
         ):
@@ -1943,6 +1963,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 pass
             del self._linkedMarkupDisplayObservers[display_node_id]
 
+        # Observe Slicer's explicit landmark-click event on newly discovered display nodes.
         for display_node_id, display_node in linked_display_nodes.items():
             if display_node_id in self._linkedMarkupDisplayObservers:
                 continue
@@ -1957,6 +1978,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @staticmethod
     def _stringListNodeAttribute(node, attribute_name: str) -> list[str]:
+        # Decode a JSON string-list attribute while treating malformed metadata as unavailable.
         encoded = node.GetAttribute(attribute_name) if node is not None else None
         if not encoded:
             return []
@@ -1970,6 +1992,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @classmethod
     def _linkedMarkupPointForTableRow(cls, table_node, row: int):
+        # Follow the table's MRML reference to its linked fiducial node.
         if table_node is None or row < 0:
             return None, None
         markup_node_id = table_node.GetNodeReferenceID(_LINKED_MARKUP_ROLE)
@@ -1977,6 +2000,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if markup_node is None or not markup_node.IsA("vtkMRMLMarkupsFiducialNode"):
             return None, None
 
+        # Resolve the row to a control point by stable finding key rather than list position.
         row_keys = cls._stringListNodeAttribute(table_node, _ROW_KEYS_ATTRIBUTE)
         point_keys = cls._stringListNodeAttribute(markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE)
         if row >= len(row_keys):
@@ -1991,6 +2015,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @classmethod
     def _linkedTableRowForMarkupPoint(cls, markup_node, point_index: int):
+        # Follow the fiducial node's MRML reference to its linked result table.
         if markup_node is None or point_index < 0:
             return None, None
         table_node_id = markup_node.GetNodeReferenceID(_LINKED_TABLE_ROLE)
@@ -1998,6 +2023,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if table_node is None or not table_node.IsA("vtkMRMLTableNode"):
             return None, None
 
+        # Resolve the control point to a row by the same stable finding key.
         point_keys = cls._stringListNodeAttribute(
             markup_node, _CONTROL_POINT_KEYS_ATTRIBUTE
         )
@@ -2014,6 +2040,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @staticmethod
     def _selectMarkupControlPoint(markup_node, point_index: int | None) -> None:
+        # Select exactly one corresponding landmark, or clear selection when none exists.
         if markup_node is None:
             return
         for index in range(markup_node.GetNumberOfControlPoints()):
@@ -2021,16 +2048,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
     @staticmethod
     def _activeTableNode():
+        # Resolve the table currently presented by Slicer's application selection node.
         selection_node = slicer.app.applicationLogic().GetSelectionNode()
         table_node_id = selection_node.GetActiveTableID() if selection_node is not None else None
         return slicer.mrmlScene.GetNodeByID(table_node_id) if table_node_id else None
 
     def _activateLinkedTableRow(self, row: int, navigate: bool) -> None:
+        # Ignore callbacks caused by the inverse landmark-to-table synchronization.
         if self._syncingResultSelection:
             return
+
+        # Resolve the selected table row before entering the synchronization guard.
         markup_node, point_index = self._linkedMarkupPointForTableRow(
             self._activeTableNode(), row
         )
+
+        # Select the landmark and optionally center slice views without triggering feedback.
         self._syncingResultSelection = True
         try:
             self._selectMarkupControlPoint(markup_node, point_index)
@@ -2042,6 +2075,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._syncingResultSelection = False
 
     def _onLinkedTableSelectionChanged(self, *_args) -> None:
+        # Mirror the first selected table row to its linked landmark.
         if self._resultTableView is None:
             return
         selected_indexes = self._resultTableView.selectedIndexes()
@@ -2049,10 +2083,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._activateLinkedTableRow(selected_indexes[0].row(), navigate=False)
 
     def _onLinkedTableDoubleClicked(self, model_index) -> None:
+        # Treat a double-click as selection plus slice navigation to the landmark.
         if model_index is not None and model_index.isValid():
             self._activateLinkedTableRow(model_index.row(), navigate=True)
 
     def _onLinkedMarkupJumpToPoint(self, display_node, _event) -> None:
+        # Ignore programmatic synchronization and non-control-point markup clicks.
         if self._syncingResultSelection:
             return
         if (
@@ -2060,12 +2096,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             != slicer.vtkMRMLMarkupsDisplayNode.ComponentControlPoint
         ):
             return
+        # Resolve the clicked landmark to the corresponding table row.
         markup_node = display_node.GetDisplayableNode()
         point_index = display_node.GetActiveControlPoint()
         table_node, row = self._linkedTableRowForMarkupPoint(markup_node, point_index)
         if table_node is None or row is None:
             return
 
+        # Make the linked table active so the visible table view presents the correct data.
         selection_node = slicer.app.applicationLogic().GetSelectionNode()
         if selection_node is None:
             return
@@ -2073,19 +2111,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             selection_node.SetReferenceActiveTableID(table_node.GetID())
             slicer.app.applicationLogic().PropagateTableSelection()
 
+        # Defer row selection until Slicer has propagated any active-table model change.
         self._pendingLinkedTableSelection = (table_node.GetID(), row)
         qt.QTimer.singleShot(0, self._applyPendingLinkedTableSelection)
 
     def _applyPendingLinkedTableSelection(self) -> None:
+        # Consume the latest pending selection so older clicks cannot run afterward.
         pending_selection = self._pendingLinkedTableSelection
         self._pendingLinkedTableSelection = None
         if pending_selection is None:
             return
         table_node_id, row = pending_selection
+        # Discard the request if another table became active before the timer fired.
         active_table_node = self._activeTableNode()
         if active_table_node is None or active_table_node.GetID() != table_node_id:
             return
 
+        # Resolve the refreshed table model and validate that the target row still exists.
         self._connectResultTableView()
         if self._resultTableView is None or self._resultTableSelectionModel is None:
             return
@@ -2096,6 +2138,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if not model_index.isValid():
             return
 
+        # Select and reveal the row while suppressing the forward synchronization callback.
         self._syncingResultSelection = True
         try:
             selection_flags = (
@@ -3569,9 +3612,11 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """Resolve model outputs through an exact-model handler or the generic fallback."""
         from MHubRunnerModelHandlers import ModelHandlerRegistry, OutputHandlerContext
 
+        # Skip both import and visualization when output handling is disabled.
         if output_handling == "none":
             return None
 
+        # Ask the exact-model handler, or the generic fallback, for a declarative output plan.
         context = OutputHandlerContext(
             model_name=model.name,
             model_label=model.label,
@@ -3583,20 +3628,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         plan = handler.build_output_plan(context)
         run_id = run_id or os.path.basename(os.path.normpath(output_dir))
 
+        # Report handler warnings without changing or clinically interpreting their content.
         for warning in plan.warnings:
             logger.warning("%s", warning)
 
+        # Import DICOM SEG outputs only when the run input belongs to the DICOM database.
         if output_handling in ("load_import", "import_only"):
             if input_is_dicom and plan.segmentation_files:
                 self.addFilesToDatabase(plan.segmentation_files, operation="copy")
             elif plan.segmentation_files and not input_is_dicom:
                 logger.info("DICOM SEG import skipped because the input was not in the DICOM database.")
 
+        # Return after import when the selected mode does not request scene visualization.
         if output_handling not in ("load_import", "load_only"):
             return plan
 
+        # Group every visualized output from this run under one Subject Hierarchy folder.
         run_folder_item_id = self._getOrCreateRunFolder(run_id, model)
 
+        # Create or update planned tables and index them by their optional link group.
         table_nodes_by_link: dict[str, list[Any]] = {}
         for table in plan.tables:
             identity = self._plannedOutputIdentity(
@@ -3615,6 +3665,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 link_group=table.link_group,
                 input_node=input_node,
             )
+            # Persist only a complete, unique row-key mapping for interactive navigation.
             row_keys = [str(key) for key in table.row_keys]
             if row_keys and (
                 len(row_keys) != len(table.rows) or len(set(row_keys)) != len(row_keys)
@@ -3633,6 +3684,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             if table.link_group:
                 table_nodes_by_link.setdefault(table.link_group, []).append(table_node)
 
+        # Create geometry-validated markups and index them by the same link-group contract.
         markup_nodes_by_link: dict[str, list[Any]] = {}
         for markup in plan.markups:
             identity = self._plannedOutputIdentity(
@@ -3649,12 +3701,14 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             if markup_node is not None and markup.link_group:
                 markup_nodes_by_link.setdefault(markup.link_group, []).append(markup_node)
 
+        # Store bidirectional MRML references between the first table and markup in each group.
         for link_group in set(table_nodes_by_link).intersection(markup_nodes_by_link):
             table_node = table_nodes_by_link[link_group][0]
             markup_node = markup_nodes_by_link[link_group][0]
             table_node.SetNodeReferenceID(_LINKED_MARKUP_ROLE, markup_node.GetID())
             markup_node.SetNodeReferenceID(_LINKED_TABLE_ROLE, table_node.GetID())
 
+        # Reuse existing segmentation nodes or load and tag newly created ones.
         for segmentation_file in plan.segmentation_files:
             identity = self._plannedOutputIdentity(
                 "segmentation", segmentation_file, "", output_dir
@@ -3786,12 +3840,14 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         run_folder_item_id: int | None = None,
     ):
         """Create local-RAS fiducials only when reported LPS image geometry matches the input."""
+        # Build the persistent identity used to reuse this markup on repeated result loading.
         output_identity = output_identity or self._plannedOutputIdentity(
             "markup", markup.source_file, markup.identity, os.path.dirname(markup.source_file)
         )
         markups_node = self._findOutputNode(
             "vtkMRMLMarkupsFiducialNode", run_id, output_identity
         )
+        # Refuse spatial annotations whose reported geometry cannot be verified against the input.
         geometry_error = self._validateMarkupImageGeometry(input_node, markup.image_geometry)
         if geometry_error:
             if markups_node is not None:
@@ -3804,6 +3860,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             )
             return None
 
+        # Create a new fiducial node only when this run output is not already in the scene.
         if markups_node is None:
             markups_node = slicer.mrmlScene.AddNewNodeByClass(
                 "vtkMRMLMarkupsFiducialNode", markup.name
@@ -3824,6 +3881,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             input_node.GetTransformNodeID() if input_node is not None else None
         )
 
+        # Convert verified physical LPS coordinates to Slicer RAS control points.
         control_point_keys = []
         for point in markup.points:
             # The report coordinates are physical image coordinates (ITK/DICOM LPS).
@@ -3835,6 +3893,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 markups_node.SetNthControlPointDescription(index, point.description)
             control_point_keys.append(str(point.key) if point.key else f"point:{index}")
 
+        # Persist only unique point keys so reverse lookup cannot select the wrong finding.
         if len(set(control_point_keys)) != len(control_point_keys):
             logger.warning(
                 "Interactive point linking disabled for %s: control point keys must be unique.",
@@ -3846,6 +3905,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             json.dumps(control_point_keys) if control_point_keys else None,
         )
 
+        # Apply finding colors and place the node inside the run's Subject Hierarchy folder.
         display_node = markups_node.GetDisplayNode()
         if display_node is not None:
             display_node.SetSelectedColor(1.0, 0.4, 0.0)

@@ -257,6 +257,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             )
             self.assertIs(unpositioned_markup, findings_markup)
             self.assertIsNone(unpositioned_point_index)
+            # Verify both stable-key lookup directions, including an unpositioned finding.
             linked_table, linked_row = MHubRunnerWidget._linkedTableRowForMarkupPoint(
                 findings_markup, 0
             )
@@ -268,6 +269,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             self.assertIs(out_of_range_table, findings_table)
             self.assertIsNone(out_of_range_row)
 
+            # Exercise Slicer's landmark-click event through to actual Qt table-row selection.
             widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
             widget._linkedMarkupDisplayObservers = {}
             widget._pendingLinkedTableSelection = None
