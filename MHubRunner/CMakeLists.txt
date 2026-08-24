@@ -33,7 +33,8 @@ set(MODULE_PYTHON_SCRIPTS
   ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerBuildInfo.py
   MHubRunnerModelHandlers/__init__.py
   MHubRunnerModelHandlers/base.py
-  MHubRunnerModelHandlers/gc_grt123_lung_cancer.py
+  MHubRunnerModelHandlers/handlers/__init__.py
+  MHubRunnerModelHandlers/handlers/gc_grt123_lung_cancer.py
   MHubRunnerModelHandlers/registry.py
   MHubRunnerModelHandlers/run_manifest.py
   )

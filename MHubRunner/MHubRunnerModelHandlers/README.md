@@ -6,7 +6,7 @@ DICOM SEG, JSON, and CSV handling.
 
 To add a model-specific renderer:
 
-1. Add a module containing a `ModelHandler` subclass.
+1. Add a module under `handlers/` containing a `ModelHandler` subclass.
 2. Set `model_names` to exact names returned by the MHub API.
 3. Override `resolve_inputs` when the generic single-volume input plan is not
    sufficient. Return node references and destination subdirectories; the core

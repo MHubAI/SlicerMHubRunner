@@ -2,7 +2,7 @@ import json
 import os
 from typing import Any
 
-from .base import (
+from ..base import (
     GenericModelHandler,
     MarkupOutput,
     MarkupPoint,

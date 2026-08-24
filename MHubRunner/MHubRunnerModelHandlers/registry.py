@@ -1,5 +1,5 @@
 from .base import GenericModelHandler, ModelHandler
-from .gc_grt123_lung_cancer import Grt123LungCancerHandler
+from .handlers import Grt123LungCancerHandler
 
 
 class ModelHandlerRegistry:
