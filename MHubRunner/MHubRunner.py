@@ -467,16 +467,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
 
-        # print path
-        import sys
+        # Record the effective Python search path without invoking platform-specific shell tools.
         logger.debug("Python sys.path: %s", sys.path)
-
-        # run which python and which pip
-        import subprocess
-        logger.debug("which python3: %s", subprocess.run(["which", "python3"], capture_output=True).stdout.decode('utf-8'))
-        # try the same with slicer.utils.consoleProcess
-        p = slicer.util.launchConsoleProcess(["which", "python3"])
-        logger.debug("slicer console which python3: %s", p.stdout.read())
 
     def cleanup(self) -> None:
         """
@@ -2982,7 +2974,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         Called when the logic class is instantiated. Can be used for initializing member variables.
         """
         ScriptedLoadableModuleLogic.__init__(self)
-        self.setupPythonRequirements()
         self._executables: dict[str, str] = {}
         # self.hosts: List[str] = []
         # self.hostInfo: Dict[str, HostInformation] = {}
@@ -2992,22 +2983,6 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def getParameterNode(self):
         return MHubRunnerParameterNode(super().getParameterNode())
-
-    def setupPythonRequirements(self, upgrade=False):
-
-        # install sshconf python package
-        try:
-          import sshconf
-        except ModuleNotFoundError as e:
-           #self.log('sshconf is required. Installing...')
-           slicer.util.pip_install('sshconf')
-
-        # install paramiko python package
-        try:
-            import paramiko
-        except ModuleNotFoundError as e:
-            #self.log('paramiko is required. Installing...')
-            slicer.util.pip_install('paramiko')
 
     def _build_subprocess_env(self, executable_path: str | None = None) -> dict[str, str]:
         env = os.environ.copy()
@@ -4692,75 +4667,5 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
 
     def openSegmentation(self, files: list[str]):
         self.loadSegmentations(files)
-
-#
-# MHubRunnerTest
-#
-
-class MHubRunnerTest(ScriptedLoadableModuleTest):
-    """
-    This is the test case for your scripted module.
-    Uses ScriptedLoadableModuleTest base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    """
-
-    def setUp(self):
-        """ Do whatever is needed to reset the state - typically a scene clear will be enough.
-        """
-        slicer.mrmlScene.Clear()
-
-    def runTest(self):
-        """Run as few or as many tests as needed here.
-        """
-        self.setUp()
-        self.test_MHubRunner1()
-
-    def test_MHubRunner1(self):
-        """ Ideally you should have several levels of tests.  At the lowest level
-        tests should exercise the functionality of the logic with different inputs
-        (both valid and invalid).  At higher levels your tests should emulate the
-        way the user would interact with your code and confirm that it still works
-        the way you intended.
-        One of the most important features of the tests is that it should alert other
-        developers when their changes will have an impact on the behavior of your
-        module.  For example, if a developer removes a feature that you depend on,
-        your test should break so they know that the feature is needed.
-        """
-
-        self.delayDisplay("Starting the test")
-
-        # Get/create input data
-
-        import SampleData
-        registerSampleData()
-        inputVolume = SampleData.downloadSample('MHubRunner1')
-        self.delayDisplay('Loaded test data set')
-
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
-
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
-        logic = MHubRunnerLogic()
-
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
-
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay('Test passed')
-
-
 
 # TODO: get gpus and allow select-box passed to docker command
