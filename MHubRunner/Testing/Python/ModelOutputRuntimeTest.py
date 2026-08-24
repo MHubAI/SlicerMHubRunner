@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -25,12 +26,31 @@ class ModelOutputRuntimeTest(unittest.TestCase):
     def test_extension_build_footer(self):
         label = qt.QLabel()
         widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
+        build_info = SimpleNamespace(
+            EXTENSION_VERSION="9.8.7-test",
+            BUILD_REVISION="abcdef1234567890",
+            BUILD_REVISION_SHORT="abcdef123456",
+        )
 
-        MHubRunnerWidget._updateExtensionBuildInfo(widget)
+        # Verify that the footer renders metadata supplied by the generated build module.
+        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": build_info}):
+            MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
-        self.assertTrue(label.text.startswith("MHubRunner 2.4.0-beta \u00b7 build "))
-        self.assertIn("Extension version: 2.4.0-beta", label.toolTip)
-        self.assertIn("Git revision:", label.toolTip)
+        self.assertEqual(label.text, "MHubRunner 9.8.7-test \u00b7 build abcdef123456")
+        self.assertIn("Extension version: 9.8.7-test", label.toolTip)
+        self.assertIn("Git revision: abcdef1234567890", label.toolTip)
+
+    def test_extension_build_footer_without_generated_metadata(self):
+        label = qt.QLabel()
+        widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
+
+        # Identify direct source loading without duplicating the CMake release version.
+        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": None}):
+            MHubRunnerWidget._updateExtensionBuildInfo(widget)
+
+        self.assertEqual(label.text, "MHubRunner development source \u00b7 build unknown")
+        self.assertIn("Extension version: development source", label.toolTip)
+        self.assertIn("Git revision: unknown", label.toolTip)
 
     def test_output_display_path_handles_symlinked_run_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -929,15 +929,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 EXTENSION_VERSION,
             )
         except ImportError:
-            # Direct source loading does not run CMake and therefore has no
-            # generated revision metadata.
-            EXTENSION_VERSION = "2.4.0-beta"
+            # Direct source loading has no CMake-generated version or revision metadata.
+            EXTENSION_VERSION = None
             BUILD_REVISION = "unknown"
             BUILD_REVISION_SHORT = "unknown"
 
-        label.text = f"MHubRunner {EXTENSION_VERSION} \u00b7 build {BUILD_REVISION_SHORT}"
+        # Render a version-neutral development label when the generated module is unavailable.
+        version_text = EXTENSION_VERSION or "development source"
+        label.text = f"MHubRunner {version_text} \u00b7 build {BUILD_REVISION_SHORT}"
         label.toolTip = (
-            f"Extension version: {EXTENSION_VERSION}\n"
+            f"Extension version: {version_text}\n"
             f"Git revision: {BUILD_REVISION}"
         )
 
