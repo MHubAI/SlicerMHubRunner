@@ -4,7 +4,7 @@ project(MHubRunner)
 
 # Keep the user-facing extension version independent from the Git revision.
 # Release builds should remove the pre-release suffix when the matching tag is created.
-set(MHUBRUNNER_VERSION "2.4.0-dev")
+set(MHUBRUNNER_VERSION "2.4.0-beta")
 
 #-----------------------------------------------------------------------------
 # Extension meta-information
