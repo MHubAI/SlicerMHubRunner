@@ -339,13 +339,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if hasattr(self.ui, "cmdShowDockerSetup"):
             self.ui.cmdShowDockerSetup.connect('clicked(bool)', self.showDockerSetupScreenFromSettings)
 
-        # output section
-        self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
+        # Restore the durable run location independently from temporary model input staging.
+        default_runs_directory = self._defaultRunsDirectory()
+        saved_runs_directory = settings.value(
+            "MHubRunner/RunsDirectory", default_runs_directory
+        ) or default_runs_directory
+        self.ui.pthRunsDirectory.currentPath = os.path.abspath(
+            os.path.expanduser(str(saved_runs_directory))
+        )
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
         self.ui.cmdRefreshRuns.connect('clicked(bool)', self.updateOutputRunDirectories)
         if hasattr(self.ui, "cmdOpenOutputFile"):
             self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onLoadResults)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
+        self.ui.pthRunsDirectory.connect(
+            'currentPathChanged(QString)', self.onRunsDirectoryChanged
+        )
         self.updateOutputRunDirectories()
 
         # Follow layout and active-table changes so result interaction hooks stay current.
@@ -1087,6 +1096,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         value = self.ui.cmbOutputHandling.itemData(index)
         settings = qt.QSettings()
         settings.setValue("MHubRunner/OutputHandling", value or "load_import")
+
+    @staticmethod
+    def _defaultRunsDirectory() -> str:
+        # Keep completed runs in the operating system's persistent application-data location.
+        application_data = qt.QStandardPaths.writableLocation(
+            qt.QStandardPaths.AppLocalDataLocation
+        )
+        if not application_data:
+            application_data = os.path.dirname(qt.QSettings().fileName())
+        return os.path.join(str(application_data), "MHubRunner", "runs")
+
+    def onRunsDirectoryChanged(self, path: str) -> None:
+        # Persist a user-selected run root and immediately refresh its available runs.
+        if not path:
+            return
+        normalized_path = os.path.abspath(os.path.expanduser(str(path)))
+        qt.QSettings().setValue("MHubRunner/RunsDirectory", normalized_path)
+        self.updateOutputRunDirectories()
 
     def onShowCompletionNotificationChanged(self, checked: bool) -> None:
         settings = qt.QSettings()
@@ -1880,11 +1907,16 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update list
         for output_file in output_files:
             item = qt.QListWidgetItem()
-            item.setText(os.path.relpath(output_file, output_dir))
+            item.setText(self._relativeOutputDisplayPath(output_file, output_dir))
             self.ui.lstOutputFiles.addItem(item)
 
             item.setData(qt.Qt.UserRole, output_file)
         self._updateLoadResultsButton()
+
+    @staticmethod
+    def _relativeOutputDisplayPath(output_file: str, output_dir: str) -> str:
+        # Compare resolved paths so aliases such as macOS /tmp and /private/tmp display correctly.
+        return os.path.relpath(os.path.realpath(output_file), os.path.realpath(output_dir))
 
     def onOutputFileSelect(self) -> None:
         self._updateLoadResultsButton()
@@ -2405,7 +2437,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             # TODO: create temp directory for slicer-mhub under $HOME/.slicer-mhub ??
             #tmp_dir = "/Users/lenny/Projects/SlicerMHubIntegration/SlicerMHubRunner/return_data"
-            tmp_dir = "/tmp/mhub_slicer_extension"
+            # Use the platform temporary directory only for disposable model input staging.
+            tmp_dir = os.path.join(tempfile.gettempdir(), "mhub_slicer_extension")
             runs_dir = self.ui.pthRunsDirectory.currentPath
 
             input_dir = os.path.join(tmp_dir, "input")

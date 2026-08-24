@@ -32,6 +32,41 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertIn("Extension version: 2.4.0-beta", label.toolTip)
         self.assertIn("Git revision:", label.toolTip)
 
+    def test_output_display_path_handles_symlinked_run_root(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            real_run = os.path.join(temporary_directory, "real-run")
+            alias_run = os.path.join(temporary_directory, "alias-run")
+            outputs_directory = os.path.join(real_run, "outputs")
+            os.makedirs(outputs_directory)
+            output_file = os.path.join(outputs_directory, "result.json")
+            with open(output_file, "w", encoding="utf-8") as stream:
+                stream.write("{}")
+            try:
+                os.symlink(real_run, alias_run)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"Symbolic links are unavailable: {exc}")
+
+            # Resolve both sides before relativizing, as required for /tmp on macOS.
+            display_path = MHubRunnerWidget._relativeOutputDisplayPath(
+                os.path.realpath(output_file), alias_run
+            )
+
+        self.assertEqual(display_path, os.path.join("outputs", "result.json"))
+
+    def test_default_runs_directory_uses_persistent_application_data(self):
+        runs_directory = MHubRunnerWidget._defaultRunsDirectory()
+
+        # Keep run history under application data instead of the system temporary directory.
+        self.assertTrue(os.path.isabs(runs_directory))
+        self.assertEqual(
+            os.path.normpath(runs_directory).split(os.sep)[-2:],
+            ["MHubRunner", "runs"],
+        )
+        self.assertNotEqual(
+            os.path.normpath(runs_directory),
+            os.path.join(tempfile.gettempdir(), "mhub_slicer_extension", "runs"),
+        )
+
     def test_main_workflow_sections_are_exclusive(self):
         # Load the real UI so this test covers its initial collapse and page visibility states.
         ui_path = os.path.abspath(
