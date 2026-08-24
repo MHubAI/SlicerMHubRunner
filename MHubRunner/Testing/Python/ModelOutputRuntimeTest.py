@@ -32,6 +32,67 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertIn("Extension version: 2.4.0-dev", label.toolTip)
         self.assertIn("Git revision:", label.toolTip)
 
+    def test_main_workflow_sections_are_exclusive(self):
+        # Load the real UI so this test covers its initial collapse and page visibility states.
+        ui_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "Resources",
+                "UI",
+                "MHubRunner.ui",
+            )
+        )
+        ui_widget = slicer.util.loadUI(ui_path)
+        ui = slicer.util.childWidgetVariables(ui_widget)
+        widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
+        widget.ui = ui
+        widget._mainSectionSignalsWired = False
+        widget._dockerSetupDismissed = False
+        widget._updateDockerSetupLogo = lambda: None
+
+        # Verify the compact initial workflow state and wire manual section changes.
+        self.assertFalse(ui.outputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.inputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.outputCollapsibleButton.collapsed)
+        self.assertEqual(
+            ui.outputTableSelector.sizePolicy.horizontalPolicy(),
+            qt.QSizePolicy.Ignored,
+        )
+        self.assertEqual(
+            ui.cmbSelectRunOutput.sizePolicy.horizontalPolicy(),
+            qt.QSizePolicy.Ignored,
+        )
+        self.assertEqual(ui.cmdRefreshRuns.text, "Refresh Runs")
+        widget._setupMainSectionCollapse()
+
+        # Verify programmatic navigation closes the previously open workflow section.
+        widget._expandMainSection(ui.outputCollapsibleButton)
+        self.assertTrue(ui.outputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.inputsCollapsibleButton.collapsed)
+        self.assertFalse(ui.outputCollapsibleButton.collapsed)
+
+        # Verify manual expansion uses the same exclusive-section behavior.
+        ui.inputsCollapsibleButton.collapsed = False
+        slicer.app.processEvents()
+        self.assertFalse(ui.inputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.outputCollapsibleButton.collapsed)
+
+        # Verify hidden workflow/setup pages do not coexist in the parent layout.
+        widget.showDockerSetupScreen()
+        self.assertTrue(ui.mainPanel.isHidden())
+        self.assertFalse(ui.dockerSetupPanel.isHidden())
+        widget.hideDockerSetupScreen()
+        self.assertFalse(ui.mainPanel.isHidden())
+        self.assertTrue(ui.dockerSetupPanel.isHidden())
+
+        # Release native Qt/MRML widgets before Slicer's leak check runs at shutdown.
+        ui_widget.hide()
+        ui_widget.setMRMLScene(None)
+        ui_widget.deleteLater()
+        slicer.app.processEvents()
+
     def test_docker_image_digest_is_read_from_local_image(self):
         logic = self._logic_without_dependency_setup()
         logic._executables = {"docker": "/mock/docker"}

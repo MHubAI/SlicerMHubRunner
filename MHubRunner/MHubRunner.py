@@ -291,6 +291,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.ui = slicer.util.childWidgetVariables(uiWidget)
         self._loadSettingsUi()
         self._setupSettingsSectionCollapse()
+        self._setupMainSectionCollapse()
 
         self._ensureLoggerConfigured()
         self._updateDockerSetupLogo()
@@ -341,7 +342,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # output section
         self.ui.pthRunsDirectory.currentPath = "/tmp/mhub_slicer_extension/runs"
         self.ui.lstOutputFiles.connect('itemSelectionChanged()', self.onOutputFileSelect)
-        self.ui.cmdRefreshOutputFiles.connect('clicked(bool)', self.updateOutputRunDirectories)
+        self.ui.cmdRefreshRuns.connect('clicked(bool)', self.updateOutputRunDirectories)
         if hasattr(self.ui, "cmdOpenOutputFile"):
             self.ui.cmdOpenOutputFile.connect('clicked(bool)', self.onLoadResults)
         self.ui.cmbSelectRunOutput.connect('currentIndexChanged(int)', self.prepareOutput)
@@ -695,12 +696,18 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if self._dockerSetupDismissed and not force:
             return
         self._updateDockerSetupLogo()
-        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "dockerSetupPanel"):
-            self.ui.stackedMain.setCurrentWidget(self.ui.dockerSetupPanel)
+        if hasattr(self.ui, "mainPanel") and hasattr(self.ui, "dockerSetupPanel"):
+            # Hide the workflow page so only the visible setup page contributes to layout size.
+            self.ui.mainPanel.hide()
+            self.ui.dockerSetupPanel.show()
+            self.ui.dockerSetupPanel.updateGeometry()
 
     def hideDockerSetupScreen(self) -> None:
-        if hasattr(self.ui, "stackedMain") and hasattr(self.ui, "mainPanel"):
-            self.ui.stackedMain.setCurrentWidget(self.ui.mainPanel)
+        if hasattr(self.ui, "mainPanel") and hasattr(self.ui, "dockerSetupPanel"):
+            # Hide the setup page so its larger size hint cannot constrain the workflow page.
+            self.ui.dockerSetupPanel.hide()
+            self.ui.mainPanel.show()
+            self.ui.mainPanel.updateGeometry()
 
     def dismissDockerSetupScreen(self, checked: bool = False) -> None:
         self._dockerSetupDismissed = True
@@ -802,6 +809,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         "CollapsibleButton",
         "advancedCollapsibleButton",
         "logCollapsibleButton",
+    )
+    _MAIN_SECTION_WIDGET_NAMES = (
+        "outputsCollapsibleButton",
+        "inputsCollapsibleButton",
+        "outputCollapsibleButton",
     )
     _OUTPUT_HANDLING_OPTIONS = (
         ("Load and import (DICOMSEG)", "load_import"),
@@ -960,6 +972,39 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             if widget is None or widget is opened_widget:
                 continue
             widget.collapsed = True
+
+    def _setupMainSectionCollapse(self) -> None:
+        # Keep one workflow section open so large tables cannot push actions below Data Probe.
+        if getattr(self, "_mainSectionSignalsWired", False):
+            return
+        self._mainSectionSignalsWired = True
+        for name in self._MAIN_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None:
+                continue
+            widget.connect(
+                "toggled(bool)",
+                lambda _, opened_widget=widget: self._closeOtherMainSections(
+                    opened_widget
+                ),
+            )
+
+    def _closeOtherMainSections(self, opened_widget) -> None:
+        # Collapse the other workflow sections whenever the user expands one section.
+        if opened_widget is None or opened_widget.collapsed:
+            return
+        for name in self._MAIN_SECTION_WIDGET_NAMES:
+            widget = getattr(self.ui, name, None)
+            if widget is None or widget is opened_widget:
+                continue
+            widget.collapsed = True
+
+    def _expandMainSection(self, section_widget) -> None:
+        # Apply the same exclusive-section behavior to programmatic workflow transitions.
+        if section_widget is None:
+            return
+        section_widget.collapsed = False
+        self._closeOtherMainSections(section_widget)
 
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
@@ -1551,6 +1596,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         model_name = model.name if model else "N/A"
 
         logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
+
+        # Advance to input selection after the user chooses a supported model.
+        if model is not None and model.inputs_compatibility:
+            self._expandMainSection(self.ui.inputsCollapsibleButton)
 
         # update apply button
         self._checkCanApply()
@@ -2447,7 +2496,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 open_panel = self._getOpenOutputPanelOnComplete()
                 self.updateOutputRunDirectories(open_latest=open_panel)
                 if open_panel:
-                    self.ui.outputCollapsibleButton.collapsed = False
+                    self._expandMainSection(self.ui.outputCollapsibleButton)
 
                 if self._getOpenRunFolderOnComplete():
                     self._openOutputFolder(output_dir)

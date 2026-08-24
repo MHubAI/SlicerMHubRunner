@@ -12,11 +12,7 @@
   </property>
   <layout class="QVBoxLayout" name="verticalLayout">
    <item>
-    <widget class="QStackedWidget" name="stackedMain">
-     <property name="currentIndex">
-      <number>0</number>
-     </property>
-     <widget class="QWidget" name="mainPanel">
+    <widget class="QWidget" name="mainPanel">
       <layout class="QVBoxLayout" name="verticalLayout_main">
        <item>
         <widget class="ctkCollapsibleButton" name="outputsCollapsibleButton">
@@ -58,7 +54,7 @@
           <string>Step 2 - Select the Input Image</string>
          </property>
          <property name="collapsed">
-          <bool>false</bool>
+          <bool>true</bool>
          </property>
          <property name="collapsedHeight">
           <number>0</number>
@@ -152,6 +148,12 @@
               <property name="enabled">
                <bool>true</bool>
               </property>
+              <property name="sizePolicy">
+               <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+                <horstretch>1</horstretch>
+                <verstretch>0</verstretch>
+               </sizepolicy>
+              </property>
               <property name="nodeTypes">
                <stringlist notr="true">
                 <string>vtkMRMLTableNode</string>
@@ -171,17 +173,23 @@
             <item>
              <widget class="QComboBox" name="cmbSelectRunOutput">
               <property name="sizePolicy">
-               <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
-                <horstretch>0</horstretch>
+               <sizepolicy hsizetype="Ignored" vsizetype="Fixed">
+                <horstretch>1</horstretch>
                 <verstretch>0</verstretch>
                </sizepolicy>
+              </property>
+              <property name="sizeAdjustPolicy">
+               <enum>QComboBox::AdjustToMinimumContentsLengthWithIcon</enum>
+              </property>
+              <property name="minimumContentsLength">
+               <number>6</number>
               </property>
              </widget>
             </item>
            <item>
-            <widget class="QPushButton" name="cmdRefreshOutputFiles">
+            <widget class="QPushButton" name="cmdRefreshRuns">
              <property name="text">
-              <string>Reload Files</string>
+              <string>Refresh Runs</string>
              </property>
              <property name="styleSheet">
               <string>padding: 3px 8px;</string>
@@ -298,7 +306,12 @@
        </item>
       </layout>
      </widget>
+   </item>
+   <item>
      <widget class="QWidget" name="dockerSetupPanel">
+      <property name="visible">
+       <bool>false</bool>
+      </property>
       <layout class="QVBoxLayout" name="verticalLayout_dockerSetup">
        <property name="spacing">
         <number>16</number>
@@ -384,6 +397,9 @@
               </property>
               <property name="text">
                <string>Set up Docker to run MHub.ai models</string>
+              </property>
+              <property name="wordWrap">
+               <bool>true</bool>
               </property>
              </widget>
             </item>
@@ -479,15 +495,15 @@
              </layout>
             </item>
             <item>
-             <layout class="QFormLayout" name="formLayout_dockerSetup">
-              <item row="0" column="0">
+             <layout class="QVBoxLayout" name="verticalLayout_dockerSetupPath">
+              <item>
                <widget class="QLabel" name="label_dockerSetupPath">
                 <property name="text">
                  <string>Docker Executable</string>
                 </property>
                </widget>
               </item>
-              <item row="0" column="1">
+              <item>
                <layout class="QHBoxLayout" name="horizontalLayout_dockerSetupPath">
                 <item>
                  <widget class="ctkPathLineEdit" name="pthDockerExecutableSetup"/>
@@ -577,7 +593,6 @@
        </item>
       </layout>
      </widget>
-    </widget>
    </item>
   </layout>
  </widget>
