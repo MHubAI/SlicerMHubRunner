@@ -30,6 +30,20 @@ class OutputHandlerContext:
     model_label: str
     model_categories: list[str]
     output_directory: str
+    output_files: list[str] | None = None
+
+    def files_with_suffixes(self, suffixes: tuple[str, ...]) -> list[str]:
+        # Use the manifest allowlist when supplied; otherwise scan without following symlinks.
+        if self.output_files is not None:
+            candidates = self.output_files
+        else:
+            candidates = ModelHandler.find_files(self.output_directory, suffixes)
+        return sorted(
+            path
+            for path in candidates
+            if os.path.basename(path) != "mhubrunner-run.json"
+            and path.lower().endswith(suffixes)
+        )
 
 
 @dataclass
@@ -84,13 +98,30 @@ class ModelHandler:
 
     @staticmethod
     def find_files(output_directory: str, suffixes: tuple[str, ...]) -> list[str]:
+        # Keep legacy runs confined to regular files physically located below their run root.
+        output_root = os.path.realpath(output_directory)
         matches = []
-        for root, _, files in os.walk(output_directory):
+        for root, directories, files in os.walk(output_root, followlinks=False):
+            directories[:] = [
+                name
+                for name in directories
+                if not os.path.islink(os.path.join(root, name))
+            ]
             for filename in files:
                 if filename == "mhubrunner-run.json":
                     continue
-                if filename.lower().endswith(suffixes):
-                    matches.append(os.path.join(root, filename))
+                candidate = os.path.join(root, filename)
+                if os.path.islink(candidate) or not filename.lower().endswith(suffixes):
+                    continue
+                resolved_candidate = os.path.realpath(candidate)
+                try:
+                    candidate_is_inside_output = os.path.commonpath(
+                        [output_root, resolved_candidate]
+                    ) == output_root
+                except ValueError:
+                    candidate_is_inside_output = False
+                if candidate_is_inside_output and os.path.isfile(resolved_candidate):
+                    matches.append(resolved_candidate)
         return sorted(matches)
 
 
@@ -99,10 +130,10 @@ class GenericModelHandler(ModelHandler):
 
     def build_output_plan(self, context: OutputHandlerContext) -> OutputPlan:
         plan = OutputPlan(
-            segmentation_files=self.find_files(context.output_directory, (".seg.dcm",))
+            segmentation_files=context.files_with_suffixes((".seg.dcm",))
         )
-        json_files = self.find_files(context.output_directory, (".json",))
-        csv_files = self.find_files(context.output_directory, (".csv",))
+        json_files = context.files_with_suffixes((".json",))
+        csv_files = context.files_with_suffixes((".csv",))
 
         # Keep the pre-handler behavior: automatically display one tabular output.
         if json_files:

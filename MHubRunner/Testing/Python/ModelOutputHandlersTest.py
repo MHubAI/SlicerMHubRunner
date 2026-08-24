@@ -85,6 +85,49 @@ class ModelOutputHandlersTest(unittest.TestCase):
         handler = ModelHandlerRegistry().handler_for("unregistered_exact_model")
         self.assertEqual(type(handler).__name__, "GenericModelHandler")
 
+    def test_generic_handler_uses_manifest_output_allowlist(self):
+        with tempfile.TemporaryDirectory() as output_directory:
+            declared_path = os.path.join(output_directory, "declared.json")
+            undeclared_path = os.path.join(output_directory, "undeclared.json")
+            with open(declared_path, "w", encoding="utf-8") as stream:
+                json.dump({"selected": True}, stream)
+            with open(undeclared_path, "w", encoding="utf-8") as stream:
+                json.dump({"selected": False}, stream)
+
+            # Supply the manifest-derived allowlist instead of scanning the directory.
+            context = OutputHandlerContext(
+                model_name="unregistered_exact_model",
+                model_label="Unknown model",
+                model_categories=[],
+                output_directory=output_directory,
+                output_files=[declared_path],
+            )
+            plan = ModelHandlerRegistry().handler_for(context.model_name).build_output_plan(context)
+
+        self.assertEqual(plan.tables[0].rows, [["selected", True]])
+
+    def test_generic_handler_ignores_symlinked_outputs(self):
+        with tempfile.TemporaryDirectory() as output_directory, tempfile.TemporaryDirectory() as outside:
+            outside_path = os.path.join(outside, "outside.json")
+            with open(outside_path, "w", encoding="utf-8") as stream:
+                json.dump({"outside": True}, stream)
+            linked_path = os.path.join(output_directory, "linked.json")
+            try:
+                os.symlink(outside_path, linked_path)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"Symbolic links are unavailable: {exc}")
+
+            # Legacy directory scans must not load files reached through symbolic links.
+            context = OutputHandlerContext(
+                model_name="unregistered_exact_model",
+                model_label="Unknown model",
+                model_categories=[],
+                output_directory=output_directory,
+            )
+            plan = ModelHandlerRegistry().handler_for(context.model_name).build_output_plan(context)
+
+        self.assertEqual(plan.tables, [])
+
     def test_generic_input_plan_preserves_selected_node_and_modality(self):
         selected_node = object()
         handler = ModelHandlerRegistry().handler_for("unregistered_exact_model")

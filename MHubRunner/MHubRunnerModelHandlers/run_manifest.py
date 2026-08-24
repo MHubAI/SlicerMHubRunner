@@ -1,5 +1,7 @@
 import json
+import ntpath
 import os
+import posixpath
 import re
 import tempfile
 from datetime import datetime
@@ -12,6 +14,24 @@ SCHEMA_VERSION = 1
 
 class RunManifestError(ValueError):
     pass
+
+
+def normalize_relative_manifest_path(path: str, *, allow_current: bool = False) -> str:
+    # Normalize either platform's separators before enforcing a portable relative path.
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise RunManifestError("Run manifest paths must be non-empty strings.")
+    portable_path = path.replace("\\", "/")
+    drive, _ = ntpath.splitdrive(path)
+    if drive or ntpath.isabs(path) or posixpath.isabs(portable_path):
+        raise RunManifestError("Run manifest paths must be relative.")
+    normalized = posixpath.normpath(portable_path)
+    if normalized == ".":
+        if allow_current:
+            return normalized
+        raise RunManifestError("Run manifest file paths cannot refer to a directory.")
+    if normalized == ".." or normalized.startswith("../"):
+        raise RunManifestError("Run manifest paths must remain inside the run directory.")
+    return normalized
 
 
 def manifest_path(output_directory: str) -> str:
@@ -71,15 +91,10 @@ def validate_run_manifest(manifest: Any) -> dict[str, Any]:
         if not isinstance(manifest.get(field), str) or not manifest[field]:
             raise RunManifestError(f"Run manifest field {field!r} must be a non-empty string.")
 
-    model_output_directory = manifest.get("modelOutputDirectory")
-    if (
-        not isinstance(model_output_directory, str)
-        or not model_output_directory
-        or os.path.isabs(model_output_directory)
-        or model_output_directory == ".."
-        or model_output_directory.startswith(".." + os.sep)
-    ):
-        raise RunManifestError("Run manifest modelOutputDirectory must remain inside the run directory.")
+    # Normalize before checking so nested traversal cannot escape the run directory.
+    model_output_directory = normalize_relative_manifest_path(
+        manifest.get("modelOutputDirectory"), allow_current=True
+    )
 
     model = manifest.get("model")
     if not isinstance(model, dict):
@@ -135,13 +150,63 @@ def validate_run_manifest(manifest: Any) -> dict[str, Any]:
     outputs = manifest.get("outputs")
     if not isinstance(outputs, list) or not all(isinstance(path, str) for path in outputs):
         raise RunManifestError("Run manifest outputs must be an array of relative paths.")
-    if any(os.path.isabs(path) or path == ".." or path.startswith(".." + os.sep) for path in outputs):
-        raise RunManifestError("Run manifest output paths must remain inside the run directory.")
+    normalized_outputs = [normalize_relative_manifest_path(path) for path in outputs]
+
+    # Require every declared output to remain inside the declared model output directory.
+    if model_output_directory != ".":
+        model_output_prefix = model_output_directory.rstrip("/") + "/"
+        if any(not path.startswith(model_output_prefix) for path in normalized_outputs):
+            raise RunManifestError(
+                "Run manifest output paths must remain inside modelOutputDirectory."
+            )
     return manifest
+
+
+def resolve_manifest_output_files(output_directory: str, manifest: dict[str, Any]) -> list[str]:
+    # Validate manifest syntax before resolving any filesystem paths.
+    validate_run_manifest(manifest)
+    run_root = os.path.realpath(output_directory)
+    model_output_relative = normalize_relative_manifest_path(
+        manifest["modelOutputDirectory"], allow_current=True
+    )
+    model_output_directory = os.path.realpath(
+        os.path.join(run_root, *model_output_relative.split("/"))
+    )
+    try:
+        model_output_is_inside_run = os.path.commonpath(
+            [run_root, model_output_directory]
+        ) == run_root
+    except ValueError:
+        model_output_is_inside_run = False
+    if not model_output_is_inside_run:
+        raise RunManifestError("Run manifest model output directory escapes the run directory.")
+
+    # Resolve only declared regular files and reject symlink escapes or missing outputs.
+    resolved_files = []
+    for output_path in manifest["outputs"]:
+        normalized_path = normalize_relative_manifest_path(output_path)
+        candidate = os.path.join(run_root, *normalized_path.split("/"))
+        resolved_candidate = os.path.realpath(candidate)
+        try:
+            candidate_is_inside_model_output = os.path.commonpath(
+                [model_output_directory, resolved_candidate]
+            ) == model_output_directory
+        except ValueError:
+            candidate_is_inside_model_output = False
+        if not candidate_is_inside_model_output or not os.path.isfile(resolved_candidate):
+            raise RunManifestError(
+                f"Run manifest output is missing or escapes modelOutputDirectory: {output_path!r}."
+            )
+        resolved_files.append(resolved_candidate)
+    return resolved_files
 
 
 def load_run_manifest(output_directory: str) -> dict[str, Any]:
     path = manifest_path(output_directory)
+
+    # Reject linked manifest files so metadata cannot be read from outside the run.
+    if os.path.islink(path):
+        raise RunManifestError(f"Run manifest must not be a symbolic link: {path}")
     try:
         with open(path, encoding="utf-8") as stream:
             manifest = json.load(stream)

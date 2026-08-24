@@ -922,7 +922,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         except ImportError:
             # Direct source loading does not run CMake and therefore has no
             # generated revision metadata.
-            EXTENSION_VERSION = "2.4.0-dev"
+            EXTENSION_VERSION = "2.4.0-beta"
             BUILD_REVISION = "unknown"
             BUILD_REVISION_SHORT = "unknown"
 
@@ -1830,7 +1830,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # get run directories, ordered by creation date
         run_dirs = []
         for d in os.scandir(runs_dir):
-            if not d.is_dir() or d.name.startswith("."):
+            if d.is_symlink() or not d.is_dir() or d.name.startswith("."):
                 continue
             run_dirs.append(d)
         run_dirs.sort(key=lambda d: d.stat().st_ctime, reverse=True)
@@ -2381,15 +2381,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._updateMainButtonIcons()
 
         ###### TEST (for caching on host)
-        # get InstanceUIDs (only available for nodes loaded through the dicom module)
+        # Resolve DICOM identity consistently from either instance or series metadata.
         node = self.ui.inputSelector.currentNode()
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
-        input_is_dicom = bool(instanceUIDs)
-
-        # create a stable hash from instance UIDs if available
-        instance_idh = self.logic.dicomInstanceUIDHash(node) if instanceUIDs else "non-dicom"
-        if not instanceUIDs:
-            logger.debug("No DICOM instanceUIDs for node: %s", node.GetName() if node else None)
+        dicom_identity = self.logic.dicomInputIdentity(node)
+        input_is_dicom = dicom_identity["wasDicom"]
+        instance_idh = dicom_identity["dicomInstanceUIDHash"] or "non-dicom"
+        if not input_is_dicom:
+            logger.debug("No DICOM identity for node: %s", node.GetName() if node else None)
 
         # get selected model
         model = self.getModelFromTableSelection()
@@ -3268,11 +3266,10 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         return images
 
     def get_node_paths(self, node) -> list[str]:
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs') if node else None
-        if instanceUIDs:
-            instanceUIDs = instanceUIDs.split()
-            files = [slicer.dicomDatabase.fileForInstance(instanceUID) for instanceUID in instanceUIDs]
-            return [f for f in files if f]
+        # Prefer original DICOM files resolved from either instance or series identity.
+        dicom_files = self.dicomFilesForNode(node)
+        if dicom_files:
+            return dicom_files
 
         storageNode = node.GetStorageNode() if node else None
         if storageNode is not None:
@@ -3281,6 +3278,27 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 return [file_path]
 
         raise ValueError("Selected input node has no file path or DICOM instanceUIDs.")
+
+    def dicomFilesForNode(self, node) -> list[str]:
+        # Resolve instance-level DICOM files when the node retains SOP Instance UIDs.
+        database = getattr(slicer, "dicomDatabase", None)
+        if node is None or database is None or not database.isOpen:
+            return []
+        instance_uids = node.GetAttribute("DICOM.instanceUIDs")
+        if instance_uids:
+            files = [database.fileForInstance(uid) for uid in instance_uids.split()]
+            files = [path for path in files if path]
+            if files:
+                return files
+
+        # Fall back to all database files for the Series Instance UID.
+        series_uid = self._seriesInstanceUIDForNode(node)
+        if series_uid:
+            try:
+                return [path for path in database.filesForSeries(series_uid) if path]
+            except Exception:
+                logger.debug("Could not resolve DICOM files for series %s", series_uid, exc_info=True)
+        return []
 
     def _normalize_modality(self, modality: str | None) -> str:
         if not modality:
@@ -3374,6 +3392,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         canonical_uids = "\n".join(sorted(instance_uids.split()))
         return hashlib.sha256(canonical_uids.encode("utf-8")).hexdigest()
 
+    def dicomInputIdentity(self, node) -> dict:
+        # Treat either durable DICOM identifier as evidence that the source was DICOM.
+        series_uid = self._seriesInstanceUIDForNode(node)
+        instance_uid_hash = self.dicomInstanceUIDHash(node)
+        return {
+            "wasDicom": bool(series_uid or instance_uid_hash),
+            "dicomSeriesInstanceUID": series_uid,
+            "dicomInstanceUIDHash": instance_uid_hash,
+        }
+
     def _seriesInstanceUIDForNode(self, node) -> str | None:
         if node is None:
             return None
@@ -3450,7 +3478,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
     ) -> dict:
         from MHubRunnerModelHandlers.run_manifest import new_run_manifest, write_run_manifest
 
-        instance_uid_hash = self.dicomInstanceUIDHash(input_node)
+        dicom_identity = self.dicomInputIdentity(input_node)
         image_name = f"mhubai/{model.name}:latest"
         image_digest = image_digest or self.getDockerImageDigest(image_name)
         manifest = new_run_manifest(
@@ -3463,9 +3491,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             slicer_session_id=_RUN_SESSION_ID,
             input_data={
                 "nodeId": input_node.GetID() if input_node else "",
-                "wasDicom": bool(instance_uid_hash),
-                "dicomSeriesInstanceUID": self._seriesInstanceUIDForNode(input_node),
-                "dicomInstanceUIDHash": instance_uid_hash,
+                **dicom_identity,
                 "geometry": self._nodeGeometryForManifest(input_node),
             },
         )
@@ -3476,13 +3502,30 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
     def _relativeRunOutputPaths(output_dir: str) -> list[str]:
         from MHubRunnerModelHandlers.run_manifest import MANIFEST_FILENAME
 
+        # Record only regular files physically contained by the run directory.
+        output_root = os.path.realpath(output_dir)
         output_paths = []
-        for root, _, filenames in os.walk(output_dir):
+        for root, directories, filenames in os.walk(output_root, followlinks=False):
+            directories[:] = [
+                name for name in directories if not os.path.islink(os.path.join(root, name))
+            ]
             for filename in filenames:
                 if filename == MANIFEST_FILENAME or filename.startswith(".mhubrunner-run-"):
                     continue
                 absolute_path = os.path.join(root, filename)
-                output_paths.append(os.path.relpath(absolute_path, output_dir))
+                if os.path.islink(absolute_path):
+                    continue
+                resolved_path = os.path.realpath(absolute_path)
+                try:
+                    path_is_inside_run = os.path.commonpath(
+                        [output_root, resolved_path]
+                    ) == output_root
+                except ValueError:
+                    path_is_inside_run = False
+                if not path_is_inside_run or not os.path.isfile(resolved_path):
+                    continue
+                relative_path = os.path.relpath(resolved_path, output_root).replace(os.sep, "/")
+                output_paths.append(relative_path)
         return sorted(output_paths)
 
     def finalizeRunManifest(
@@ -3597,11 +3640,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         )
 
     def loadStoredRun(self, output_dir: str, selected_input_node=None) -> dict | None:
-        from MHubRunnerModelHandlers.run_manifest import MANIFEST_FILENAME, load_run_manifest
+        from MHubRunnerModelHandlers.run_manifest import (
+            MANIFEST_FILENAME,
+            load_run_manifest,
+            resolve_manifest_output_files,
+        )
 
         manifest_file = os.path.join(output_dir, MANIFEST_FILENAME)
         if os.path.exists(manifest_file):
             manifest = load_run_manifest(output_dir)
+            output_files = resolve_manifest_output_files(output_dir, manifest)
             model = self._modelFromStoredMetadata(manifest["model"])
             input_node = self._resolveStoredRunInput(manifest, selected_input_node)
             input_is_dicom = bool(manifest["input"]["wasDicom"])
@@ -3613,6 +3661,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 {"name": model_name, "label": model_name, "categories": []}
             )
             manifest = None
+            output_files = None
             input_node = None
             input_is_dicom = False
 
@@ -3623,6 +3672,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             input_is_dicom=input_is_dicom,
             output_handling="load_only",
             run_id=manifest["runId"] if manifest is not None else os.path.basename(output_dir),
+            output_files=output_files,
         )
         annotation_warning = None
         if plan is not None and plan.markups and input_node is None:
@@ -3668,6 +3718,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         input_is_dicom: bool,
         output_handling: str,
         run_id: str | None = None,
+        output_files: list[str] | None = None,
     ):
         """Resolve model outputs through an exact-model handler or the generic fallback."""
         from MHubRunnerModelHandlers import ModelHandlerRegistry, OutputHandlerContext
@@ -3682,6 +3733,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             model_label=model.label,
             model_categories=list(model.categories),
             output_directory=output_dir,
+            output_files=output_files,
         )
         handler = ModelHandlerRegistry().handler_for(model.name)
         logger.info("Processing %s outputs with %s", model.name, type(handler).__name__)
@@ -4139,9 +4191,9 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if node is None:
             raise ValueError("No input node selected.")
 
-        instanceUIDs = node.GetAttribute('DICOM.instanceUIDs')
-        if instanceUIDs:
-            files = self.get_node_paths(node)
+        # Copy original DICOM files when either instance or series metadata resolves in the database.
+        files = self.dicomFilesForNode(node)
+        if files:
             if verbose:
                 logger.debug("Number of files: %s", len(files))
             if not os.path.exists(copy_dir):
@@ -4306,12 +4358,31 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """
         Find all files with the specified extension in the specified directory and its subdirectories.
         """
+        # Traverse only regular files physically contained by the requested directory.
         extension = extension if isinstance(extension, list) else [extension]
+        local_root = os.path.realpath(local_dir)
         seg_files = []
-        for root, _, files in os.walk(local_dir):
+        for root, directories, files in os.walk(local_root, followlinks=False):
+            directories[:] = [
+                name for name in directories if not os.path.islink(os.path.join(root, name))
+            ]
             for file in files:
-                if len(extension) == 0 or any(file.endswith(e) for e in extension):
-                    seg_files.append(os.path.join(root, file))
+                candidate = os.path.join(root, file)
+                if os.path.islink(candidate):
+                    continue
+                resolved_candidate = os.path.realpath(candidate)
+                try:
+                    candidate_is_inside_root = os.path.commonpath(
+                        [local_root, resolved_candidate]
+                    ) == local_root
+                except ValueError:
+                    candidate_is_inside_root = False
+                if (
+                    candidate_is_inside_root
+                    and os.path.isfile(resolved_candidate)
+                    and (len(extension) == 0 or any(file.endswith(e) for e in extension))
+                ):
+                    seg_files.append(resolved_candidate)
         return seg_files
 
     def addFilesToDatabase(self, files: list[str], operation: Literal["reference", "copy", "move"]) -> None:

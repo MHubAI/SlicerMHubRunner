@@ -18,7 +18,7 @@ class Grt123LungCancerHandler(ModelHandler):
     output_suffix = "gc_grt123_lung_cancer_findings.json"
 
     def build_output_plan(self, context: OutputHandlerContext) -> OutputPlan:
-        files = self.find_files(context.output_directory, (".json",))
+        files = context.files_with_suffixes((".json",))
         files.sort(key=lambda path: os.path.basename(path) != self.output_suffix)
         selected = None
         payload = None

@@ -9,6 +9,7 @@ from MHubRunnerModelHandlers.run_manifest import (
     finalize_run_manifest,
     load_run_manifest,
     new_run_manifest,
+    resolve_manifest_output_files,
     write_run_manifest,
 )
 
@@ -55,10 +56,10 @@ class RunManifestTest(unittest.TestCase):
                 return_code=0,
                 timed_out=False,
                 killed=False,
-                output_paths=["series/findings.json"],
+                output_paths=["outputs/series/findings.json"],
             )
             self.assertEqual(finalized["status"]["state"], "succeeded")
-            self.assertEqual(finalized["outputs"], ["series/findings.json"])
+            self.assertEqual(finalized["outputs"], ["outputs/series/findings.json"])
             self.assertTrue(os.path.exists(os.path.join(output_directory, MANIFEST_FILENAME)))
 
     def test_invalid_manifest_is_rejected(self):
@@ -72,11 +73,67 @@ class RunManifestTest(unittest.TestCase):
                 load_run_manifest(output_directory)
 
     def test_parent_output_path_is_rejected(self):
+        unsafe_paths = [
+            "../outside.json",
+            "outputs/../../outside.json",
+            r"outputs\..\..\outside.json",
+            "/outside.json",
+            r"C:\outside.json",
+            "other/output.json",
+        ]
+
+        # Reject traversal, absolute paths, and outputs outside the declared output directory.
+        for unsafe_path in unsafe_paths:
+            with self.subTest(path=unsafe_path):
+                manifest = self._manifest()
+                manifest["outputs"] = [unsafe_path]
+                with tempfile.TemporaryDirectory() as output_directory:
+                    with self.assertRaises(RunManifestError):
+                        write_run_manifest(output_directory, manifest)
+
+    def test_nested_parent_model_output_directory_is_rejected(self):
         manifest = self._manifest()
-        manifest["outputs"] = [os.path.join("..", "outside.json")]
+        manifest["modelOutputDirectory"] = "outputs/../../outside"
         with tempfile.TemporaryDirectory() as output_directory:
             with self.assertRaises(RunManifestError):
                 write_run_manifest(output_directory, manifest)
+
+    def test_manifest_outputs_resolve_only_declared_regular_files(self):
+        with tempfile.TemporaryDirectory() as output_directory:
+            outputs_directory = os.path.join(output_directory, "outputs")
+            os.makedirs(outputs_directory)
+            declared_path = os.path.join(outputs_directory, "declared.json")
+            undeclared_path = os.path.join(outputs_directory, "undeclared.json")
+            for path in (declared_path, undeclared_path):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write("{}")
+
+            # Return only the file explicitly named by the validated manifest.
+            manifest = self._manifest()
+            manifest["outputs"] = ["outputs/declared.json"]
+            self.assertEqual(
+                resolve_manifest_output_files(output_directory, manifest),
+                [os.path.realpath(declared_path)],
+            )
+
+    def test_manifest_output_symlink_escape_is_rejected(self):
+        with tempfile.TemporaryDirectory() as output_directory, tempfile.TemporaryDirectory() as outside:
+            outputs_directory = os.path.join(output_directory, "outputs")
+            os.makedirs(outputs_directory)
+            outside_path = os.path.join(outside, "outside.json")
+            with open(outside_path, "w", encoding="utf-8") as stream:
+                stream.write("{}")
+            linked_path = os.path.join(outputs_directory, "linked.json")
+            try:
+                os.symlink(outside_path, linked_path)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"Symbolic links are unavailable: {exc}")
+
+            # Reject a declared output whose resolved target leaves modelOutputDirectory.
+            manifest = self._manifest()
+            manifest["outputs"] = ["outputs/linked.json"]
+            with self.assertRaises(RunManifestError):
+                resolve_manifest_output_files(output_directory, manifest)
 
     def test_invalid_image_digest_is_rejected(self):
         manifest = self._manifest()

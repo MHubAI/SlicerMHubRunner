@@ -28,8 +28,8 @@ class ModelOutputRuntimeTest(unittest.TestCase):
 
         MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
-        self.assertTrue(label.text.startswith("MHubRunner 2.4.0-dev \u00b7 build "))
-        self.assertIn("Extension version: 2.4.0-dev", label.toolTip)
+        self.assertTrue(label.text.startswith("MHubRunner 2.4.0-beta \u00b7 build "))
+        self.assertIn("Extension version: 2.4.0-beta", label.toolTip)
         self.assertIn("Git revision:", label.toolTip)
 
     def test_main_workflow_sections_are_exclusive(self):
@@ -115,6 +115,18 @@ class ModelOutputRuntimeTest(unittest.TestCase):
                 "mhubai/example:latest",
             ],
         )
+
+    def test_dicom_identity_accepts_series_uid_without_instance_uid_attribute(self):
+        logic = self._logic_without_initialization()
+        node = SimpleNamespace(GetAttribute=lambda name: None)
+
+        # Preserve DICOM provenance when only the subject-hierarchy series UID survives.
+        with patch.object(logic, "_seriesInstanceUIDForNode", return_value="1.2.3"):
+            identity = logic.dicomInputIdentity(node)
+
+        self.assertTrue(identity["wasDicom"])
+        self.assertEqual(identity["dicomSeriesInstanceUID"], "1.2.3")
+        self.assertIsNone(identity["dicomInstanceUIDHash"])
 
     def test_docker_detection_uses_path_on_linux(self):
         logic = self._logic_without_initialization()
@@ -339,8 +351,10 @@ class ModelOutputRuntimeTest(unittest.TestCase):
 
         logic = self._logic_without_initialization()
         with tempfile.TemporaryDirectory() as output_directory:
+            model_output_directory = os.path.join(output_directory, "outputs")
+            os.makedirs(model_output_directory)
             result_path = os.path.join(
-                output_directory, "gc_grt123_lung_cancer_findings.json"
+                model_output_directory, "gc_grt123_lung_cancer_findings.json"
             )
             with open(result_path, "w", encoding="utf-8") as stream:
                 json.dump(result_payload, stream)

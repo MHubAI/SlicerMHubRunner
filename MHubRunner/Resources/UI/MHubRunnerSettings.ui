@@ -554,7 +554,7 @@
    <item>
     <widget class="QLabel" name="lblExtensionBuildInfo">
      <property name="text">
-      <string>MHubRunner 2.4.0-dev · build unknown</string>
+      <string>MHubRunner 2.4.0-beta · build unknown</string>
      </property>
      <property name="alignment">
       <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
