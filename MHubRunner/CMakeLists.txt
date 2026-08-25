@@ -43,7 +43,8 @@ set(MODULE_PYTHON_SCRIPTS
   )
 
 set(MODULE_PYTHON_RESOURCES
-  Resources/Icons/MHubRunner.png
+  Resources/Icons/MHubRunner_icon_b.png
+  Resources/Icons/MHubRunner_icon_w.png
   Resources/Icons/MRunner_b.png
   Resources/Icons/MRunner_w.png
   Resources/Icons/Name.png
