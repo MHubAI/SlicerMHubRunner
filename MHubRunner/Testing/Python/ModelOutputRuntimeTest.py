@@ -73,6 +73,17 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertIn("Extension version: development source", label.toolTip)
         self.assertIn("Git revision: unknown", label.toolTip)
 
+    def test_docker_version_summary_uses_compact_version(self):
+        # Keep the footer concise while preserving Docker's reported semantic version.
+        self.assertEqual(
+            MHubRunnerWidget._formatDockerVersion("Docker version 27.0.0, build 1234567\n"),
+            "v27.0.0",
+        )
+        self.assertEqual(
+            MHubRunnerWidget._formatDockerVersion("unexpected output"),
+            "version unknown",
+        )
+
     def test_output_display_path_handles_symlinked_run_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             real_run = os.path.join(temporary_directory, "real-run")
@@ -297,12 +308,15 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         ) as run:
             run.return_value = SimpleNamespace(stdout=b"Docker version 27.0.0\n")
             information = logic.getDockerInformation()
+            cached_information = logic.getDockerInformation()
 
         self.assertTrue(information.available)
         self.assertEqual(information.version, "Docker version 27.0.0\n")
+        self.assertIs(cached_information, information)
         self.assertEqual(run.call_args.args[0], ["/resolved/docker", "--version"])
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
         self.assertTrue(run.call_args.kwargs["check"])
+        run.assert_called_once()
 
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")
