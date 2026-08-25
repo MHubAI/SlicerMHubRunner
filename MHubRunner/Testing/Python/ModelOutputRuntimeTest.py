@@ -33,7 +33,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         )
 
         # Verify that the footer renders metadata supplied by the generated build module.
-        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": build_info}):
+        with patch.dict(sys.modules, {"MHubRunnerLib.build_info": build_info}):
             MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
         self.assertEqual(label.text, "MHubRunner 9.8.7-test \u00b7 build abcdef123456")
@@ -45,7 +45,7 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
 
         # Identify direct source loading without duplicating the CMake release version.
-        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": None}):
+        with patch.dict(sys.modules, {"MHubRunnerLib.build_info": None}):
             MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
         self.assertEqual(label.text, "MHubRunner development source \u00b7 build unknown")

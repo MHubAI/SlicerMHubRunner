@@ -923,7 +923,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
         try:
-            from MHubRunnerBuildInfo import (
+            from MHubRunnerLib.build_info import (
                 BUILD_REVISION,
                 BUILD_REVISION_SHORT,
                 EXTENSION_VERSION,
