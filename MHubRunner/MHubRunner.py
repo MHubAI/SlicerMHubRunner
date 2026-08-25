@@ -3279,8 +3279,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             info.version = "E"
             info.available = False
 
-        # Cache both successful and failed checks for this resolved executable.
-        self._docker_information_cache = (docker_exec, info)
+        # Cache successful checks only so transient Docker startup failures retry normally.
+        self._docker_information_cache = (docker_exec, info) if info.available else None
         return info
 
     def getGPUInformation(self) -> list[str]:

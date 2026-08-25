@@ -343,6 +343,26 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["check"])
         run.assert_called_once()
 
+    def test_docker_information_retries_transient_version_failure(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {"docker": "/resolved/docker"}
+
+        # Retry an unavailable result for the same executable after Docker recovers.
+        with patch("shutil.which", return_value="/resolved/docker"), patch(
+            "subprocess.run",
+            side_effect=[
+                RuntimeError("Docker Desktop is still starting"),
+                SimpleNamespace(stdout=b"Docker version 27.0.0\n"),
+            ],
+        ) as run:
+            unavailable_information = logic.getDockerInformation()
+            recovered_information = logic.getDockerInformation()
+
+        self.assertFalse(unavailable_information.available)
+        self.assertTrue(recovered_information.available)
+        self.assertEqual(recovered_information.version, "Docker version 27.0.0\n")
+        self.assertEqual(run.call_count, 2)
+
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")
         image = vtk.vtkImageData()
