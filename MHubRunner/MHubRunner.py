@@ -888,10 +888,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         docker_status = "Docker unavailable"
 
-        # Report the cached Docker CLI version instead of exposing its executable path.
-        docker_info = self.logic.getDockerInformation()
-        if docker_info.available:
-            docker_status = f"Docker available ({self._formatDockerVersion(docker_info.version)})"
+        # Honor an explicitly configured path before reporting fallback Docker information.
+        if self._dockerExecutableAvailable():
+            docker_info = self.logic.getDockerInformation()
+            if docker_info.available:
+                docker_status = f"Docker available ({self._formatDockerVersion(docker_info.version)})"
 
         summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
         self.ui.lblSetupSummary.text = summary_line

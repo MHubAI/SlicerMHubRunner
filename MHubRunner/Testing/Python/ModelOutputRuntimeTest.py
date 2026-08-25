@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import qt
 import slicer
@@ -83,6 +83,31 @@ class ModelOutputRuntimeTest(unittest.TestCase):
             MHubRunnerWidget._formatDockerVersion("unexpected output"),
             "version unknown",
         )
+
+    def test_docker_summary_rejects_invalid_configured_path(self):
+        widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
+        docker_information = Mock()
+        widget.logic = SimpleNamespace(getDockerInformation=docker_information)
+        widget.ui = SimpleNamespace(
+            lstHostGpu=qt.QListWidget(),
+            chkGpuEnabled=SimpleNamespace(checked=False),
+            cmbLogLevel=SimpleNamespace(currentText="INFO"),
+            pthDockerExecutable=SimpleNamespace(currentPath="/invalid/manual/docker"),
+            lblSetupSummary=qt.QLabel(),
+        )
+
+        # Keep an invalid manual path authoritative even if Docker exists on PATH.
+        with patch(
+            "shutil.which",
+            side_effect=lambda candidate: "/usr/bin/docker" if candidate == "docker" else None,
+        ):
+            widget.updateSettingsSummary()
+
+        self.assertEqual(
+            widget.ui.lblSetupSummary.text,
+            "No GPU, Docker unavailable, Log Level INFO",
+        )
+        docker_information.assert_not_called()
 
     def test_output_display_path_handles_symlinked_run_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
