@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import qt
 import slicer
@@ -72,6 +72,42 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertEqual(label.text, "MHubRunner development source \u00b7 build unknown")
         self.assertIn("Extension version: development source", label.toolTip)
         self.assertIn("Git revision: unknown", label.toolTip)
+
+    def test_docker_version_summary_uses_compact_version(self):
+        # Keep the footer concise while preserving Docker's reported semantic version.
+        self.assertEqual(
+            MHubRunnerWidget._formatDockerVersion("Docker version 27.0.0, build 1234567\n"),
+            "v27.0.0",
+        )
+        self.assertEqual(
+            MHubRunnerWidget._formatDockerVersion("unexpected output"),
+            "version unknown",
+        )
+
+    def test_docker_summary_rejects_invalid_configured_path(self):
+        widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
+        docker_information = Mock()
+        widget.logic = SimpleNamespace(getDockerInformation=docker_information)
+        widget.ui = SimpleNamespace(
+            lstHostGpu=qt.QListWidget(),
+            chkGpuEnabled=SimpleNamespace(checked=False),
+            cmbLogLevel=SimpleNamespace(currentText="INFO"),
+            pthDockerExecutable=SimpleNamespace(currentPath="/invalid/manual/docker"),
+            lblSetupSummary=qt.QLabel(),
+        )
+
+        # Keep an invalid manual path authoritative even if Docker exists on PATH.
+        with patch(
+            "shutil.which",
+            side_effect=lambda candidate: "/usr/bin/docker" if candidate == "docker" else None,
+        ):
+            widget.updateSettingsSummary()
+
+        self.assertEqual(
+            widget.ui.lblSetupSummary.text,
+            "No GPU, Docker unavailable, Log Level INFO",
+        )
+        docker_information.assert_not_called()
 
     def test_output_display_path_handles_symlinked_run_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -154,6 +190,27 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         slicer.app.processEvents()
         self.assertFalse(ui.inputsCollapsibleButton.collapsed)
         self.assertTrue(ui.outputCollapsibleButton.collapsed)
+
+        # Render the fully collapsed workflow and compare actual CTK header heights.
+        for section in (
+            ui.outputsCollapsibleButton,
+            ui.inputsCollapsibleButton,
+            ui.outputCollapsibleButton,
+        ):
+            section.collapsed = True
+        ui_widget.resize(600, 500)
+        ui_widget.show()
+        slicer.app.processEvents()
+        collapsed_heights = {
+            section.geometry.height()
+            for section in (
+                ui.outputsCollapsibleButton,
+                ui.inputsCollapsibleButton,
+                ui.outputCollapsibleButton,
+            )
+        }
+        self.assertEqual(len(collapsed_heights), 1)
+        self.assertGreater(next(iter(collapsed_heights)), 0)
 
         # Verify hidden workflow/setup pages do not coexist in the parent layout.
         widget.showDockerSetupScreen()
@@ -277,12 +334,35 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         ) as run:
             run.return_value = SimpleNamespace(stdout=b"Docker version 27.0.0\n")
             information = logic.getDockerInformation()
+            cached_information = logic.getDockerInformation()
 
         self.assertTrue(information.available)
         self.assertEqual(information.version, "Docker version 27.0.0\n")
+        self.assertIs(cached_information, information)
         self.assertEqual(run.call_args.args[0], ["/resolved/docker", "--version"])
         self.assertEqual(run.call_args.kwargs["timeout"], 5)
         self.assertTrue(run.call_args.kwargs["check"])
+        run.assert_called_once()
+
+    def test_docker_information_retries_transient_version_failure(self):
+        logic = self._logic_without_initialization()
+        logic._executables = {"docker": "/resolved/docker"}
+
+        # Retry an unavailable result for the same executable after Docker recovers.
+        with patch("shutil.which", return_value="/resolved/docker"), patch(
+            "subprocess.run",
+            side_effect=[
+                RuntimeError("Docker Desktop is still starting"),
+                SimpleNamespace(stdout=b"Docker version 27.0.0\n"),
+            ],
+        ) as run:
+            unavailable_information = logic.getDockerInformation()
+            recovered_information = logic.getDockerInformation()
+
+        self.assertFalse(unavailable_information.available)
+        self.assertTrue(recovered_information.available)
+        self.assertEqual(recovered_information.version, "Docker version 27.0.0\n")
+        self.assertEqual(run.call_count, 2)
 
     def test_matching_lps_geometry_creates_ras_fiducial(self):
         volume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode", "Input")

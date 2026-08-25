@@ -498,7 +498,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self.updateHostGpuList()
 
         # load docker info
-        self.onDockerUpdate()
+        self.onDockerUpdate(refresh=False)
 
         # Make sure parameter node is initialized (needed for module reload)
         self.initializeParameterNode()
@@ -886,25 +886,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         log_level = self.ui.cmbLogLevel.currentText
         log_level = log_level or "N/A"
 
-        docker_exec = self._getDockerExecutablePath()
-        docker_exec = docker_exec or ""
         docker_status = "Docker unavailable"
 
-        # Resolve the configured path before reporting Docker as available.
-        try:
-            import shutil
-            docker_path = shutil.which(docker_exec) if docker_exec else shutil.which("docker")
-        except Exception:
-            docker_path = None
-
-        # Describe either the resolved executable or the invalid configured path.
-        if docker_path:
-            docker_status = f"Docker available at {docker_path}"
-        elif docker_exec:
-            docker_status = f"Docker not found at {docker_exec}"
+        # Honor an explicitly configured path before reporting fallback Docker information.
+        if self._dockerExecutableAvailable():
+            docker_info = self.logic.getDockerInformation()
+            if docker_info.available:
+                docker_status = f"Docker available ({self._formatDockerVersion(docker_info.version)})"
 
         summary_line = f"{gpu_summary}, {docker_status}, Log Level {log_level}"
         self.ui.lblSetupSummary.text = summary_line
+
+    @staticmethod
+    def _formatDockerVersion(version_text: str) -> str:
+        # Extract Docker's semantic version from its standard version response.
+        match = re.search(r"\bv?(\d+(?:\.\d+)+(?:[-+][0-9A-Za-z.-]+)?)\b", version_text or "")
+        return f"v{match.group(1)}" if match else "version unknown"
 
     def _formatLicenseSummary(self, model: Optional['Model']) -> str:
         if model is None:
@@ -1016,6 +1013,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             widget = getattr(self.ui, name, None)
             if widget is None:
                 continue
+
+            # Normalize CTK's stale initial height for sections loaded as collapsed.
+            if widget.collapsed:
+                widget.collapsed = False
+                widget.collapsed = True
             widget.connect(
                 "toggled(bool)",
                 lambda _, opened_widget=widget: self._closeOtherMainSections(
@@ -1656,10 +1658,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # update apply button
         self._checkCanApply()
 
-    def onDockerUpdate(self) -> None:
+    def onDockerUpdate(self, _checked: bool = False, refresh: bool = True) -> None:
         assert self.logic is not None
 
-        info = self.logic.getDockerInformation()
+        # Refresh on an explicit reload while reusing startup information during setup.
+        info = self.logic.getDockerInformation(refresh=refresh)
         if not info.available:
             self.ui.lblBackendVersion.setText("Docker not available.")
         else:
@@ -3039,6 +3042,7 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         """
         ScriptedLoadableModuleLogic.__init__(self)
         self._executables: dict[str, str] = {}
+        self._docker_information_cache: tuple[str | None, DockerInformation] | None = None
         # self.hosts: List[str] = []
         # self.hostInfo: Dict[str, HostInformation] = {}
 
@@ -3252,12 +3256,18 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # Return the resolved executable or None when Docker is unavailable.
         return docker_executable
 
-    def getDockerInformation(self) -> DockerInformation:
+    def getDockerInformation(self, refresh: bool = False) -> DockerInformation:
         import subprocess
+
+        docker_exec = self.getDockerExecutable()
+
+        # Reuse the version check while the resolved Docker executable is unchanged.
+        cached = getattr(self, "_docker_information_cache", None)
+        if not refresh and cached is not None and cached[0] == docker_exec:
+            return cached[1]
 
         info = DockerInformation(version="N/A", available=False)
         try:
-            docker_exec = self.getDockerExecutable()
             assert docker_exec is not None, "Docker executable not found"
             logger.debug("Running %s --version", docker_exec)
             env = self._build_subprocess_env(docker_exec)
@@ -3269,6 +3279,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             info.version = "E"
             info.available = False
 
+        # Cache successful checks only so transient Docker startup failures retry normally.
+        self._docker_information_cache = (docker_exec, info) if info.available else None
         return info
 
     def getGPUInformation(self) -> list[str]:
