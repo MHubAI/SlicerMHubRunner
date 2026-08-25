@@ -1016,6 +1016,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             widget = getattr(self.ui, name, None)
             if widget is None:
                 continue
+
+            # Normalize CTK's stale initial height for sections loaded as collapsed.
+            if widget.collapsed:
+                widget.collapsed = False
+                widget.collapsed = True
             widget.connect(
                 "toggled(bool)",
                 lambda _, opened_widget=widget: self._closeOtherMainSections(

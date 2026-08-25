@@ -155,6 +155,26 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertFalse(ui.inputsCollapsibleButton.collapsed)
         self.assertTrue(ui.outputCollapsibleButton.collapsed)
 
+        # Render the fully collapsed workflow and compare actual CTK header heights.
+        for section in (
+            ui.outputsCollapsibleButton,
+            ui.inputsCollapsibleButton,
+            ui.outputCollapsibleButton,
+        ):
+            section.collapsed = True
+        ui_widget.resize(600, 500)
+        ui_widget.show()
+        slicer.app.processEvents()
+        collapsed_heights = {
+            section.geometry.height()
+            for section in (
+                ui.outputsCollapsibleButton,
+                ui.inputsCollapsibleButton,
+                ui.outputCollapsibleButton,
+            )
+        }
+        self.assertEqual(collapsed_heights, {24})
+
         # Verify hidden workflow/setup pages do not coexist in the parent layout.
         widget.showDockerSetupScreen()
         self.assertTrue(ui.mainPanel.isHidden())
