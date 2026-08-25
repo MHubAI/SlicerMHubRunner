@@ -10,7 +10,7 @@ import qt
 import slicer
 import vtk
 
-from MHubRunner import MHubRunnerLogic, MHubRunnerWidget, Model, ModelStatus
+from MHubRunner import MHubRunner, MHubRunnerLogic, MHubRunnerWidget, Model, ModelStatus
 from MHubRunnerModelHandlers import MarkupOutput, MarkupPoint
 from MHubRunnerModelHandlers.run_manifest import load_run_manifest, write_run_manifest
 
@@ -33,19 +33,40 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         )
 
         # Verify that the footer renders metadata supplied by the generated build module.
-        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": build_info}):
+        with patch.dict(sys.modules, {"MHubRunnerLib.build_info": build_info}):
             MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
         self.assertEqual(label.text, "MHubRunner 9.8.7-test \u00b7 build abcdef123456")
         self.assertIn("Extension version: 9.8.7-test", label.toolTip)
         self.assertIn("Git revision: abcdef1234567890", label.toolTip)
 
+    def test_module_icon_variants_follow_palette_brightness(self):
+        light_palette = qt.QPalette()
+        light_palette.setColor(qt.QPalette.Window, qt.QColor("white"))
+        dark_palette = qt.QPalette()
+        dark_palette.setColor(qt.QPalette.Window, qt.QColor("black"))
+
+        # Select the contrasting icon for each Slicer palette and package both resources.
+        self.assertEqual(
+            MHubRunner._moduleIconNameForPalette(light_palette),
+            "MHubRunner_icon_b.png",
+        )
+        self.assertEqual(
+            MHubRunner._moduleIconNameForPalette(dark_palette),
+            "MHubRunner_icon_w.png",
+        )
+        icons_directory = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "Resources", "Icons")
+        )
+        self.assertTrue(os.path.isfile(os.path.join(icons_directory, "MHubRunner_icon_b.png")))
+        self.assertTrue(os.path.isfile(os.path.join(icons_directory, "MHubRunner_icon_w.png")))
+
     def test_extension_build_footer_without_generated_metadata(self):
         label = qt.QLabel()
         widget = SimpleNamespace(ui=SimpleNamespace(lblExtensionBuildInfo=label))
 
         # Identify direct source loading without duplicating the CMake release version.
-        with patch.dict(sys.modules, {"MHubRunnerBuildInfo": None}):
+        with patch.dict(sys.modules, {"MHubRunnerLib.build_info": None}):
             MHubRunnerWidget._updateExtensionBuildInfo(widget)
 
         self.assertEqual(label.text, "MHubRunner development source \u00b7 build unknown")

@@ -113,6 +113,10 @@ class MHubRunner(ScriptedLoadableModule):
 
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
+
+        # Select the module icon for the palette active when Slicer starts the module.
+        self._updateModuleIcon(qt.QApplication.palette())
+
         self.parent.title = _("MHubRunner")  # TODO: make this more human readable by adding spaces
         # TODO: set categories (folders where the module shows up in the module selector)
         self.parent.categories = [translate("qSlicerAbstractCoreModule", "Examples")]
@@ -164,6 +168,25 @@ to run these models directly from 3D Slicer.
 
         # Additional initialization step after application startup is complete
         slicer.app.connect("startupCompleted()", registerSampleData)
+
+    @staticmethod
+    def _moduleIconNameForPalette(palette: qt.QPalette) -> str:
+        # Use the white icon on dark backgrounds and the black icon on light backgrounds.
+        window_color = palette.color(qt.QPalette.Window)
+        suffix = "w" if window_color.lightness() < 128 else "b"
+        return f"MHubRunner_icon_{suffix}.png"
+
+    def _updateModuleIcon(self, palette: qt.QPalette) -> None:
+        # Replace Slicer's single conventional module icon with the matching theme variant.
+        module_directory = os.path.dirname(self.parent.path)
+        icon_path = os.path.join(
+            module_directory,
+            "Resources",
+            "Icons",
+            self._moduleIconNameForPalette(palette),
+        )
+        if os.path.isfile(icon_path):
+            self.parent.icon = qt.QIcon(icon_path)
 
 
 #
@@ -923,7 +946,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             return
 
         try:
-            from MHubRunnerBuildInfo import (
+            from MHubRunnerLib.build_info import (
                 BUILD_REVISION,
                 BUILD_REVISION_SHORT,
                 EXTENSION_VERSION,

@@ -1,56 +1,72 @@
-![MHub Runner (3DSlicer Plugin)](https://github.com/AIM-Harvard/SlicerMHubRunner/blob/main/MHubRunner/Resources/Icons/Name.png?raw=true)
+<p align="center">
+  <img src="MHubRunner/Resources/Icons/Name.png" alt="MRunner" width="500">
+</p>
 
-The MHubRunner extension seamlessly integrates Deep Learning models from [MHub.ai](https://mhub.ai) into 3D Slicer.
+<p align="center">
+  <a href="https://github.com/AIM-Harvard/SlicerMHubRunner/actions/workflows/lint.yml">
+    <img src="https://github.com/AIM-Harvard/SlicerMHubRunner/actions/workflows/lint.yml/badge.svg?branch=main" alt="Lint status">
+  </a>
+  <a href="https://slicer.cdash.org/viewBuildGroup.php?project=SlicerPreview&amp;buildgroup=Extensions-Nightly&amp;filtercount=2&amp;showfilters=1&amp;field1=buildname&amp;compare1=63&amp;value1=MHubRunner&amp;field2=buildname&amp;compare2=63&amp;value2=g%2B%2B">
+    <img src="https://img.shields.io/badge/CDash-Linux-informational?logo=linux&amp;logoColor=white" alt="Linux nightly builds">
+  </a>
+  <a href="https://slicer.cdash.org/viewBuildGroup.php?project=SlicerPreview&amp;buildgroup=Extensions-Nightly&amp;filtercount=2&amp;showfilters=1&amp;field1=buildname&amp;compare1=63&amp;value1=MHubRunner&amp;field2=buildname&amp;compare2=63&amp;value2=MSBuild">
+    <img src="https://img.shields.io/badge/CDash-Windows-informational?logo=windows&amp;logoColor=white" alt="Windows nightly builds">
+  </a>
+  <a href="https://slicer.cdash.org/viewBuildGroup.php?project=SlicerPreview&amp;buildgroup=Extensions-Nightly&amp;filtercount=2&amp;showfilters=1&amp;field1=buildname&amp;compare1=63&amp;value1=MHubRunner&amp;field2=buildname&amp;compare2=63&amp;value2=clang%2B%2B">
+    <img src="https://img.shields.io/badge/CDash-macOS-informational?logo=apple&amp;logoColor=white" alt="macOS nightly builds">
+  </a>
+</p>
+
+MHubRunner integrates containerized medical-imaging models from [MHub.ai](https://mhub.ai) into [3D Slicer](https://www.slicer.org/). It handles model discovery, Docker execution, run history, and loading supported results into the Slicer scene.
 
 ## MHub.ai
-MHub is a repository for Machine Learning models for medical imaging.
-The goal of mhub is to make these models universally accessible by containerizing the entire model pipeline and standardizing the I/O interface.
 
-Find out more at [mhub.ai](https://mhub.ai) and check out the mhub [GitHub repository](https://github.com/MHubAI).
+[MHub.ai](https://mhub.ai) makes medical-imaging models more accessible by packaging complete inference pipelines in containers and standardizing their inputs and outputs. Model descriptions, citations, licenses, and intended inputs are available from the MHub model catalog and the [MHubAI GitHub organization](https://github.com/MHubAI).
 
 ## Requirements
-We only need [Docker](https://docs.docker.com/get-docker/) 🐳 to be installed on your system. That's it.
 
-# Usage
+- 3D Slicer 5.12.x
+- [Docker](https://docs.docker.com/get-docker/)
+- A supported GPU and container runtime configuration for models that require GPU execution
 
-First, open a volume in Slicer on which you want to run the plugin.
-You can use your own data or the slicer sample data.
-Slicer sample data can be found at *File > Download Sample Data*, to download a chest CT scan click on *CTChest*.
-Now open the *MRunner* module (navigate to *3D Slicer > Modules > Examples > MHubRunner*).
-You will now see the graphical user interface (GUI) of the module.
+The QuantitativeReporting extension is installed as an MHubRunner dependency.
 
-<img width="602" alt="Bildschirmfoto 2025-01-27 um 11 11 28" src="https://github.com/user-attachments/assets/2d8ba82e-a6f2-41c9-8c57-12cc3418bc77" />
+## Usage
 
-## MHub Model
+Load a volume into Slicer, then open **MHubRunner** from the module selector.
 
-Here you see an overview of all available MHub.ai models.
-You can use the search box to find models suitable for your use case.
+<p align="center">
+  <img src="docs/images/mhubrunner-ui.png" alt="MHubRunner model selection and model information interface" width="602">
+</p>
 
-Additional model information such as a short description of the model, the modalities and the expected input data can be displayed using the details button.
-For more information, you can open the model card on MHub.ai using the web button which will take you directly to the model page.
+### Step 1 – Search and select a model
 
-## Input Image
+Use the search field to filter the available MHub.ai models. The table summarizes each model's type, accepted image modalities, and commercial-use status.
 
-Here you can select and inspect the input image to run the model on.
+The action buttons let you:
 
-## Docker
+- download or update the model's Docker image;
+- inspect its description, expected inputs, license, and citation;
+- open the complete model card on MHub.ai.
 
-Under the Docker tab, you can manage your local model images.
-You can select an image and use the update button to pull the latest version of this model.
-You can use the delete button to remove the image to free up space on your disk.
-You can always download the image again.
+### Step 2 – Select the input image
 
+Select the scalar volume that should be processed. MHubRunner can reuse DICOM data already indexed in Slicer's DICOM database or export a selected non-DICOM volume for model execution.
 
-## GPU
+### Run the model
 
-Some of our models require a GPU to run, most will be significantly faster with a GPU available. If you have a supported GPU installed, it will be listed here.
-You can then select the gpu(s) you want to use running the model here.
+The main action button displays the selected model and starts its containerized workflow. GPU selection, Docker configuration, output behavior, and logging options are available under **Settings**.
 
-## Advanced Options
+### Load results
 
-You can manually specify the path to the Docker executable, kill all running background processes and see the run log under the advanced options.
+Each run is stored with a manifest containing its model, input identity, image digest, status, and declared outputs. The **Output** section can reopen past runs and load supported results, including:
 
-# Important Note
+- DICOM segmentation objects;
+- generic JSON and CSV tables;
+- model-specific tables and image annotations where a model handler is available.
 
-**This repository and plugin are under active development, as is the mhub repository.
-Use this plugin with caution and always backup your data. We strongly recommend that you only use the slicer sample data and only use this plugin in a non-production environment.**
+Results loaded into the scene are grouped by run. Model-specific handlers may also link table rows with their corresponding image landmarks.
+
+## Development status
+
+This repository, MHubRunner, and the MHub model collection are under active development. Review each model's documentation and outputs carefully, retain the original data, and validate results independently before using them in research or clinical workflows.

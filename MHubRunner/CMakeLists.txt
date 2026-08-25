@@ -21,16 +21,19 @@ if(GIT_FOUND)
   endif()
 endif()
 
+# Generate metadata inside the internal package so Slicer does not discover it as a module.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerLib")
 configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/MHubRunnerBuildInfo.py.in
-  ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerBuildInfo.py
+  "${CMAKE_CURRENT_SOURCE_DIR}/MHubRunnerLib/build_info.py.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerLib/build_info.py"
   @ONLY
   )
 
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
-  ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerBuildInfo.py
+  MHubRunnerLib/__init__.py
+  ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerLib/build_info.py
   MHubRunnerModelHandlers/__init__.py
   MHubRunnerModelHandlers/base.py
   MHubRunnerModelHandlers/handlers/__init__.py
@@ -40,7 +43,8 @@ set(MODULE_PYTHON_SCRIPTS
   )
 
 set(MODULE_PYTHON_RESOURCES
-  Resources/Icons/MHubRunner.png
+  Resources/Icons/MHubRunner_icon_b.png
+  Resources/Icons/MHubRunner_icon_w.png
   Resources/Icons/MRunner_b.png
   Resources/Icons/MRunner_w.png
   Resources/Icons/Name.png
