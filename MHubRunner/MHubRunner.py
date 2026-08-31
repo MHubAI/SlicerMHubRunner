@@ -25,6 +25,11 @@ from slicer.parameterNodeWrapper import (
 
 from slicer import vtkMRMLScalarVolumeNode
 import DICOMSegmentationPlugin
+from MHubRunnerLib.gpu_requirements import (
+    GPURequirement,
+    gpu_requirement_display,
+    gpu_requirement_from_model_data,
+)
 
 import hashlib
 from datetime import datetime
@@ -348,8 +353,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # self.ui.cmdTest.connect('clicked(bool)', self.loadSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
-        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
-        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.updateSettingsSummary)
+        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.onGpuSelectionChanged)
+        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.onGpuSelectionChanged)
         self.ui.lstBackendImages.connect('itemSelectionChanged()', self.onBackendImageSelect)
         self.ui.cmdImageUpdate.connect('clicked(bool)', self.onBackendImageUpdate)
         self.ui.cmdImageRemove.connect('clicked(bool)', self.onBackendImageRemove)
@@ -875,11 +880,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             item = self.ui.lstHostGpu.item(i)
             if item.checkState() == qt.Qt.Checked:
                 selected_gpus.append(item.text())
-        if not selected_gpus:
-            selected_gpus = [item.text() for item in self.ui.lstHostGpu.selectedItems()]
-
         if gpu_enabled and selected_gpus:
             gpu_summary = "Selected GPU " + ", ".join(selected_gpus)
+        elif gpu_enabled and gpu_count > 0:
+            gpu_summary = "All detected GPUs"
         else:
             gpu_summary = "No GPU"
 
@@ -1200,11 +1204,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # check if docker is available
         # TODO: ...
 
-        # chekc if gpu requirements are met
-        # TODO: ...
+        # Keep required models unavailable until GPU execution is enabled.
+        gpu_requirement_met = model is None or self._modelGpuRequirementMet(model)
 
         # check if input is selected
-        if model and model.inputs_compatibility and self._parameterNode and self._parameterNode.inputVolume:
+        if model and model.inputs_compatibility and gpu_requirement_met and self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
             self._setButtonTextWithIcon(self.ui.applyButton, f"Run {model.label}")
@@ -1219,6 +1223,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             elif not model.inputs_compatibility:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
+            elif not gpu_requirement_met:
+                self._setButtonTextWithIcon(self.ui.applyButton, "GPU Required")
+                self.ui.applyButton.toolTip = _("This model requires GPU execution. Enable GPU acceleration in Settings to run it.")
             else:
                 self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
         self.updateLicenseSummary(model)
@@ -1278,11 +1285,31 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def updateHostGpuList(self) -> None:
         assert self.logic is not None
 
+        # Replace the previous detection result so reloads cannot duplicate devices.
         gpus = self.logic.getGPUInformation()
+        self.ui.lstHostGpu.clear()
         for gpu in gpus:
             self.ui.lstHostGpu.addItem(gpu)
         self.ui.chkGpuEnabled.checked = len(gpus) > 0
         self.ui.chkGpuEnabled.enabled = len(gpus) > 0
+        self.onGpuSelectionChanged()
+
+    def _gpuExecutionEnabled(self) -> bool:
+        """Return whether Docker will receive access to at least one detected GPU."""
+
+        return bool(self.ui.chkGpuEnabled.checked and self.ui.lstHostGpu.count > 0)
+
+    def _modelGpuRequirementMet(self, model: 'Model') -> bool:
+        """Block only models that explicitly require a currently unavailable GPU."""
+
+        return model.gpu_requirement != GPURequirement.REQUIRED or self._gpuExecutionEnabled()
+
+    def onGpuSelectionChanged(self, *args) -> None:
+        """Refresh model availability and summaries after any GPU setting changes."""
+
+        if hasattr(self.logic, "_model_cache"):
+            self._renderFilteredModels(self.logic._model_cache, self._pendingModelSearchText or "")
+        self._checkCanApply()
         self.updateSettingsSummary()
 
     def onGpuEnabled(self) -> None:
@@ -1291,9 +1318,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         enabled = self.ui.chkGpuEnabled.checked
         self.ui.lstHostGpu.enabled = enabled
 
-        # enable/disable apply button
-        self._checkCanApply()
-        self.updateSettingsSummary()
+        # Re-evaluate required models and the Run button using the new GPU state.
+        self.onGpuSelectionChanged()
 
     def loadModelRepo(self) -> None:
         pass
@@ -1315,8 +1341,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._fetchModelsAsync()
 
     def _renderFilteredModels(self, models: list['Model'], text: str) -> None:
+        # Preserve the selected model while GPU or status updates rebuild the table.
+        selected_model = self.getModelFromTableSelection()
+        selected_model_name = selected_model.name if selected_model else None
         filtered = [model for model in models if model.str_match(text)]
         self.renderModelTable(filtered)
+        if selected_model_name:
+            for row in range(self.ui.tblModelList.rowCount):
+                model = self.getModelFromTableSelection(row)
+                if model and model.name == selected_model_name:
+                    self.ui.tblModelList.selectRow(row)
+                    break
 
     def _fetchModelsAsync(self) -> None:
         if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
@@ -1391,9 +1426,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # remove all rows from model table
         self.ui.tblModelList.setRowCount(0)
 
-        # add models to table with columns
-        self.ui.tblModelList.setColumnCount(5)
-        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "CU", "Actions"])
+        # Add a compact GPU requirement column without increasing the table's minimum width significantly.
+        self.ui.tblModelList.setColumnCount(6)
+        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "GPU", "CU", "Actions"])
 
         # make table rows slim
         self.ui.tblModelList.verticalHeader().setDefaultSectionSize(24)
@@ -1412,6 +1447,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         header.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, qt.QHeaderView.ResizeToContents)
 
         # fill table with models that match the search text
         for model in models:
@@ -1429,7 +1465,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # add model image (placeholder)
             self.ui.tblModelList.setItem(rowPosition, 2, qt.QTableWidgetItem(",".join(model.modalities)))
 
-            # add commercial use column
+            # Show the verified or API-provided GPU requirement with its provenance-independent meaning.
+            gpu_text, gpu_tooltip = gpu_requirement_display(model.gpu_requirement)
+            gpu_item = qt.QTableWidgetItem(gpu_text)
+            gpu_item.setFlags(gpu_item.flags() & ~qt.Qt.ItemIsEditable)
+            gpu_item.setTextAlignment(qt.Qt.AlignCenter)
+            gpu_item.setToolTip(gpu_tooltip)
+            self.ui.tblModelList.setItem(rowPosition, 3, gpu_item)
+
+            # Add the commercial use column.
             cu_item = qt.QTableWidgetItem("Yes" if model.commercial_use else "No")
             cu_item.setFlags(cu_item.flags() & ~qt.Qt.ItemIsEditable)
             cu_item.setTextAlignment(qt.Qt.AlignCenter)
@@ -1438,7 +1482,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 if model.commercial_use
                 else "Commercial use likely not allowed; check license"
             )
-            self.ui.tblModelList.setItem(rowPosition, 3, cu_item)
+            self.ui.tblModelList.setItem(rowPosition, 4, cu_item)
 
             # create horizontal layout, add pull, run, and details buttons, and set layout to cell
             layout = qt.QHBoxLayout()
@@ -1519,16 +1563,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             widget = qt.QWidget()
             widget.setLayout(layout)
-            self.ui.tblModelList.setCellWidget(rowPosition, 4, widget)
+            self.ui.tblModelList.setCellWidget(rowPosition, 5, widget)
 
-            # if model has more than 1 input, disable row
-            if not model.inputs_compatibility:
-                for ci in range(5):
+            # Visually deactivate unsupported inputs and models whose required GPU is unavailable.
+            gpu_unavailable = not self._modelGpuRequirementMet(model)
+            if not model.inputs_compatibility or gpu_unavailable:
+                disabled_tooltip = (
+                    "This model requires GPU execution. Enable GPU acceleration in Settings to run it."
+                    if gpu_unavailable
+                    else "This model's inputs are not supported by the 3D Slicer extension."
+                )
+                for ci in range(6):
                     item = self.ui.tblModelList.item(rowPosition, ci)
                     if item:
                         item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)  # Make it non-editable
                         item.setBackground(qt.Qt.gray)  # Change background color to indicate it's disabled
                         item.setForeground(qt.Qt.white)  # Change text color to white
+                        item.setToolTip(disabled_tooltip)
 
         self.updateLicenseSummary()
 
@@ -1558,6 +1609,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             details += ["License: N/A"]
         details += [f"Commercial use allowed: {'Yes' if model.commercial_use else 'No'}"]
+        gpu_text, gpu_tooltip = gpu_requirement_display(model.gpu_requirement)
+        details += [f"GPU required: {gpu_text} ({gpu_tooltip})"]
         details += ["\n REQUIRED CITATION: \n"]
         details += [f"The model was provided through the MHub.ai platform and is available under https://mhub.ai/models/{model.name}."]
         details += [model.cite]
@@ -1652,7 +1705,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
         # Advance to input selection after the user chooses a supported model.
-        if model is not None and model.inputs_compatibility:
+        if model is not None and model.inputs_compatibility and self._modelGpuRequirementMet(model):
             self._expandMainSection(self.ui.inputsCollapsibleButton)
 
         # update apply button
@@ -2434,6 +2487,27 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         assert self.logic is not None
 
+        # Resolve and validate the model before changing the workflow into its running state.
+        model = self.getModelFromTableSelection()
+        assert model is not None, "No model selected"
+        if not self._modelGpuRequirementMet(model):
+            self._checkCanApply()
+            return
+
+        # Warn, but permit execution, when the model has no authoritative GPU metadata.
+        if model.gpu_requirement == GPURequirement.UNVERIFIED and not self._gpuExecutionEnabled():
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("GPU requirement not verified")
+            msg.setText(
+                f"The GPU requirement for {model.label} has not been verified. "
+                "The model might fail when run without a GPU. Continue anyway?"
+            )
+            msg.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
+            msg.setDefaultButton(qt.QMessageBox.Cancel)
+            if msg.exec_() != qt.QMessageBox.Ok:
+                return
+
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
@@ -2447,10 +2521,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         instance_idh = dicom_identity["dicomInstanceUIDHash"] or "non-dicom"
         if not input_is_dicom:
             logger.debug("No DICOM identity for node: %s", node.GetName() if node else None)
-
-        # get selected model
-        model = self.getModelFromTableSelection()
-        assert model is not None, "No model selected"
 
         logger.debug("Instance UID hash: %s", instance_idh)
 
@@ -2673,6 +2743,7 @@ class Model:
     inputs: list[str]
     inputs_compatibility: bool
 
+    gpu_requirement: GPURequirement = GPURequirement.UNVERIFIED
     status: ModelStatus = ModelStatus.UNKNOWN
 
     def str_match(self, text: str) -> bool:
@@ -3147,7 +3218,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                         license_weights=license_weights,
                         commercial_use=commercial_use,
                         inputs=[i['description'] for i in model_data['inputs']],
-                        inputs_compatibility=inputs_compatibility
+                        inputs_compatibility=inputs_compatibility,
+                        gpu_requirement=gpu_requirement_from_model_data(model_data),
                     ))
 
                 # cache
