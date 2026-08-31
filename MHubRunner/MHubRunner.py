@@ -1207,8 +1207,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Keep required models unavailable until GPU execution is enabled.
         gpu_requirement_met = model is None or self._modelGpuRequirementMet(model)
 
+        # Require a locally available image before preparing inputs or reading its digest.
+        model_image_available = model is not None and model.status == ModelStatus.PULLED
+
         # check if input is selected
-        if model and model.inputs_compatibility and gpu_requirement_met and self._parameterNode and self._parameterNode.inputVolume:
+        if model and model.inputs_compatibility and model_image_available and gpu_requirement_met and self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
             self._setButtonTextWithIcon(self.ui.applyButton, f"Run {model.label}")
@@ -1218,14 +1221,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             if not model:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
-            elif not self._parameterNode or not self._parameterNode.inputVolume:
-                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             elif not model.inputs_compatibility:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
+            elif model.status == ModelStatus.UNKNOWN:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Checking Model Image")
+                self.ui.applyButton.toolTip = _("Checking whether the model image is available locally.")
+            elif model.status == ModelStatus.PULLING:
+                self._setButtonTextWithIcon(self.ui.applyButton, f"Pulling {model.label}")
+                self.ui.applyButton.toolTip = _("The model image is currently being pulled.")
+            elif not model_image_available:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Pull Model First")
+                self.ui.applyButton.toolTip = _("The model image must be pulled before it can be run.")
             elif not gpu_requirement_met:
                 self._setButtonTextWithIcon(self.ui.applyButton, "GPU Required")
                 self.ui.applyButton.toolTip = _("This model requires GPU execution. Enable GPU acceleration in Settings to run it.")
+            elif not self._parameterNode or not self._parameterNode.inputVolume:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             else:
                 self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
         self.updateLicenseSummary(model)
@@ -1416,6 +1428,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if models:
             self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._checkCanApply()
 
     def renderModelTable(self, models: list['Model']) -> None:
 
@@ -1490,8 +1503,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             layout.setContentsMargins(0,0,0,0)
 
             # Create function that creates a new scope for each button
-            def create_pull_handler(btnPull, model):
-                return lambda: self.onModelPull(btnPull, model)
+            def create_pull_handler(model):
+                return lambda: self.onModelPull(model)
 
             def create_details_handler(model):
                 return lambda: self.onModelDetails(model)
@@ -1508,7 +1521,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             btnPull.setIconSize(icon_size)
             btnPull.setFixedHeight(button_size)
             btnPull.setMinimumWidth(button_size)
-            btnPull.clicked.connect(create_pull_handler(btnPull, model))
+            btnPull.clicked.connect(create_pull_handler(model))
             layout.addWidget(btnPull)
 
             if model.status == ModelStatus.UNKNOWN:
@@ -1636,39 +1649,78 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         qt.QDesktopServices.openUrl(url)
 
 
-    def onModelPull(self, button: qt.QPushButton, model: 'Model') -> None:
+    def onModelPull(self, model: 'Model') -> bool:
         assert self.logic is not None
 
-        # disable button and block table selection signals temporarily
-        button.enabled = False
+        # Ignore duplicate pull requests and images that are already available.
+        if model.status in {ModelStatus.PULLING, ModelStatus.PULLED, ModelStatus.RUNNING}:
+            return False
 
-        # set button text to pulling
-        button.text = "Pulling..."
-
-        # construct image name
+        # Mark the shared model state before starting the asynchronous Docker pull.
         image_name = f"mhubai/{model.name}:latest"
-
         logger.info("Pulling image: %s", image_name)
+        model.status = ModelStatus.PULLING
+        models = getattr(self.logic, "_model_cache", [model])
+        self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._checkCanApply()
 
-        # on stop handler
-        def on_stop(*args):
-            # button.enabled = True
-            button.text = "Pulled" # <-- NOTE: optimistic update
-            self.updateBackendImagesList()
+        # Resolve success or failure into the same state used by the table and Run button.
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
+            pull_succeeded = returncode == 0 and not timedout and not killed
+            model.status = ModelStatus.PULLED if pull_succeeded else ModelStatus.PULLABLE
+            if pull_succeeded:
+                self.updateBackendImagesList()
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
+            self._checkCanApply()
+            logger.debug("Image %s pull completed with return code %s", image_name, returncode)
 
-            logger.debug("Image %s pulled, args: %s", image_name, args)
+            if not pull_succeeded:
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Pull model failed")
+                msg.setText(f"Pulling {model.label} failed with return code {returncode}.")
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
 
-        last_progress_sec = {"value": -1}
-
+        # Stream pull output to the existing log panel without maintaining a second progress UI.
         def on_progress(progress: float, stdout: str | None):
-            sec = int(progress)
-            if sec != last_progress_sec["value"]:
-                button.text = f"Pulling ({sec}s)"
-                last_progress_sec["value"] = sec
             self._appendLogOutput(stdout)
 
-        # pull model
-        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
+        # Use the existing Docker image update operation for both table and dialog requests.
+        try:
+            self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
+            return True
+        except Exception as exc:
+            model.status = ModelStatus.PULLABLE
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
+            self._checkCanApply()
+            logger.exception("Could not start pull for %s", image_name)
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Could not pull model")
+            msg.setText(f"Could not start pulling {model.label}: {exc}")
+            msg.exec_()
+            return False
+
+    def _promptToPullModel(self, model: 'Model') -> bool:
+        """Offer to pull an unavailable model image and report whether pulling started."""
+
+        # Explain why execution is unavailable and expose the shared pull action directly.
+        msg = qt.QMessageBox()
+        msg.setIcon(qt.QMessageBox.Information)
+        msg.setWindowTitle("Model image not available")
+        msg.setText(
+            f"{model.label} is not available locally. Pull the model image before running it?"
+        )
+        pull_button = msg.addButton("Pull Model", qt.QMessageBox.AcceptRole)
+        msg.addButton(qt.QMessageBox.Cancel)
+        msg.setDefaultButton(pull_button)
+        msg.exec_()
+        if msg.clickedButton() != pull_button:
+            return False
+
+        return self.onModelPull(model)
 
     def onModelLoadTest(self, model: str) -> None:
 
@@ -1704,8 +1756,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
+        # Offer the existing pull action as soon as an unavailable runnable model is selected.
+        if model is not None and col != 5 and model.inputs_compatibility and model.status == ModelStatus.PULLABLE:
+            self._promptToPullModel(model)
+
         # Advance to input selection after the user chooses a supported model.
-        if model is not None and model.inputs_compatibility and self._modelGpuRequirementMet(model):
+        if model is not None and model.inputs_compatibility and model.status == ModelStatus.PULLED and self._modelGpuRequirementMet(model):
             self._expandMainSection(self.ui.inputsCollapsibleButton)
 
         # update apply button
@@ -2490,6 +2546,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # Resolve and validate the model before changing the workflow into its running state.
         model = self.getModelFromTableSelection()
         assert model is not None, "No model selected"
+        if model.status != ModelStatus.PULLED:
+            if model.status == ModelStatus.PULLABLE:
+                self._promptToPullModel(model)
+            self._checkCanApply()
+            return
         if not self._modelGpuRequirementMet(model):
             self._checkCanApply()
             return

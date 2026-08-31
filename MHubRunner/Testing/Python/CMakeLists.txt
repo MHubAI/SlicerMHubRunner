@@ -1,5 +1,6 @@
 
 slicer_add_python_unittest(SCRIPT GPURequirementsTest.py)
+slicer_add_python_unittest(SCRIPT ModelAvailabilityTest.py)
 slicer_add_python_unittest(SCRIPT ModelOutputHandlersTest.py)
 slicer_add_python_unittest(SCRIPT ModelOutputRuntimeTest.py)
 slicer_add_python_unittest(SCRIPT RunManifestTest.py)
