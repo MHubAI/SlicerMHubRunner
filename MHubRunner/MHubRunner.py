@@ -2731,6 +2731,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 gpus=gpus,
                 input_dir=input_dir,
                 output_dir=model_output_dir,
+                run_id=runid,
                 onProgress=onProgress,
                 onStop=onStop
             )
@@ -3037,8 +3038,10 @@ class ProgressObserver:
 
         self._proc = None
         self._env = env
+        self._finished = False
         self._onProgress: Callable[[float, str], None] | None = None
         self._onStop: Callable[[int, str, bool, bool], None] | None = None
+        self._onTerminate: Callable[[bool, bool], None] | None = None
 
         # initialize timer
         self._timer: qt.QTimer = qt.QTimer()
@@ -3088,6 +3091,11 @@ class ProgressObserver:
 
     def _stop(self, returncode: int, timedout: bool, killed: bool):
 
+        # Deliver completion at most once even if process exit races with cancellation.
+        if self._finished:
+            return
+        self._finished = True
+
         # cleanup (delete stdout file)
         logger.debug(
             "Read and remove temp stdout file: %s %s",
@@ -3118,18 +3126,16 @@ class ProgressObserver:
 
         # check timeout condition
         if self._timeout > 0 and self._seconds_elapsed > self._timeout:
-            self._timer.stop()
-            self._proc.kill()
-            self._stop(-1, True, False)
-            self._tasks.remove(self)
+            self._terminate(timedout=True, killed=False)
             return
 
         # stop timer if process is done
         if self._proc.poll() is not None:
             returncode = self._proc.returncode
             self._timer.stop()
+            if self in self._tasks:
+                self._tasks.remove(self)
             self._stop(returncode, False, False)
-            self._tasks.remove(self)
             return
 
         # call progress method
@@ -3150,26 +3156,51 @@ class ProgressObserver:
     def onProgress(self, callback: Callable[[float, str], None]):
         self._onProgress = callback
 
-    def kill(self):
+    def onTerminate(self, callback: Callable[[bool, bool], None]):
+        self._onTerminate = callback
 
-        # disable
+    def _terminate(self, *, timedout: bool, killed: bool) -> None:
+        """Stop the owned resource, then its client process, before reporting completion."""
+
+        # Disable polling before an explicit resource-level termination can race with it.
         self._disabled = True
-
-        # stop the timer
         self._timer.stop()
 
-        # try to stop
-        try:
-            self._stop(-1, False, True)
-        except Exception:
-            logger.exception("Error when killing process: stop method failed. cmd=%s", self.cmd)
+        # Preserve a real result if the process completed just before cancellation.
+        if self._proc is not None and self._proc.poll() is not None:
+            returncode = self._proc.returncode
+            if self in self._tasks:
+                self._tasks.remove(self)
+            self._stop(returncode, False, False)
+            return
 
-        # then stop timer, kill process and remove from tasks
-        if self._proc is not None:
+        # Stop externally owned resources, such as a Docker container, before the CLI client.
+        if self._onTerminate is not None:
+            try:
+                self._onTerminate(timedout, killed)
+            except Exception:
+                logger.exception("Error while terminating owned resource. cmd=%s", self.cmd)
+
+        # End and reap the local client so its output file is closed on every platform.
+        if self._proc is not None and self._proc.poll() is None:
             self._proc.kill()
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                logger.exception("Error while waiting for killed process. cmd=%s", self.cmd)
 
-        # remove from tasks
-        self._tasks.remove(self)
+        # Unregister first so completion callbacks observe that no run remains active.
+        if self in self._tasks:
+            self._tasks.remove(self)
+
+        # Report completion only after both the resource and its client have stopped.
+        try:
+            self._stop(-1, timedout, killed)
+        except Exception:
+            logger.exception("Error when terminating process: stop method failed. cmd=%s", self.cmd)
+
+    def kill(self):
+        self._terminate(timedout=False, killed=True)
 
 # MHubRunnerLogic
 #
@@ -4427,7 +4458,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if verbose:
             logger.debug("Exported %s DICOM files.", len(files))
 
-    def _run_mhub_docker(self, model: 'Model', gpus: list[int] | None, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
+    @staticmethod
+    def _containerNameForRun(run_id: str | None) -> str:
+        """Create a unique Docker-compatible name that can be stopped deterministically."""
+
+        identifier = run_id or uuid.uuid4().hex
+        safe_identifier = re.sub(r"[^A-Za-z0-9_.-]", "-", identifier).strip("-.")
+        return f"mhubrunner-{safe_identifier or uuid.uuid4().hex}"
+
+    def _run_mhub_docker(
+        self,
+        model: 'Model',
+        gpus: list[int] | None,
+        input_dir: str,
+        output_dir: str,
+        onProgress: Callable[[float, str], None],
+        onStop: Callable[[int, str, bool, bool], None],
+        timeout: int = 0,
+        run_id: str | None = None,
+    ):
 
         # gpus command
         if gpus is None:
@@ -4440,10 +4489,21 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # get executable
         docker_exec = self.getDockerExecutable()
         env = self._build_subprocess_env(docker_exec)
+        container_name = self._containerNameForRun(run_id)
 
-        # run mhub
+        # Name and label the container so cancellation targets only this extension run.
         run_cmd = [
-            docker_exec, "run", "--rm", "-t", "--network=none"
+            docker_exec,
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--label",
+            "org.mhubai.slicer-mhub-runner=true",
+            "--label",
+            f"org.mhubai.slicer-mhub-runner.run-id={run_id or container_name}",
+            "-t",
+            "--network=none",
         ] + mhub_run_gpus + [
             "-v", f"{input_dir}:/app/data/input_data:ro",
             "-v", f"{output_dir}:/app/data/output_data:rw",
@@ -4463,16 +4523,64 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             )
             onStop(returncode, stdout, timedout, killed)
 
+        # Stop the actual container before ProgressObserver terminates its attached CLI.
+        def _on_terminate(timedout: bool, killed: bool):
+            import subprocess
+
+            reason = "timeout" if timedout else "cancellation"
+            logger.info("Stopping container %s after %s", container_name, reason)
+            try:
+                stop_result = subprocess.run(
+                    [docker_exec, "stop", "--timeout", "10", container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    env=env,
+                )
+            except Exception as exc:
+                logger.warning("Could not gracefully stop %s: %s", container_name, exc)
+                stop_result = None
+            if stop_result is not None and stop_result.returncode == 0:
+                return
+
+            stop_error = (
+                (stop_result.stderr or stop_result.stdout or "").strip()
+                if stop_result is not None
+                else "docker stop did not complete"
+            )
+            if "No such container" in stop_error:
+                logger.debug("Container %s already stopped or was never created", container_name)
+                return
+
+            logger.warning("Could not gracefully stop %s: %s", container_name, stop_error)
+            try:
+                subprocess.run(
+                    [docker_exec, "rm", "--force", container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=env,
+                )
+            except Exception:
+                logger.exception("Could not force-remove container %s", container_name)
+
         # run async
         po = ProgressObserver(
             run_cmd,
             frequency=2,
             timeout=timeout,
-            data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"},
+            data={
+                "image_name": f"mhubai/{model.name}:latest",
+                "operation": "run",
+                "run_id": run_id,
+                "container_name": container_name,
+            },
             env=env,
         )
         po.onStop(_on_stop)
         po.onProgress(onProgress)
+        po.onTerminate(_on_terminate)
+        return po
 
     def run_mhub(self,
                  model: 'Model',
@@ -4481,7 +4589,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                  output_dir: str,
                  onProgress: Callable[[float, str], None] | None = None,
                  onStop: Callable[[int, str, bool, bool], None] | None = None,
-                 timeout: int = 1200):
+                 timeout: int = 0,
+                 run_id: str | None = None):
 
         # define callbacks
         def _on_progress(time: float, stdout: str):
@@ -4497,7 +4606,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 onStop(returncode, stdout, timedout, killed)
 
         # run docker backend
-        self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
+        return self._run_mhub_docker(
+            model,
+            gpus,
+            input_dir,
+            output_dir,
+            _on_progress,
+            _on_stop,
+            run_id=run_id,
+            timeout=timeout,
+        )
 
 
     def remove_image(
