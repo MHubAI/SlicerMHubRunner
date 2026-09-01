@@ -5,6 +5,7 @@ from enum import Enum
 
 class GPURequirement(Enum):
     REQUIRED = "required"
+    RECOMMENDED = "recommended"
     OPTIONAL = "optional"
     NOT_SUPPORTED = "not_supported"
     UNVERIFIED = "unverified"
@@ -12,8 +13,8 @@ class GPURequirement(Enum):
 
 # Keep verified fallbacks local until the MHub.ai API publishes gpu_requirement.
 _GPU_REQUIREMENT_OVERRIDES = {
-    "totalsegmentator": GPURequirement.OPTIONAL,
-    "gc_grt123_lung_cancer": GPURequirement.OPTIONAL,
+    "totalsegmentator": GPURequirement.RECOMMENDED,
+    "gc_grt123_lung_cancer": GPURequirement.RECOMMENDED,
     "mrsegmentator": GPURequirement.REQUIRED,
 }
 
@@ -21,6 +22,9 @@ _GPU_REQUIREMENT_OVERRIDES = {
 # Accept the API's planned values while remaining tolerant of common separators.
 _API_GPU_REQUIREMENTS = {
     "required": GPURequirement.REQUIRED,
+    "recommended": GPURequirement.RECOMMENDED,
+    "preferred": GPURequirement.RECOMMENDED,
+    "slow_cpu": GPURequirement.RECOMMENDED,
     "optional": GPURequirement.OPTIONAL,
     "not_required": GPURequirement.OPTIONAL,
     "not_supported": GPURequirement.NOT_SUPPORTED,
@@ -48,6 +52,10 @@ def gpu_requirement_display(requirement: GPURequirement) -> tuple[str, str]:
 
     display = {
         GPURequirement.REQUIRED: ("Yes", "A GPU is required to run this model."),
+        GPURequirement.RECOMMENDED: (
+            "Recommended",
+            "CPU execution is supported but may be substantially slower than GPU execution.",
+        ),
         GPURequirement.OPTIONAL: ("Optional", "This model can run with or without a GPU."),
         GPURequirement.NOT_SUPPORTED: ("No", "This model does not support GPU acceleration."),
         GPURequirement.UNVERIFIED: ("?", "GPU requirements have not been verified for this model."),

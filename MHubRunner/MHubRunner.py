@@ -1316,6 +1316,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         return model.gpu_requirement != GPURequirement.REQUIRED or self._gpuExecutionEnabled()
 
+    @staticmethod
+    def _cpuExecutionWarning(model: 'Model') -> tuple[str, str] | None:
+        """Describe risks that require confirmation before running without a GPU."""
+
+        if model.gpu_requirement == GPURequirement.RECOMMENDED:
+            return (
+                "GPU recommended",
+                f"{model.label} supports CPU execution, but it may be substantially slower than "
+                "GPU execution. Continue without a GPU?",
+            )
+        if model.gpu_requirement == GPURequirement.UNVERIFIED:
+            return (
+                "GPU requirement not verified",
+                f"The GPU requirement for {model.label} has not been verified. "
+                "The model might fail when run without a GPU. Continue anyway?",
+            )
+        return None
+
     def onGpuSelectionChanged(self, *args) -> None:
         """Refresh model availability and summaries after any GPU setting changes."""
 
@@ -2555,15 +2573,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             self._checkCanApply()
             return
 
-        # Warn, but permit execution, when the model has no authoritative GPU metadata.
-        if model.gpu_requirement == GPURequirement.UNVERIFIED and not self._gpuExecutionEnabled():
+        # Warn, but permit execution, for slow or unverified CPU execution paths.
+        cpu_warning = None if self._gpuExecutionEnabled() else self._cpuExecutionWarning(model)
+        if cpu_warning is not None:
             msg = qt.QMessageBox()
             msg.setIcon(qt.QMessageBox.Warning)
-            msg.setWindowTitle("GPU requirement not verified")
-            msg.setText(
-                f"The GPU requirement for {model.label} has not been verified. "
-                "The model might fail when run without a GPU. Continue anyway?"
-            )
+            msg.setWindowTitle(cpu_warning[0])
+            msg.setText(cpu_warning[1])
             msg.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
             msg.setDefaultButton(qt.QMessageBox.Cancel)
             if msg.exec_() != qt.QMessageBox.Ok:
