@@ -774,6 +774,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         pixmap = qt.QPixmap(logo_path)
         self.ui.lblDockerSetupLogo.setPixmap(pixmap)
 
+    def _updateSettingsLogo(self) -> None:
+        # Display the theme-matched MHubRunner wordmark above the settings description.
+        if not hasattr(self.ui, "lblSettingsLogo"):
+            return
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        logo_name = "MRunner_w.png" if self._isDarkTheme() else "MRunner_b.png"
+        logo_path = os.path.join(icons_path, logo_name)
+        if not os.path.exists(logo_path):
+            return
+        pixmap = qt.QPixmap(logo_path)
+        logo_size = qt.QSize(199, 58)
+        self.ui.lblSettingsLogo.setPixmap(
+            pixmap.scaled(logo_size, qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation)
+        )
+
     def _applyMainButtonIcons(self) -> None:
         icon_size = qt.QSize(14, 14)
         self._mainButtonIconSize = icon_size
@@ -985,6 +1000,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if root_name and not hasattr(self.ui, root_name):
             setattr(self.ui, root_name, settings_widget)
         self._settingsWidget = settings_widget
+        self._updateSettingsLogo()
+
+    def _fitSettingsInformationPanel(self) -> None:
+        # Lock the description panel to its wrapped content height at the dialog's final width.
+        panel = getattr(self.ui, "mhubInfoGroupBox", None)
+        if panel is None or panel.layout() is None:
+            return
+        information_layout = panel.layout()
+        information_layout.activate()
+
+        # Use height-for-width because QLabel's generic size hint assumes its narrow natural width.
+        content_rect = panel.contentsRect()
+        layout_height = information_layout.heightForWidth(content_rect.width())
+        frame_height = max(0, panel.height - content_rect.height())
+        fitted_height = layout_height + frame_height
+        if fitted_height > 0:
+            panel.setMinimumHeight(fitted_height)
+            panel.setMaximumHeight(fitted_height)
 
     def _setupSettingsSectionCollapse(self) -> None:
         if getattr(self, "_settingsSectionSignalsWired", False):
@@ -1009,10 +1042,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             widget.collapsed = True
 
     def _setupMainSectionCollapse(self) -> None:
-        # Keep one workflow section open so large tables cannot push actions below Data Probe.
+        # Keep exactly one workflow section open so navigation never collapses completely.
         if getattr(self, "_mainSectionSignalsWired", False):
             return
         self._mainSectionSignalsWired = True
+        self._updatingMainSections = False
         for name in self._MAIN_SECTION_WIDGET_NAMES:
             widget = getattr(self.ui, name, None)
             if widget is None:
@@ -1024,27 +1058,52 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 widget.collapsed = True
             widget.connect(
                 "toggled(bool)",
-                lambda _, opened_widget=widget: self._closeOtherMainSections(
-                    opened_widget
-                ),
+                lambda _, changed_widget=widget: self._onMainSectionToggled(changed_widget),
             )
 
-    def _closeOtherMainSections(self, opened_widget) -> None:
-        # Collapse the other workflow sections whenever the user expands one section.
-        if opened_widget is None or opened_widget.collapsed:
+        # Normalize malformed saved/UI state to the Step 1 default.
+        open_sections = [
+            getattr(self.ui, name, None)
+            for name in self._MAIN_SECTION_WIDGET_NAMES
+            if getattr(self.ui, name, None) is not None
+            and not getattr(self.ui, name).collapsed
+        ]
+        if len(open_sections) != 1:
+            self._expandMainSection(getattr(self.ui, "outputsCollapsibleButton", None))
+
+    def _onMainSectionToggled(self, changed_widget) -> None:
+        """Maintain one open workflow section after any manual toggle."""
+
+        # Ignore recursive signals emitted while applying the resulting accordion state.
+        if changed_widget is None or getattr(self, "_updatingMainSections", False):
             return
-        for name in self._MAIN_SECTION_WIDGET_NAMES:
-            widget = getattr(self.ui, name, None)
-            if widget is None or widget is opened_widget:
-                continue
-            widget.collapsed = True
+
+        # Opening any section closes the other two; closing selects the requested fallback.
+        if changed_widget.collapsed:
+            step_one = getattr(self.ui, "outputsCollapsibleButton", None)
+            step_two = getattr(self.ui, "inputsCollapsibleButton", None)
+            target = step_two if changed_widget is step_one else step_one
+            self._setExclusiveMainSection(target or changed_widget)
+        else:
+            self._setExclusiveMainSection(changed_widget)
+
+    def _setExclusiveMainSection(self, section_widget) -> None:
+        """Expand one workflow section and collapse every sibling without recursion."""
+
+        if section_widget is None:
+            return
+        self._updatingMainSections = True
+        try:
+            for name in self._MAIN_SECTION_WIDGET_NAMES:
+                widget = getattr(self.ui, name, None)
+                if widget is not None:
+                    widget.collapsed = widget is not section_widget
+        finally:
+            self._updatingMainSections = False
 
     def _expandMainSection(self, section_widget) -> None:
         # Apply the same exclusive-section behavior to programmatic workflow transitions.
-        if section_widget is None:
-            return
-        section_widget.collapsed = False
-        self._closeOtherMainSections(section_widget)
+        self._setExclusiveMainSection(section_widget)
 
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
@@ -1067,9 +1126,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 settings_widget.show()
                 layout.addWidget(settings_widget)
             dialog.setLayout(layout)
-            dialog.setMinimumWidth(520)
+            dialog.setMinimumWidth(440)
             self._settingsDialog = dialog
         self._settingsDialog.show()
+        slicer.app.processEvents()
+        self._fitSettingsInformationPanel()
+        self._settingsDialog.adjustSize()
         self._settingsDialog.raise_()
         self._settingsDialog.activateWindow()
 

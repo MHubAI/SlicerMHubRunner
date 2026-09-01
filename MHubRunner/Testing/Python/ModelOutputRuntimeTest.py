@@ -191,20 +191,34 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         self.assertFalse(ui.inputsCollapsibleButton.collapsed)
         self.assertTrue(ui.outputCollapsibleButton.collapsed)
 
-        # Render the fully collapsed workflow and compare actual CTK header heights.
-        for section in (
-            ui.outputsCollapsibleButton,
-            ui.inputsCollapsibleButton,
-            ui.outputCollapsibleButton,
-        ):
-            section.collapsed = True
+        # Closing Step 2 returns to Step 1, while closing Step 1 advances to Step 2.
+        ui.inputsCollapsibleButton.collapsed = True
+        slicer.app.processEvents()
+        self.assertFalse(ui.outputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.inputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.outputCollapsibleButton.collapsed)
+        ui.outputsCollapsibleButton.collapsed = True
+        slicer.app.processEvents()
+        self.assertTrue(ui.outputsCollapsibleButton.collapsed)
+        self.assertFalse(ui.inputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.outputCollapsibleButton.collapsed)
+
+        # Closing Output also returns to Step 1 and leaves exactly one section open.
+        ui.outputCollapsibleButton.collapsed = False
+        slicer.app.processEvents()
+        ui.outputCollapsibleButton.collapsed = True
+        slicer.app.processEvents()
+        self.assertFalse(ui.outputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.inputsCollapsibleButton.collapsed)
+        self.assertTrue(ui.outputCollapsibleButton.collapsed)
+
+        # Compare the two collapsed CTK headers without violating the always-open contract.
         ui_widget.resize(600, 500)
         ui_widget.show()
         slicer.app.processEvents()
         collapsed_heights = {
             section.geometry.height()
             for section in (
-                ui.outputsCollapsibleButton,
                 ui.inputsCollapsibleButton,
                 ui.outputCollapsibleButton,
             )
@@ -223,6 +237,47 @@ class ModelOutputRuntimeTest(unittest.TestCase):
         # Release native Qt/MRML widgets before Slicer's leak check runs at shutdown.
         ui_widget.hide()
         ui_widget.setMRMLScene(None)
+        ui_widget.deleteLater()
+        slicer.app.processEvents()
+
+    def test_settings_mhub_information_is_not_collapsible(self):
+        # Load the settings UI and require its informational section to remain visible at the top.
+        ui_path = os.path.abspath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "Resources",
+                "UI",
+                "MHubRunnerSettings.ui",
+            )
+        )
+        ui_widget = slicer.util.loadUI(ui_path)
+        ui = slicer.util.childWidgetVariables(ui_widget)
+        widget = MHubRunnerWidget.__new__(MHubRunnerWidget)
+        widget.ui = ui
+
+        # Render at the settings dialog width before deriving the wrapped description height.
+        ui_widget.resize(440, 600)
+        ui_widget.show()
+        slicer.app.processEvents()
+        widget._updateSettingsLogo()
+        widget._fitSettingsInformationPanel()
+
+        self.assertIsInstance(ui.lblSettingsLogo, qt.QLabel)
+        self.assertFalse(ui.lblSettingsLogo.pixmap.isNull())
+        self.assertIsInstance(ui.mhubInfoGroupBox, qt.QGroupBox)
+        self.assertEqual(ui.mhubInfoGroupBox.title, "")
+        self.assertGreater(ui.mhubInfoGroupBox.minimumHeight, 0)
+        self.assertEqual(
+            ui.mhubInfoGroupBox.minimumHeight,
+            ui.mhubInfoGroupBox.maximumHeight,
+        )
+        self.assertLess(ui.mhubInfoGroupBox.maximumHeight, 240)
+        self.assertIs(ui.verticalLayout_settings.itemAt(0).widget(), ui.lblSettingsLogo)
+        self.assertIs(ui.verticalLayout_settings.itemAt(1).widget(), ui.mhubInfoGroupBox)
+        self.assertIsNone(ui_widget.findChild(qt.QWidget, "mhubInfoCollapsibleButton"))
+
         ui_widget.deleteLater()
         slicer.app.processEvents()
 
