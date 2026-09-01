@@ -25,6 +25,11 @@ from slicer.parameterNodeWrapper import (
 
 from slicer import vtkMRMLScalarVolumeNode
 import DICOMSegmentationPlugin
+from MHubRunnerLib.gpu_requirements import (
+    GPURequirement,
+    gpu_requirement_display,
+    gpu_requirement_from_model_data,
+)
 
 import hashlib
 from datetime import datetime
@@ -348,8 +353,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # self.ui.cmdTest.connect('clicked(bool)', self.loadSegmentations)
         self.ui.cmdReloadHostGpus.connect('clicked(bool)', self.updateHostGpuList)
         self.ui.chkGpuEnabled.connect('clicked(bool)', self.onGpuEnabled)
-        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.updateSettingsSummary)
-        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.updateSettingsSummary)
+        self.ui.lstHostGpu.connect('itemSelectionChanged()', self.onGpuSelectionChanged)
+        self.ui.lstHostGpu.connect('itemChanged(QListWidgetItem*)', self.onGpuSelectionChanged)
         self.ui.lstBackendImages.connect('itemSelectionChanged()', self.onBackendImageSelect)
         self.ui.cmdImageUpdate.connect('clicked(bool)', self.onBackendImageUpdate)
         self.ui.cmdImageRemove.connect('clicked(bool)', self.onBackendImageRemove)
@@ -769,6 +774,21 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         pixmap = qt.QPixmap(logo_path)
         self.ui.lblDockerSetupLogo.setPixmap(pixmap)
 
+    def _updateSettingsLogo(self) -> None:
+        # Display the theme-matched MHubRunner wordmark above the settings description.
+        if not hasattr(self.ui, "lblSettingsLogo"):
+            return
+        icons_path = os.path.join(os.path.dirname(__file__), 'Resources', 'Icons')
+        logo_name = "MRunner_w.png" if self._isDarkTheme() else "MRunner_b.png"
+        logo_path = os.path.join(icons_path, logo_name)
+        if not os.path.exists(logo_path):
+            return
+        pixmap = qt.QPixmap(logo_path)
+        logo_size = qt.QSize(199, 58)
+        self.ui.lblSettingsLogo.setPixmap(
+            pixmap.scaled(logo_size, qt.Qt.KeepAspectRatio, qt.Qt.SmoothTransformation)
+        )
+
     def _applyMainButtonIcons(self) -> None:
         icon_size = qt.QSize(14, 14)
         self._mainButtonIconSize = icon_size
@@ -875,11 +895,10 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             item = self.ui.lstHostGpu.item(i)
             if item.checkState() == qt.Qt.Checked:
                 selected_gpus.append(item.text())
-        if not selected_gpus:
-            selected_gpus = [item.text() for item in self.ui.lstHostGpu.selectedItems()]
-
         if gpu_enabled and selected_gpus:
             gpu_summary = "Selected GPU " + ", ".join(selected_gpus)
+        elif gpu_enabled and gpu_count > 0:
+            gpu_summary = "All detected GPUs"
         else:
             gpu_summary = "No GPU"
 
@@ -981,6 +1000,24 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if root_name and not hasattr(self.ui, root_name):
             setattr(self.ui, root_name, settings_widget)
         self._settingsWidget = settings_widget
+        self._updateSettingsLogo()
+
+    def _fitSettingsInformationPanel(self) -> None:
+        # Lock the description panel to its wrapped content height at the dialog's final width.
+        panel = getattr(self.ui, "mhubInfoGroupBox", None)
+        if panel is None or panel.layout() is None:
+            return
+        information_layout = panel.layout()
+        information_layout.activate()
+
+        # Use height-for-width because QLabel's generic size hint assumes its narrow natural width.
+        content_rect = panel.contentsRect()
+        layout_height = information_layout.heightForWidth(content_rect.width())
+        frame_height = max(0, panel.height - content_rect.height())
+        fitted_height = layout_height + frame_height
+        if fitted_height > 0:
+            panel.setMinimumHeight(fitted_height)
+            panel.setMaximumHeight(fitted_height)
 
     def _setupSettingsSectionCollapse(self) -> None:
         if getattr(self, "_settingsSectionSignalsWired", False):
@@ -1005,10 +1042,11 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             widget.collapsed = True
 
     def _setupMainSectionCollapse(self) -> None:
-        # Keep one workflow section open so large tables cannot push actions below Data Probe.
+        # Keep exactly one workflow section open so navigation never collapses completely.
         if getattr(self, "_mainSectionSignalsWired", False):
             return
         self._mainSectionSignalsWired = True
+        self._updatingMainSections = False
         for name in self._MAIN_SECTION_WIDGET_NAMES:
             widget = getattr(self.ui, name, None)
             if widget is None:
@@ -1020,27 +1058,52 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 widget.collapsed = True
             widget.connect(
                 "toggled(bool)",
-                lambda _, opened_widget=widget: self._closeOtherMainSections(
-                    opened_widget
-                ),
+                lambda _, changed_widget=widget: self._onMainSectionToggled(changed_widget),
             )
 
-    def _closeOtherMainSections(self, opened_widget) -> None:
-        # Collapse the other workflow sections whenever the user expands one section.
-        if opened_widget is None or opened_widget.collapsed:
+        # Normalize malformed saved/UI state to the Step 1 default.
+        open_sections = [
+            getattr(self.ui, name, None)
+            for name in self._MAIN_SECTION_WIDGET_NAMES
+            if getattr(self.ui, name, None) is not None
+            and not getattr(self.ui, name).collapsed
+        ]
+        if len(open_sections) != 1:
+            self._expandMainSection(getattr(self.ui, "outputsCollapsibleButton", None))
+
+    def _onMainSectionToggled(self, changed_widget) -> None:
+        """Maintain one open workflow section after any manual toggle."""
+
+        # Ignore recursive signals emitted while applying the resulting accordion state.
+        if changed_widget is None or getattr(self, "_updatingMainSections", False):
             return
-        for name in self._MAIN_SECTION_WIDGET_NAMES:
-            widget = getattr(self.ui, name, None)
-            if widget is None or widget is opened_widget:
-                continue
-            widget.collapsed = True
+
+        # Opening any section closes the other two; closing selects the requested fallback.
+        if changed_widget.collapsed:
+            step_one = getattr(self.ui, "outputsCollapsibleButton", None)
+            step_two = getattr(self.ui, "inputsCollapsibleButton", None)
+            target = step_two if changed_widget is step_one else step_one
+            self._setExclusiveMainSection(target or changed_widget)
+        else:
+            self._setExclusiveMainSection(changed_widget)
+
+    def _setExclusiveMainSection(self, section_widget) -> None:
+        """Expand one workflow section and collapse every sibling without recursion."""
+
+        if section_widget is None:
+            return
+        self._updatingMainSections = True
+        try:
+            for name in self._MAIN_SECTION_WIDGET_NAMES:
+                widget = getattr(self.ui, name, None)
+                if widget is not None:
+                    widget.collapsed = widget is not section_widget
+        finally:
+            self._updatingMainSections = False
 
     def _expandMainSection(self, section_widget) -> None:
         # Apply the same exclusive-section behavior to programmatic workflow transitions.
-        if section_widget is None:
-            return
-        section_widget.collapsed = False
-        self._closeOtherMainSections(section_widget)
+        self._setExclusiveMainSection(section_widget)
 
     def openSettingsDialog(self) -> None:
         self._loadSettingsUi()
@@ -1063,9 +1126,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 settings_widget.show()
                 layout.addWidget(settings_widget)
             dialog.setLayout(layout)
-            dialog.setMinimumWidth(520)
+            dialog.setMinimumWidth(440)
             self._settingsDialog = dialog
         self._settingsDialog.show()
+        slicer.app.processEvents()
+        self._fitSettingsInformationPanel()
+        self._settingsDialog.adjustSize()
         self._settingsDialog.raise_()
         self._settingsDialog.activateWindow()
 
@@ -1200,11 +1266,14 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # check if docker is available
         # TODO: ...
 
-        # chekc if gpu requirements are met
-        # TODO: ...
+        # Keep required models unavailable until GPU execution is enabled.
+        gpu_requirement_met = model is None or self._modelGpuRequirementMet(model)
+
+        # Require a locally available image before preparing inputs or reading its digest.
+        model_image_available = model is not None and model.status == ModelStatus.PULLED
 
         # check if input is selected
-        if model and model.inputs_compatibility and self._parameterNode and self._parameterNode.inputVolume:
+        if model and model.inputs_compatibility and model_image_available and gpu_requirement_met and self._parameterNode and self._parameterNode.inputVolume:
             self.ui.applyButton.toolTip = _("Compute output volume")
             self.ui.applyButton.enabled = True
             self._setButtonTextWithIcon(self.ui.applyButton, f"Run {model.label}")
@@ -1214,11 +1283,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             if not model:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
-            elif not self._parameterNode or not self._parameterNode.inputVolume:
-                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             elif not model.inputs_compatibility:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
                 self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
+            elif model.status == ModelStatus.UNKNOWN:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Checking Model Image")
+                self.ui.applyButton.toolTip = _("Checking whether the model image is available locally.")
+            elif model.status == ModelStatus.PULLING:
+                self._setButtonTextWithIcon(self.ui.applyButton, f"Pulling {model.label}")
+                self.ui.applyButton.toolTip = _("The model image is currently being pulled.")
+            elif not model_image_available:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Pull Model First")
+                self.ui.applyButton.toolTip = _("The model image must be pulled before it can be run.")
+            elif not gpu_requirement_met:
+                self._setButtonTextWithIcon(self.ui.applyButton, "GPU Required")
+                self.ui.applyButton.toolTip = _("This model requires GPU execution. Enable GPU acceleration in Settings to run it.")
+            elif not self._parameterNode or not self._parameterNode.inputVolume:
+                self._setButtonTextWithIcon(self.ui.applyButton, "Select an Input Volume")
             else:
                 self._setButtonTextWithIcon(self.ui.applyButton, "N/A")
         self.updateLicenseSummary(model)
@@ -1278,11 +1359,49 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
     def updateHostGpuList(self) -> None:
         assert self.logic is not None
 
+        # Replace the previous detection result so reloads cannot duplicate devices.
         gpus = self.logic.getGPUInformation()
+        self.ui.lstHostGpu.clear()
         for gpu in gpus:
             self.ui.lstHostGpu.addItem(gpu)
         self.ui.chkGpuEnabled.checked = len(gpus) > 0
         self.ui.chkGpuEnabled.enabled = len(gpus) > 0
+        self.onGpuSelectionChanged()
+
+    def _gpuExecutionEnabled(self) -> bool:
+        """Return whether Docker will receive access to at least one detected GPU."""
+
+        return bool(self.ui.chkGpuEnabled.checked and self.ui.lstHostGpu.count > 0)
+
+    def _modelGpuRequirementMet(self, model: 'Model') -> bool:
+        """Block only models that explicitly require a currently unavailable GPU."""
+
+        return model.gpu_requirement != GPURequirement.REQUIRED or self._gpuExecutionEnabled()
+
+    @staticmethod
+    def _cpuExecutionWarning(model: 'Model') -> tuple[str, str] | None:
+        """Describe risks that require confirmation before running without a GPU."""
+
+        if model.gpu_requirement == GPURequirement.RECOMMENDED:
+            return (
+                "GPU recommended",
+                f"{model.label} supports CPU execution, but it may be substantially slower than "
+                "GPU execution. Continue without a GPU?",
+            )
+        if model.gpu_requirement == GPURequirement.UNVERIFIED:
+            return (
+                "GPU requirement not verified",
+                f"The GPU requirement for {model.label} has not been verified. "
+                "The model might fail when run without a GPU. Continue anyway?",
+            )
+        return None
+
+    def onGpuSelectionChanged(self, *args) -> None:
+        """Refresh model availability and summaries after any GPU setting changes."""
+
+        if hasattr(self.logic, "_model_cache"):
+            self._renderFilteredModels(self.logic._model_cache, self._pendingModelSearchText or "")
+        self._checkCanApply()
         self.updateSettingsSummary()
 
     def onGpuEnabled(self) -> None:
@@ -1291,9 +1410,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         enabled = self.ui.chkGpuEnabled.checked
         self.ui.lstHostGpu.enabled = enabled
 
-        # enable/disable apply button
-        self._checkCanApply()
-        self.updateSettingsSummary()
+        # Re-evaluate required models and the Run button using the new GPU state.
+        self.onGpuSelectionChanged()
 
     def loadModelRepo(self) -> None:
         pass
@@ -1315,8 +1433,17 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._fetchModelsAsync()
 
     def _renderFilteredModels(self, models: list['Model'], text: str) -> None:
+        # Preserve the selected model while GPU or status updates rebuild the table.
+        selected_model = self.getModelFromTableSelection()
+        selected_model_name = selected_model.name if selected_model else None
         filtered = [model for model in models if model.str_match(text)]
         self.renderModelTable(filtered)
+        if selected_model_name:
+            for row in range(self.ui.tblModelList.rowCount):
+                model = self.getModelFromTableSelection(row)
+                if model and model.name == selected_model_name:
+                    self.ui.tblModelList.selectRow(row)
+                    break
 
     def _fetchModelsAsync(self) -> None:
         if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
@@ -1381,6 +1508,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         models = self.logic.getModels(cached=True, hydrate_status=False) if hasattr(self.logic, "_model_cache") else []
         if models:
             self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._checkCanApply()
 
     def renderModelTable(self, models: list['Model']) -> None:
 
@@ -1391,9 +1519,9 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # remove all rows from model table
         self.ui.tblModelList.setRowCount(0)
 
-        # add models to table with columns
-        self.ui.tblModelList.setColumnCount(5)
-        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "CU", "Actions"])
+        # Add a compact GPU requirement column without increasing the table's minimum width significantly.
+        self.ui.tblModelList.setColumnCount(6)
+        self.ui.tblModelList.setHorizontalHeaderLabels(["Model", "Type", "Image", "GPU", "CU", "Actions"])
 
         # make table rows slim
         self.ui.tblModelList.verticalHeader().setDefaultSectionSize(24)
@@ -1412,6 +1540,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         header.setSectionResizeMode(2, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, qt.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(4, qt.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, qt.QHeaderView.ResizeToContents)
 
         # fill table with models that match the search text
         for model in models:
@@ -1429,7 +1558,15 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             # add model image (placeholder)
             self.ui.tblModelList.setItem(rowPosition, 2, qt.QTableWidgetItem(",".join(model.modalities)))
 
-            # add commercial use column
+            # Show the verified or API-provided GPU requirement with its provenance-independent meaning.
+            gpu_text, gpu_tooltip = gpu_requirement_display(model.gpu_requirement)
+            gpu_item = qt.QTableWidgetItem(gpu_text)
+            gpu_item.setFlags(gpu_item.flags() & ~qt.Qt.ItemIsEditable)
+            gpu_item.setTextAlignment(qt.Qt.AlignCenter)
+            gpu_item.setToolTip(gpu_tooltip)
+            self.ui.tblModelList.setItem(rowPosition, 3, gpu_item)
+
+            # Add the commercial use column.
             cu_item = qt.QTableWidgetItem("Yes" if model.commercial_use else "No")
             cu_item.setFlags(cu_item.flags() & ~qt.Qt.ItemIsEditable)
             cu_item.setTextAlignment(qt.Qt.AlignCenter)
@@ -1438,7 +1575,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 if model.commercial_use
                 else "Commercial use likely not allowed; check license"
             )
-            self.ui.tblModelList.setItem(rowPosition, 3, cu_item)
+            self.ui.tblModelList.setItem(rowPosition, 4, cu_item)
 
             # create horizontal layout, add pull, run, and details buttons, and set layout to cell
             layout = qt.QHBoxLayout()
@@ -1446,8 +1583,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             layout.setContentsMargins(0,0,0,0)
 
             # Create function that creates a new scope for each button
-            def create_pull_handler(btnPull, model):
-                return lambda: self.onModelPull(btnPull, model)
+            def create_pull_handler(model):
+                return lambda: self.onModelPull(model)
 
             def create_details_handler(model):
                 return lambda: self.onModelDetails(model)
@@ -1464,7 +1601,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
             btnPull.setIconSize(icon_size)
             btnPull.setFixedHeight(button_size)
             btnPull.setMinimumWidth(button_size)
-            btnPull.clicked.connect(create_pull_handler(btnPull, model))
+            btnPull.clicked.connect(create_pull_handler(model))
             layout.addWidget(btnPull)
 
             if model.status == ModelStatus.UNKNOWN:
@@ -1519,16 +1656,23 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
             widget = qt.QWidget()
             widget.setLayout(layout)
-            self.ui.tblModelList.setCellWidget(rowPosition, 4, widget)
+            self.ui.tblModelList.setCellWidget(rowPosition, 5, widget)
 
-            # if model has more than 1 input, disable row
-            if not model.inputs_compatibility:
-                for ci in range(5):
+            # Visually deactivate unsupported inputs and models whose required GPU is unavailable.
+            gpu_unavailable = not self._modelGpuRequirementMet(model)
+            if not model.inputs_compatibility or gpu_unavailable:
+                disabled_tooltip = (
+                    "This model requires GPU execution. Enable GPU acceleration in Settings to run it."
+                    if gpu_unavailable
+                    else "This model's inputs are not supported by the 3D Slicer extension."
+                )
+                for ci in range(6):
                     item = self.ui.tblModelList.item(rowPosition, ci)
                     if item:
                         item.setFlags(item.flags() & ~qt.Qt.ItemIsEditable)  # Make it non-editable
                         item.setBackground(qt.Qt.gray)  # Change background color to indicate it's disabled
                         item.setForeground(qt.Qt.white)  # Change text color to white
+                        item.setToolTip(disabled_tooltip)
 
         self.updateLicenseSummary()
 
@@ -1558,6 +1702,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         else:
             details += ["License: N/A"]
         details += [f"Commercial use allowed: {'Yes' if model.commercial_use else 'No'}"]
+        gpu_text, gpu_tooltip = gpu_requirement_display(model.gpu_requirement)
+        details += [f"GPU required: {gpu_text} ({gpu_tooltip})"]
         details += ["\n REQUIRED CITATION: \n"]
         details += [f"The model was provided through the MHub.ai platform and is available under https://mhub.ai/models/{model.name}."]
         details += [model.cite]
@@ -1583,39 +1729,78 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         qt.QDesktopServices.openUrl(url)
 
 
-    def onModelPull(self, button: qt.QPushButton, model: 'Model') -> None:
+    def onModelPull(self, model: 'Model') -> bool:
         assert self.logic is not None
 
-        # disable button and block table selection signals temporarily
-        button.enabled = False
+        # Ignore duplicate pull requests and images that are already available.
+        if model.status in {ModelStatus.PULLING, ModelStatus.PULLED, ModelStatus.RUNNING}:
+            return False
 
-        # set button text to pulling
-        button.text = "Pulling..."
-
-        # construct image name
+        # Mark the shared model state before starting the asynchronous Docker pull.
         image_name = f"mhubai/{model.name}:latest"
-
         logger.info("Pulling image: %s", image_name)
+        model.status = ModelStatus.PULLING
+        models = getattr(self.logic, "_model_cache", [model])
+        self._renderFilteredModels(models, self._pendingModelSearchText or "")
+        self._checkCanApply()
 
-        # on stop handler
-        def on_stop(*args):
-            # button.enabled = True
-            button.text = "Pulled" # <-- NOTE: optimistic update
-            self.updateBackendImagesList()
+        # Resolve success or failure into the same state used by the table and Run button.
+        def on_stop(returncode: int, stdout: str, timedout: bool, killed: bool):
+            pull_succeeded = returncode == 0 and not timedout and not killed
+            model.status = ModelStatus.PULLED if pull_succeeded else ModelStatus.PULLABLE
+            if pull_succeeded:
+                self.updateBackendImagesList()
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
+            self._checkCanApply()
+            logger.debug("Image %s pull completed with return code %s", image_name, returncode)
 
-            logger.debug("Image %s pulled, args: %s", image_name, args)
+            if not pull_succeeded:
+                msg = qt.QMessageBox()
+                msg.setIcon(qt.QMessageBox.Warning)
+                msg.setWindowTitle("Pull model failed")
+                msg.setText(f"Pulling {model.label} failed with return code {returncode}.")
+                if stdout:
+                    msg.setDetailedText(stdout)
+                msg.exec_()
 
-        last_progress_sec = {"value": -1}
-
+        # Stream pull output to the existing log panel without maintaining a second progress UI.
         def on_progress(progress: float, stdout: str | None):
-            sec = int(progress)
-            if sec != last_progress_sec["value"]:
-                button.text = f"Pulling ({sec}s)"
-                last_progress_sec["value"] = sec
             self._appendLogOutput(stdout)
 
-        # pull model
-        self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
+        # Use the existing Docker image update operation for both table and dialog requests.
+        try:
+            self.logic.update_image(image_name, on_stop=on_stop, on_progress=on_progress)
+            return True
+        except Exception as exc:
+            model.status = ModelStatus.PULLABLE
+            self._renderFilteredModels(models, self._pendingModelSearchText or "")
+            self._checkCanApply()
+            logger.exception("Could not start pull for %s", image_name)
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle("Could not pull model")
+            msg.setText(f"Could not start pulling {model.label}: {exc}")
+            msg.exec_()
+            return False
+
+    def _promptToPullModel(self, model: 'Model') -> bool:
+        """Offer to pull an unavailable model image and report whether pulling started."""
+
+        # Explain why execution is unavailable and expose the shared pull action directly.
+        msg = qt.QMessageBox()
+        msg.setIcon(qt.QMessageBox.Information)
+        msg.setWindowTitle("Model image not available")
+        msg.setText(
+            f"{model.label} is not available locally. Pull the model image before running it?"
+        )
+        pull_button = msg.addButton("Pull Model", qt.QMessageBox.AcceptRole)
+        msg.addButton(qt.QMessageBox.Cancel)
+        msg.setDefaultButton(pull_button)
+        msg.exec_()
+        if msg.clickedButton() != pull_button:
+            return False
+
+        return self.onModelPull(model)
 
     def onModelLoadTest(self, model: str) -> None:
 
@@ -1651,8 +1836,12 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
 
+        # Offer the existing pull action as soon as an unavailable runnable model is selected.
+        if model is not None and col != 5 and model.inputs_compatibility and model.status == ModelStatus.PULLABLE:
+            self._promptToPullModel(model)
+
         # Advance to input selection after the user chooses a supported model.
-        if model is not None and model.inputs_compatibility:
+        if model is not None and model.inputs_compatibility and model.status == ModelStatus.PULLED and self._modelGpuRequirementMet(model):
             self._expandMainSection(self.ui.inputsCollapsibleButton)
 
         # update apply button
@@ -2434,6 +2623,30 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         assert self.logic is not None
 
+        # Resolve and validate the model before changing the workflow into its running state.
+        model = self.getModelFromTableSelection()
+        assert model is not None, "No model selected"
+        if model.status != ModelStatus.PULLED:
+            if model.status == ModelStatus.PULLABLE:
+                self._promptToPullModel(model)
+            self._checkCanApply()
+            return
+        if not self._modelGpuRequirementMet(model):
+            self._checkCanApply()
+            return
+
+        # Warn, but permit execution, for slow or unverified CPU execution paths.
+        cpu_warning = None if self._gpuExecutionEnabled() else self._cpuExecutionWarning(model)
+        if cpu_warning is not None:
+            msg = qt.QMessageBox()
+            msg.setIcon(qt.QMessageBox.Warning)
+            msg.setWindowTitle(cpu_warning[0])
+            msg.setText(cpu_warning[1])
+            msg.setStandardButtons(qt.QMessageBox.Ok | qt.QMessageBox.Cancel)
+            msg.setDefaultButton(qt.QMessageBox.Cancel)
+            if msg.exec_() != qt.QMessageBox.Ok:
+                return
+
         # deactivate apply button and activate cancel button
         self.ui.applyButton.enabled = False
         self.ui.cancelButton.enabled = True
@@ -2447,10 +2660,6 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         instance_idh = dicom_identity["dicomInstanceUIDHash"] or "non-dicom"
         if not input_is_dicom:
             logger.debug("No DICOM identity for node: %s", node.GetName() if node else None)
-
-        # get selected model
-        model = self.getModelFromTableSelection()
-        assert model is not None, "No model selected"
 
         logger.debug("Instance UID hash: %s", instance_idh)
 
@@ -2584,6 +2793,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 gpus=gpus,
                 input_dir=input_dir,
                 output_dir=model_output_dir,
+                run_id=runid,
                 onProgress=onProgress,
                 onStop=onStop
             )
@@ -2673,6 +2883,7 @@ class Model:
     inputs: list[str]
     inputs_compatibility: bool
 
+    gpu_requirement: GPURequirement = GPURequirement.UNVERIFIED
     status: ModelStatus = ModelStatus.UNKNOWN
 
     def str_match(self, text: str) -> bool:
@@ -2889,8 +3100,10 @@ class ProgressObserver:
 
         self._proc = None
         self._env = env
+        self._finished = False
         self._onProgress: Callable[[float, str], None] | None = None
         self._onStop: Callable[[int, str, bool, bool], None] | None = None
+        self._onTerminate: Callable[[bool, bool], None] | None = None
 
         # initialize timer
         self._timer: qt.QTimer = qt.QTimer()
@@ -2940,6 +3153,11 @@ class ProgressObserver:
 
     def _stop(self, returncode: int, timedout: bool, killed: bool):
 
+        # Deliver completion at most once even if process exit races with cancellation.
+        if self._finished:
+            return
+        self._finished = True
+
         # cleanup (delete stdout file)
         logger.debug(
             "Read and remove temp stdout file: %s %s",
@@ -2970,18 +3188,16 @@ class ProgressObserver:
 
         # check timeout condition
         if self._timeout > 0 and self._seconds_elapsed > self._timeout:
-            self._timer.stop()
-            self._proc.kill()
-            self._stop(-1, True, False)
-            self._tasks.remove(self)
+            self._terminate(timedout=True, killed=False)
             return
 
         # stop timer if process is done
         if self._proc.poll() is not None:
             returncode = self._proc.returncode
             self._timer.stop()
+            if self in self._tasks:
+                self._tasks.remove(self)
             self._stop(returncode, False, False)
-            self._tasks.remove(self)
             return
 
         # call progress method
@@ -3002,26 +3218,51 @@ class ProgressObserver:
     def onProgress(self, callback: Callable[[float, str], None]):
         self._onProgress = callback
 
-    def kill(self):
+    def onTerminate(self, callback: Callable[[bool, bool], None]):
+        self._onTerminate = callback
 
-        # disable
+    def _terminate(self, *, timedout: bool, killed: bool) -> None:
+        """Stop the owned resource, then its client process, before reporting completion."""
+
+        # Disable polling before an explicit resource-level termination can race with it.
         self._disabled = True
-
-        # stop the timer
         self._timer.stop()
 
-        # try to stop
-        try:
-            self._stop(-1, False, True)
-        except Exception:
-            logger.exception("Error when killing process: stop method failed. cmd=%s", self.cmd)
+        # Preserve a real result if the process completed just before cancellation.
+        if self._proc is not None and self._proc.poll() is not None:
+            returncode = self._proc.returncode
+            if self in self._tasks:
+                self._tasks.remove(self)
+            self._stop(returncode, False, False)
+            return
 
-        # then stop timer, kill process and remove from tasks
-        if self._proc is not None:
+        # Stop externally owned resources, such as a Docker container, before the CLI client.
+        if self._onTerminate is not None:
+            try:
+                self._onTerminate(timedout, killed)
+            except Exception:
+                logger.exception("Error while terminating owned resource. cmd=%s", self.cmd)
+
+        # End and reap the local client so its output file is closed on every platform.
+        if self._proc is not None and self._proc.poll() is None:
             self._proc.kill()
+            try:
+                self._proc.wait(timeout=5)
+            except Exception:
+                logger.exception("Error while waiting for killed process. cmd=%s", self.cmd)
 
-        # remove from tasks
-        self._tasks.remove(self)
+        # Unregister first so completion callbacks observe that no run remains active.
+        if self in self._tasks:
+            self._tasks.remove(self)
+
+        # Report completion only after both the resource and its client have stopped.
+        try:
+            self._stop(-1, timedout, killed)
+        except Exception:
+            logger.exception("Error when terminating process: stop method failed. cmd=%s", self.cmd)
+
+    def kill(self):
+        self._terminate(timedout=False, killed=True)
 
 # MHubRunnerLogic
 #
@@ -3147,7 +3388,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                         license_weights=license_weights,
                         commercial_use=commercial_use,
                         inputs=[i['description'] for i in model_data['inputs']],
-                        inputs_compatibility=inputs_compatibility
+                        inputs_compatibility=inputs_compatibility,
+                        gpu_requirement=gpu_requirement_from_model_data(model_data),
                     ))
 
                 # cache
@@ -4278,7 +4520,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         if verbose:
             logger.debug("Exported %s DICOM files.", len(files))
 
-    def _run_mhub_docker(self, model: 'Model', gpus: list[int] | None, input_dir: str, output_dir: str, onProgress: Callable[[float, str], None], onStop: Callable[[int, str, bool, bool], None], timeout: int = 600):
+    @staticmethod
+    def _containerNameForRun(run_id: str | None) -> str:
+        """Create a unique Docker-compatible name that can be stopped deterministically."""
+
+        identifier = run_id or uuid.uuid4().hex
+        safe_identifier = re.sub(r"[^A-Za-z0-9_.-]", "-", identifier).strip("-.")
+        return f"mhubrunner-{safe_identifier or uuid.uuid4().hex}"
+
+    def _run_mhub_docker(
+        self,
+        model: 'Model',
+        gpus: list[int] | None,
+        input_dir: str,
+        output_dir: str,
+        onProgress: Callable[[float, str], None],
+        onStop: Callable[[int, str, bool, bool], None],
+        timeout: int = 0,
+        run_id: str | None = None,
+    ):
 
         # gpus command
         if gpus is None:
@@ -4291,10 +4551,21 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
         # get executable
         docker_exec = self.getDockerExecutable()
         env = self._build_subprocess_env(docker_exec)
+        container_name = self._containerNameForRun(run_id)
 
-        # run mhub
+        # Name and label the container so cancellation targets only this extension run.
         run_cmd = [
-            docker_exec, "run", "--rm", "-t", "--network=none"
+            docker_exec,
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--label",
+            "org.mhubai.slicer-mhub-runner=true",
+            "--label",
+            f"org.mhubai.slicer-mhub-runner.run-id={run_id or container_name}",
+            "-t",
+            "--network=none",
         ] + mhub_run_gpus + [
             "-v", f"{input_dir}:/app/data/input_data:ro",
             "-v", f"{output_dir}:/app/data/output_data:rw",
@@ -4314,16 +4585,64 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             )
             onStop(returncode, stdout, timedout, killed)
 
+        # Stop the actual container before ProgressObserver terminates its attached CLI.
+        def _on_terminate(timedout: bool, killed: bool):
+            import subprocess
+
+            reason = "timeout" if timedout else "cancellation"
+            logger.info("Stopping container %s after %s", container_name, reason)
+            try:
+                stop_result = subprocess.run(
+                    [docker_exec, "stop", "--timeout", "10", container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    env=env,
+                )
+            except Exception as exc:
+                logger.warning("Could not gracefully stop %s: %s", container_name, exc)
+                stop_result = None
+            if stop_result is not None and stop_result.returncode == 0:
+                return
+
+            stop_error = (
+                (stop_result.stderr or stop_result.stdout or "").strip()
+                if stop_result is not None
+                else "docker stop did not complete"
+            )
+            if "No such container" in stop_error:
+                logger.debug("Container %s already stopped or was never created", container_name)
+                return
+
+            logger.warning("Could not gracefully stop %s: %s", container_name, stop_error)
+            try:
+                subprocess.run(
+                    [docker_exec, "rm", "--force", container_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    env=env,
+                )
+            except Exception:
+                logger.exception("Could not force-remove container %s", container_name)
+
         # run async
         po = ProgressObserver(
             run_cmd,
             frequency=2,
             timeout=timeout,
-            data={"image_name": f"mhubai/{model.name}:latest", "operation": "run"},
+            data={
+                "image_name": f"mhubai/{model.name}:latest",
+                "operation": "run",
+                "run_id": run_id,
+                "container_name": container_name,
+            },
             env=env,
         )
         po.onStop(_on_stop)
         po.onProgress(onProgress)
+        po.onTerminate(_on_terminate)
+        return po
 
     def run_mhub(self,
                  model: 'Model',
@@ -4332,7 +4651,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                  output_dir: str,
                  onProgress: Callable[[float, str], None] | None = None,
                  onStop: Callable[[int, str, bool, bool], None] | None = None,
-                 timeout: int = 1200):
+                 timeout: int = 0,
+                 run_id: str | None = None):
 
         # define callbacks
         def _on_progress(time: float, stdout: str):
@@ -4348,7 +4668,16 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 onStop(returncode, stdout, timedout, killed)
 
         # run docker backend
-        self._run_mhub_docker(model, gpus, input_dir, output_dir, _on_progress, _on_stop, timeout)
+        return self._run_mhub_docker(
+            model,
+            gpus,
+            input_dir,
+            output_dir,
+            _on_progress,
+            _on_stop,
+            run_id=run_id,
+            timeout=timeout,
+        )
 
 
     def remove_image(

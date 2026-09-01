@@ -33,6 +33,7 @@ configure_file(
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
   MHubRunnerLib/__init__.py
+  MHubRunnerLib/gpu_requirements.py
   ${CMAKE_CURRENT_BINARY_DIR}/MHubRunnerLib/build_info.py
   MHubRunnerModelHandlers/__init__.py
   MHubRunnerModelHandlers/base.py
