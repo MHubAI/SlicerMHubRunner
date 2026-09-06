@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from MHubRunner import MHubRunnerWidget, ModelStatus
+from MHubRunner import MHubRunnerLogic, MHubRunnerWidget, ModelStatus
 from MHubRunnerLib.gpu_requirements import GPURequirement
 
 
@@ -70,6 +70,27 @@ class ModelAvailabilityTest(unittest.TestCase):
         callbacks["on_stop"](0, "pulled", False, False)
         self.assertEqual(model.status, ModelStatus.PULLED)
         self.assertTrue(callbacks["images_refreshed"])
+
+    def test_single_input_compatibility_uses_workflow_not_model_format(self):
+        # Accept SMIT-like metadata because the default MHub workflow still consumes DICOM.
+        self.assertTrue(
+            MHubRunnerLogic._modelInputsCompatible(
+                {
+                    "inputs": [{"format": "NIFTI"}],
+                    "categories": ["Segmentation"],
+                }
+            )
+        )
+
+        # Continue rejecting models that need multiple separately selected inputs.
+        self.assertFalse(
+            MHubRunnerLogic._modelInputsCompatible(
+                {
+                    "inputs": [{"format": "DICOM"}, {"format": "DICOM"}],
+                    "categories": ["Segmentation"],
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -1285,7 +1285,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
             elif not model.inputs_compatibility:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
-                self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
+                self.ui.applyButton.toolTip = _("The 3D Slicer extension currently supports segmentation and prediction models with a single input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             elif model.status == ModelStatus.UNKNOWN:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Checking Model Image")
                 self.ui.applyButton.toolTip = _("Checking whether the model image is available locally.")
@@ -3323,6 +3323,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             and self._license_allows_commercial_use(weights_license)
         )
 
+    @staticmethod
+    def _modelInputsCompatible(model_data: dict) -> bool:
+        """Return whether the current Slicer workflow can prepare this model's inputs."""
+
+        # Require the single input exposed by the current Slicer input selector.
+        inputs = model_data.get("inputs") or []
+        if len(inputs) != 1:
+            return False
+
+        # Accept supported output categories regardless of the model-level input format metadata.
+        categories = model_data.get("categories") or []
+        if not ("Segmentation" in categories or "Prediction" in categories):
+            return False
+
+        # Do not validate inputs[0]["format"] for now: MHub's default workflow consumes DICOM,
+        # while some records describe the underlying model format instead. Reconsider this check
+        # if the API later exposes workflow-level input formats consistently.
+        return True
+
     def getModel(self, model_name: str) -> Model:
 
         # get models
@@ -3367,8 +3386,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 # get model list
                 for model_data in payload['data']:
 
-                    # check if model inputs are compatible with slicer extension
-                    inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    # Check only constraints enforced by the current Slicer workflow.
+                    inputs_compatibility = self._modelInputsCompatible(model_data)
                     license_info = model_data.get('licence') or {}
                     license_model = license_info.get('model') or ""
                     license_weights = license_info.get('weights') or ""
