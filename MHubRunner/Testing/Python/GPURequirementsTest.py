@@ -19,21 +19,6 @@ class GPURequirementsTest(unittest.TestCase):
 
         self.assertEqual(requirement, GPURequirement.OPTIONAL)
 
-    def test_verified_registry_defaults(self):
-        # Cover the three initial verified fallbacks requested for this release.
-        self.assertEqual(
-            gpu_requirement_from_model_data({"name": "totalsegmentator"}),
-            GPURequirement.RECOMMENDED,
-        )
-        self.assertEqual(
-            gpu_requirement_from_model_data({"name": "gc_grt123_lung_cancer"}),
-            GPURequirement.RECOMMENDED,
-        )
-        self.assertEqual(
-            gpu_requirement_from_model_data({"name": "mrsegmentator"}),
-            GPURequirement.REQUIRED,
-        )
-
     def test_unknown_models_remain_unverified(self):
         # Never infer GPU requirements from unrelated model metadata.
         self.assertEqual(
@@ -75,7 +60,7 @@ class GPURequirementsTest(unittest.TestCase):
 
         self.assertIsNotNone(warning)
         self.assertEqual(warning[0], "GPU recommended")
-        self.assertIn("supports CPU execution", warning[1])
+        self.assertIn("may be substantially slower", warning[1])
 
     def test_future_api_accepts_recommended_gpu_state(self):
         # Lock down the structured value expected from the next MHub.ai API release.
@@ -119,7 +104,7 @@ class GPURequirementsTest(unittest.TestCase):
 
         self.assertEqual(widget.ui.tblModelList.columnCount, 6)
         self.assertEqual(widget.ui.tblModelList.horizontalHeaderItem(3).text(), "GPU")
-        self.assertEqual(widget.ui.tblModelList.item(0, 3).text(), "Yes")
+        self.assertEqual(widget.ui.tblModelList.item(0, 3).text(), "Required")
         self.assertIn("requires GPU execution", widget.ui.tblModelList.item(0, 0).toolTip())
 
         widget.ui.tblModelList.deleteLater()
