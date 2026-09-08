@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import qt
+
 from MHubRunner import MHubRunnerLogic, MHubRunnerWidget, ModelStatus
 from MHubRunnerLib.gpu_requirements import GPURequirement
 
@@ -91,6 +93,61 @@ class ModelAvailabilityTest(unittest.TestCase):
                 }
             )
         )
+
+    def test_model_sorting_uses_display_and_semantic_values(self):
+        # Cover alphabetical model sorting and the operational GPU requirement order.
+        models = [
+            SimpleNamespace(
+                name="optional",
+                label="Alpha",
+                categories=["Segmentation"],
+                modalities=["CT"],
+                gpu_requirement=GPURequirement.OPTIONAL,
+                commercial_use=True,
+            ),
+            SimpleNamespace(
+                name="required",
+                label="Zulu",
+                categories=["Prediction"],
+                modalities=["MR"],
+                gpu_requirement=GPURequirement.REQUIRED,
+                commercial_use=False,
+            ),
+            SimpleNamespace(
+                name="recommended",
+                label="Bravo",
+                categories=["Segmentation"],
+                modalities=["CT"],
+                gpu_requirement=GPURequirement.RECOMMENDED,
+                commercial_use=False,
+            ),
+        ]
+
+        # Sort labels case-insensitively in the requested direction.
+        by_label = MHubRunnerWidget._sortedModels(models, 0, qt.Qt.AscendingOrder)
+        self.assertEqual([model.name for model in by_label], ["optional", "recommended", "required"])
+
+        # Sort GPU requirements by operational severity rather than their visible text.
+        by_gpu = MHubRunnerWidget._sortedModels(models, 3, qt.Qt.AscendingOrder)
+        self.assertEqual([model.name for model in by_gpu], ["required", "recommended", "optional"])
+
+    def test_model_activation_opens_input_section_for_runnable_model(self):
+        # Exercise the behavior connected to a model-table double click.
+        model = self._model(ModelStatus.PULLED)
+        model.inputs_compatibility = True
+        expanded_sections = []
+        widget = SimpleNamespace(
+            ui=SimpleNamespace(inputsCollapsibleButton=object()),
+            getModelFromTableSelection=lambda row: model,
+            _modelGpuRequirementMet=lambda selected_model: True,
+            _promptToPullModel=lambda selected_model: None,
+            _expandMainSection=expanded_sections.append,
+            _checkCanApply=lambda: None,
+        )
+
+        MHubRunnerWidget.onModelActivateFromTable(widget, 0, 0)
+
+        self.assertEqual(expanded_sections, [widget.ui.inputsCollapsibleButton])
 
 
 if __name__ == "__main__":
