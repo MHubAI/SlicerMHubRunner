@@ -445,10 +445,19 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         self._modelFetchPoller = AsyncFetchPoller(10, self._onModelFetchDone, parent=uiWidget)
         self._modelStatusPoller = AsyncFetchPoller(200, self._onModelStatusDone, parent=uiWidget)
 
+        # Start with a predictable alphabetical model order and retain it across table refreshes.
+        self._modelSortColumn = 0
+        self._modelSortOrder = qt.Qt.AscendingOrder
+
         # search box "searchModel" and model list "lstModelList"
         self.ui.searchModel.textChanged.connect(self.onSearchModel)
-        #self.ui.lstModelList.connect('itemSelectionChanged()', self.onModelSelect)
-        self.ui.tblModelList.connect('cellClicked(int, int)', self.onModelSelectFromTable)
+        self.ui.tblModelList.connect('itemSelectionChanged()', self._checkCanApply)
+        self.ui.tblModelList.connect(
+            'cellDoubleClicked(int, int)', self.onModelActivateFromTable
+        )
+        self.ui.tblModelList.horizontalHeader().connect(
+            'sectionClicked(int)', self.onModelTableHeaderClicked
+        )
         self.onSearchModel("")
 
         # input modality (for non-DICOM volumes)
@@ -1285,7 +1294,7 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select an MHub.ai Model")
             elif not model.inputs_compatibility:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Select a Model compatible with 3D Slicer Extension")
-                self.ui.applyButton.toolTip = _("The 3D Slicer extension only supports segmentation models with a single DICOM input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
+                self.ui.applyButton.toolTip = _("The 3D Slicer extension currently supports segmentation and prediction models with a single input. For all other models, use the Web button to get more information on how you can run the model from the command line.")
             elif model.status == ModelStatus.UNKNOWN:
                 self._setButtonTextWithIcon(self.ui.applyButton, "Checking Model Image")
                 self.ui.applyButton.toolTip = _("Checking whether the model image is available locally.")
@@ -1385,8 +1394,8 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         if model.gpu_requirement == GPURequirement.RECOMMENDED:
             return (
                 "GPU recommended",
-                f"{model.label} supports CPU execution, but it may be substantially slower than "
-                "GPU execution. Continue without a GPU?",
+                f"CPU execution for {model.label} may be substantially slower or has not been "
+                "verified. Continue without a GPU?",
             )
         if model.gpu_requirement == GPURequirement.UNVERIFIED:
             return (
@@ -1437,13 +1446,74 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         selected_model = self.getModelFromTableSelection()
         selected_model_name = selected_model.name if selected_model else None
         filtered = [model for model in models if model.str_match(text)]
-        self.renderModelTable(filtered)
+
+        # Apply the active logical sort before constructing rows and their action widgets.
+        sorted_models = self._sortedModels(
+            filtered,
+            self._modelSortColumn,
+            self._modelSortOrder,
+        )
+        self.renderModelTable(sorted_models)
         if selected_model_name:
             for row in range(self.ui.tblModelList.rowCount):
                 model = self.getModelFromTableSelection(row)
                 if model and model.name == selected_model_name:
                     self.ui.tblModelList.selectRow(row)
                     break
+
+    @staticmethod
+    def _sortedModels(models: list['Model'], column: int, order) -> list['Model']:
+        """Return models ordered by the semantic value of a visible table column."""
+
+        # Give GPU states a useful operational order instead of sorting their labels alphabetically.
+        gpu_order = {
+            GPURequirement.REQUIRED: 0,
+            GPURequirement.RECOMMENDED: 1,
+            GPURequirement.OPTIONAL: 2,
+            GPURequirement.NOT_SUPPORTED: 3,
+            GPURequirement.UNVERIFIED: 4,
+        }
+
+        # Build stable case-insensitive keys and use the model label to resolve equal values.
+        label_key = lambda model: (model.label.casefold(), model.name.casefold())
+        key_functions = {
+            0: label_key,
+            1: lambda model: ((",".join(model.categories)).casefold(), *label_key(model)),
+            2: lambda model: ((",".join(model.modalities)).casefold(), *label_key(model)),
+            3: lambda model: (gpu_order.get(model.gpu_requirement, 4), *label_key(model)),
+            4: lambda model: (not bool(model.commercial_use), *label_key(model)),
+        }
+        key_function = key_functions.get(column, label_key)
+        return sorted(models, key=key_function, reverse=order == qt.Qt.DescendingOrder)
+
+    def onModelTableHeaderClicked(self, column: int) -> None:
+        """Sort supported model-table columns and leave the Actions column inert."""
+
+        # Ignore the Actions header because its embedded controls have no sortable value.
+        if column < 0 or column >= 5:
+            self.ui.tblModelList.horizontalHeader().setSortIndicator(
+                self._modelSortColumn,
+                self._modelSortOrder,
+            )
+            return
+
+        # Toggle the active column or begin a newly selected column in ascending order.
+        if column == self._modelSortColumn:
+            self._modelSortOrder = (
+                qt.Qt.DescendingOrder
+                if self._modelSortOrder == qt.Qt.AscendingOrder
+                else qt.Qt.AscendingOrder
+            )
+        else:
+            self._modelSortColumn = column
+            self._modelSortOrder = qt.Qt.AscendingOrder
+
+        # Rebuild from cached model objects so action widgets and selection stay correctly associated.
+        if hasattr(self.logic, "_model_cache"):
+            self._renderFilteredModels(
+                self.logic._model_cache,
+                self._pendingModelSearchText or "",
+            )
 
     def _fetchModelsAsync(self) -> None:
         if self._modelFetchPoller is None or self._modelFetchPoller.is_running():
@@ -1529,6 +1599,13 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
         # size columns to content, only model label stretches
         header = self.ui.tblModelList.horizontalHeader()
         header.setStretchLastSection(False)
+
+        # Display the active logical sort without enabling QTableWidget's unsafe cell-by-cell sort.
+        header.setSortIndicator(
+            getattr(self, "_modelSortColumn", 0),
+            getattr(self, "_modelSortOrder", qt.Qt.AscendingOrder),
+        )
+        header.setSortIndicatorShown(True)
 
         # select full row when cell is clicked
         self.ui.tblModelList.setSelectionBehavior(qt.QAbstractItemView.SelectRows)
@@ -1828,20 +1905,22 @@ class MHubRunnerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
         return model
 
-    def onModelSelectFromTable(self, row: int, col: int) -> None:
+    def onModelActivateFromTable(self, row: int, col: int) -> None:
 
-        # get model name
+        # Resolve the activated model while leaving embedded Actions controls independent.
         model = self.getModelFromTableSelection(row)
         model_name = model.name if model else "N/A"
 
-        logger.debug("Model selected: row=%s col=%s name=%s", row, col, model_name)
+        logger.debug("Model activated: row=%s col=%s name=%s", row, col, model_name)
+        if model is None or col == 5:
+            return
 
-        # Offer the existing pull action as soon as an unavailable runnable model is selected.
-        if model is not None and col != 5 and model.inputs_compatibility and model.status == ModelStatus.PULLABLE:
+        # Offer the existing pull action when an unavailable runnable model is activated.
+        if model.inputs_compatibility and model.status == ModelStatus.PULLABLE:
             self._promptToPullModel(model)
 
-        # Advance to input selection after the user chooses a supported model.
-        if model is not None and model.inputs_compatibility and model.status == ModelStatus.PULLED and self._modelGpuRequirementMet(model):
+        # Advance to input selection after the user activates a supported local model.
+        if model.inputs_compatibility and model.status == ModelStatus.PULLED and self._modelGpuRequirementMet(model):
             self._expandMainSection(self.ui.inputsCollapsibleButton)
 
         # update apply button
@@ -3323,6 +3402,25 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
             and self._license_allows_commercial_use(weights_license)
         )
 
+    @staticmethod
+    def _modelInputsCompatible(model_data: dict) -> bool:
+        """Return whether the current Slicer workflow can prepare this model's inputs."""
+
+        # Require the single input exposed by the current Slicer input selector.
+        inputs = model_data.get("inputs") or []
+        if len(inputs) != 1:
+            return False
+
+        # Accept supported output categories regardless of the model-level input format metadata.
+        categories = model_data.get("categories") or []
+        if not ("Segmentation" in categories or "Prediction" in categories):
+            return False
+
+        # Do not validate inputs[0]["format"] for now: MHub's default workflow consumes DICOM,
+        # while some records describe the underlying model format instead. Reconsider this check
+        # if the API later exposes workflow-level input formats consistently.
+        return True
+
     def getModel(self, model_name: str) -> Model:
 
         # get models
@@ -3367,8 +3465,8 @@ class MHubRunnerLogic(ScriptedLoadableModuleLogic):
                 # get model list
                 for model_data in payload['data']:
 
-                    # check if model inputs are compatible with slicer extension
-                    inputs_compatibility = len(model_data['inputs']) == 1 and all([i['format'].lower() == 'dicom' for i in model_data['inputs']]) and ('Segmentation' in model_data['categories'] or 'Prediction' in model_data['categories'])
+                    # Check only constraints enforced by the current Slicer workflow.
+                    inputs_compatibility = self._modelInputsCompatible(model_data)
                     license_info = model_data.get('licence') or {}
                     license_model = license_info.get('model') or ""
                     license_weights = license_info.get('weights') or ""
